@@ -193,6 +193,18 @@ class MessengerConfig:
     poll_state_path: Path = Path("messenger_poll_state.json")
 
 
+def make_config() -> MessengerConfig:
+    return MessengerConfig(
+        page_access_token=must_env("META_PAGE_ACCESS_TOKEN"),
+        verify_token=must_env("META_VERIFY_TOKEN"),
+        app_secret=os.getenv("META_APP_SECRET", ""),
+        drafts_path=Path(os.getenv("MARKETPLACE_DRAFTS_JSON", "marketplace_drafts.json")),
+        listing_doc_url=os.getenv("LISTING_DOC_URL", ""),
+        page_id=os.getenv("META_PAGE_ID", ""),
+        poll_state_path=Path(os.getenv("POLL_STATE_FILE", "messenger_poll_state.json")),
+    )
+
+
 class MessengerWebhookHandler(BaseHTTPRequestHandler):
     server_version = "MessengerAutomation/1.0"
 
@@ -215,13 +227,46 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
         from urllib.parse import parse_qs, urlparse
 
         parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
         if parsed.path == "/healthz":
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             self.wfile.write(b"ok")
             return
-        params = parse_qs(parsed.query)
+        if parsed.path == "/debug/status":
+            token = params.get("token", [""])[0]
+            if token != self.config.verify_token:
+                self.send_error(403, "Forbidden")
+                return
+            seen = load_seen_message_ids(self.config.poll_state_path)
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "draft_count": len(load_drafts(self.config.drafts_path)),
+                    "has_page_access_token": bool(self.config.page_access_token),
+                    "has_app_secret": bool(self.config.app_secret),
+                    "has_listing_doc_url": bool(self.config.listing_doc_url),
+                    "page_id": self.config.page_id,
+                    "poll_interval_seconds": getattr(self.server, "poll_interval_seconds", 0),
+                    "poll_state_file": str(self.config.poll_state_path),
+                    "seen_message_count": len(seen),
+                },
+            )
+            return
+        if parsed.path == "/poll-once":
+            token = params.get("token", [""])[0]
+            initialize_only = params.get("initialize_only", ["0"])[0] in ("1", "true", "yes")
+            if token != self.config.verify_token:
+                self.send_error(403, "Forbidden")
+                return
+            try:
+                replies = poll_conversations_once(self.config, initialize_only=initialize_only)
+                self._send_json(200, {"ok": True, "reply_count": replies, "initialize_only": initialize_only})
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": str(exc)})
+            return
         if parsed.path != "/webhook":
             self.send_error(404, "Not found")
             return
@@ -282,6 +327,7 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
 def run_server(config: MessengerConfig, port: int):
     httpd = ThreadingHTTPServer(("0.0.0.0", port), MessengerWebhookHandler)
     httpd.config = config  # type: ignore[attr-defined]
+    httpd.poll_interval_seconds = int(os.getenv("POLL_CONVERSATIONS_SECONDS", "0") or "0")  # type: ignore[attr-defined]
     print(f"Messenger webhook listening on http://0.0.0.0:{port}/webhook")
     httpd.serve_forever()
 
@@ -399,15 +445,7 @@ def main():
     parser.add_argument("--limit", type=int, default=25)
     args = parser.parse_args()
 
-    config = MessengerConfig(
-        page_access_token=must_env("META_PAGE_ACCESS_TOKEN"),
-        verify_token=must_env("META_VERIFY_TOKEN"),
-        app_secret=os.getenv("META_APP_SECRET", ""),
-        drafts_path=Path(os.getenv("MARKETPLACE_DRAFTS_JSON", "marketplace_drafts.json")),
-        listing_doc_url=os.getenv("LISTING_DOC_URL", ""),
-        page_id=os.getenv("META_PAGE_ID", ""),
-        poll_state_path=Path(os.getenv("POLL_STATE_FILE", "messenger_poll_state.json")),
-    )
+    config = make_config()
 
     if args.command == "conversations":
         page_id = must_env("META_PAGE_ID")
