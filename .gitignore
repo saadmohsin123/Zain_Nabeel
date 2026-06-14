@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+.DS_Store
+messenger_poll_state.json
+messenger_railway_env*.txt
