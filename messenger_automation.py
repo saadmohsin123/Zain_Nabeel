@@ -13,14 +13,17 @@ What it does not do:
 - It does not bypass Meta policy or review requirements.
 
 Required env vars:
-- META_PAGE_ACCESS_TOKEN
 - META_VERIFY_TOKEN
+- one of:
+  - META_PAGE_ACCESS_TOKEN
+  - META_USER_ACCESS_TOKEN
 
 Optional env vars:
 - META_APP_SECRET            # for webhook signature verification
 - META_PAGE_ID                # for Conversations API / diagnostics
 - MARKETPLACE_DRAFTS_JSON     # default: marketplace_drafts.json
 - LISTING_DOC_URL             # optional URL to send when user asks for the doc
+- META_USER_ACCESS_TOKEN      # optional fallback to derive a page token for META_PAGE_ID
 - OPENAI_API_KEY              # optional conversational answer generation
 - OPENAI_MODEL                # default: gpt-4.1-mini
 - POLL_CONVERSATIONS_SECONDS  # optional fallback when Meta does not deliver webhooks
@@ -55,6 +58,27 @@ def must_env(name: str, default: Optional[str] = None) -> str:
     if value in (None, ""):
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
+
+
+def optional_env(name: str, default: str = "") -> str:
+    value = os.getenv(name, default)
+    return "" if value is None else value
+
+
+def resolve_page_access_token(user_access_token: str, page_id: str) -> str:
+    resp = requests.get(
+        f"{GRAPH_BASE}/me/accounts",
+        params={"access_token": user_access_token},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    for page in payload.get("data", []):
+        if compact(page.get("id")) == page_id:
+            page_token = compact(page.get("access_token"))
+            if page_token:
+                return page_token
+    raise RuntimeError(f"Could not derive a page access token for META_PAGE_ID={page_id}")
 
 
 def load_drafts(path: Path) -> List[dict]:
@@ -320,19 +344,36 @@ class MessengerConfig:
     poll_state_path: Path = Path("messenger_poll_state.json")
     openai_api_key: str = ""
     openai_model: str = "gpt-4.1-mini"
+    token_source: str = "page"
 
 
 def make_config() -> MessengerConfig:
+    page_id = optional_env("META_PAGE_ID", "")
+    page_access_token = optional_env("META_PAGE_ACCESS_TOKEN", "")
+    user_access_token = optional_env("META_USER_ACCESS_TOKEN", "")
+    token_source = "page"
+
+    if not page_access_token:
+        if not user_access_token:
+            raise RuntimeError(
+                "Missing token configuration: set META_PAGE_ACCESS_TOKEN or META_USER_ACCESS_TOKEN"
+            )
+        if not page_id:
+            raise RuntimeError("META_PAGE_ID is required when using META_USER_ACCESS_TOKEN")
+        page_access_token = resolve_page_access_token(user_access_token, page_id)
+        token_source = "derived-from-user"
+
     return MessengerConfig(
-        page_access_token=must_env("META_PAGE_ACCESS_TOKEN"),
+        page_access_token=page_access_token,
         verify_token=must_env("META_VERIFY_TOKEN"),
         app_secret=os.getenv("META_APP_SECRET", ""),
         drafts_path=Path(os.getenv("MARKETPLACE_DRAFTS_JSON", "marketplace_drafts.json")),
         listing_doc_url=os.getenv("LISTING_DOC_URL", ""),
-        page_id=os.getenv("META_PAGE_ID", ""),
+        page_id=page_id,
         poll_state_path=Path(os.getenv("POLL_STATE_FILE", "messenger_poll_state.json")),
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
         openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+        token_source=token_source,
     )
 
 
@@ -377,6 +418,7 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "draft_count": len(load_drafts(self.config.drafts_path)),
                     "has_page_access_token": bool(self.config.page_access_token),
+                    "token_source": self.config.token_source,
                     "has_app_secret": bool(self.config.app_secret),
                     "has_listing_doc_url": bool(self.config.listing_doc_url),
                     "page_id": self.config.page_id,
