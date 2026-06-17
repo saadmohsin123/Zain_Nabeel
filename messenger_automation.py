@@ -21,6 +21,8 @@ Optional env vars:
 - META_PAGE_ID                # for Conversations API / diagnostics
 - MARKETPLACE_DRAFTS_JSON     # default: marketplace_drafts.json
 - LISTING_DOC_URL             # optional URL to send when user asks for the doc
+- OPENAI_API_KEY              # optional conversational answer generation
+- OPENAI_MODEL                # default: gpt-4.1-mini
 - POLL_CONVERSATIONS_SECONDS  # optional fallback when Meta does not deliver webhooks
 - POLL_STATE_FILE             # default: messenger_poll_state.json
 - MESSENGER_PORT              # default: 8000
@@ -45,6 +47,7 @@ import requests
 
 
 GRAPH_BASE = "https://graph.facebook.com/v20.0"
+OPENAI_RESPONSES_API = "https://api.openai.com/v1/responses"
 
 
 def must_env(name: str, default: Optional[str] = None) -> str:
@@ -130,14 +133,138 @@ def summarize_draft(draft: dict) -> str:
     return " | ".join(parts)
 
 
-def build_reply(query: str, drafts: List[dict], listing_doc_url: str) -> str:
+def listing_context(draft: dict) -> dict:
+    fields = [
+        "ListingKey",
+        "Address",
+        "MarketplaceTitle",
+        "MarketplacePriceDisplay",
+        "TransactionType",
+        "PropertyType",
+        "City",
+        "BedroomsTotal",
+        "BathroomsTotal",
+        "LivingAreaRange",
+        "LivingAreaUnits",
+        "Basement",
+        "PetsAllowed",
+        "HeatingDetails",
+        "CoolingDetails",
+        "GarageDetails",
+        "LaundryDetails",
+        "Amenities",
+        "ParkingFeatures",
+        "ParkingSpaces",
+        "MarketplaceDescription",
+        "ListingLifecycleStatus",
+        "MarketplaceStatus",
+    ]
+    return {field: draft.get(field) for field in fields if draft.get(field) not in (None, "", [])}
+
+
+def build_openai_headers(api_key: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+
+def extract_response_text(response_json: dict) -> str:
+    output_text = compact(response_json.get("output_text"))
+    if output_text:
+        return output_text
+
+    chunks: List[str] = []
+    for item in response_json.get("output", []):
+        for content in item.get("content", []):
+            text = compact(content.get("text"))
+            if text:
+                chunks.append(text)
+    return "\n".join(chunk for chunk in chunks if chunk).strip()
+
+
+def generate_ai_reply(
+    query: str,
+    matches: List[dict],
+    listing_doc_url: str,
+    api_key: str,
+    model: str,
+) -> Optional[str]:
+    listing_payload = [listing_context(match) for match in matches[:3]]
+    system_prompt = (
+        "You are Durham New Homes, an AI real-estate leasing and sales assistant. "
+        "Answer like a high-quality leasing coordinator: concise, helpful, natural, and action-oriented. "
+        "Use only the provided listing data and provided packet link. "
+        "Do not invent features, pricing, amenities, policies, or availability. "
+        "If the user asks something not present in the data, say that it is not confirmed yet and ask a targeted follow-up. "
+        "If the query is generic and no exact answer is available, guide the user to share the address, ListingKey, or unit number. "
+        "Prefer short paragraphs, not bullets, unless the user explicitly asks for a list."
+    )
+    user_prompt = {
+        "user_message": query,
+        "listing_packet_url": listing_doc_url,
+        "matched_listings": listing_payload,
+    }
+    payload = {
+        "model": model,
+        "input": [
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": system_prompt}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": json.dumps(user_prompt, ensure_ascii=False)}],
+            },
+        ],
+        "max_output_tokens": 350,
+    }
+    resp = requests.post(
+        OPENAI_RESPONSES_API,
+        headers=build_openai_headers(api_key),
+        json=payload,
+        timeout=60,
+    )
+    resp.raise_for_status()
+    output_text = extract_response_text(resp.json())
+    return output_text or None
+
+
+def build_reply(
+    query: str,
+    drafts: List[dict],
+    listing_doc_url: str,
+    openai_api_key: str = "",
+    openai_model: str = "gpt-4.1-mini",
+) -> str:
     normalized = query.lower().strip()
-    if any(word in normalized for word in ["doc", "sheet", "link", "packet"]):
+    link_only_patterns = [
+        "doc",
+        "document",
+        "sheet",
+        "link",
+        "packet",
+        "send me the packet",
+        "send packet",
+        "share the packet",
+        "share packet",
+        "send me the link",
+        "share the link",
+    ]
+    if any(pattern == normalized for pattern in link_only_patterns):
         if listing_doc_url:
             return f"Here is the current listing packet: {listing_doc_url}"
         return "I do not have the document URL configured yet."
 
     matches = rank_drafts(query, drafts, limit=3)
+    if openai_api_key:
+        try:
+            ai_reply = generate_ai_reply(query, matches, listing_doc_url, openai_api_key, openai_model)
+            if ai_reply:
+                return ai_reply
+        except Exception as exc:
+            print(f"AI reply generation failed: {exc}")
+
     if not matches:
         return (
             "I could not match that listing yet. Send me the address, ListingKey, or unit number, "
@@ -191,6 +318,8 @@ class MessengerConfig:
     listing_doc_url: str = ""
     page_id: str = ""
     poll_state_path: Path = Path("messenger_poll_state.json")
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4.1-mini"
 
 
 def make_config() -> MessengerConfig:
@@ -202,6 +331,8 @@ def make_config() -> MessengerConfig:
         listing_doc_url=os.getenv("LISTING_DOC_URL", ""),
         page_id=os.getenv("META_PAGE_ID", ""),
         poll_state_path=Path(os.getenv("POLL_STATE_FILE", "messenger_poll_state.json")),
+        openai_api_key=os.getenv("OPENAI_API_KEY", ""),
+        openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
     )
 
 
@@ -316,7 +447,13 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                 if not sender_id or not text:
                     continue
 
-                reply = build_reply(text, drafts, self.config.listing_doc_url)
+                reply = build_reply(
+                    text,
+                    drafts,
+                    self.config.listing_doc_url,
+                    self.config.openai_api_key,
+                    self.config.openai_model,
+                )
                 try:
                     send_message(self.config.page_access_token, sender_id, reply)
                     print(f"Replied to {sender_id}: {text[:80]}")
@@ -406,7 +543,13 @@ def poll_conversations_once(config: MessengerConfig, initialize_only: bool = Fal
         if initialize_only or not sender_id or sender_id == config.page_id or not text:
             continue
 
-        reply = build_reply(text, drafts, config.listing_doc_url)
+        reply = build_reply(
+            text,
+            drafts,
+            config.listing_doc_url,
+            config.openai_api_key,
+            config.openai_model,
+        )
         try:
             send_message(config.page_access_token, sender_id, reply)
             reply_count += 1
