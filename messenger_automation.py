@@ -26,6 +26,8 @@ Optional env vars:
 - META_USER_ACCESS_TOKEN      # optional fallback to derive a page token for META_PAGE_ID
 - OPENAI_API_KEY              # optional conversational answer generation
 - OPENAI_MODEL                # default: gpt-4.1-mini
+- CALENDLY_URL                # optional booking link for calls/showings
+- AGENT_NAME                  # default: Nabeel
 - POLL_CONVERSATIONS_SECONDS  # optional fallback when Meta does not deliver webhooks
 - POLL_STATE_FILE             # default: messenger_poll_state.json
 - MESSENGER_PORT              # default: 8000
@@ -126,13 +128,42 @@ def draft_text(draft: dict) -> str:
     return " ".join(bits).lower()
 
 
+def normalize_status(value: str) -> str:
+    return compact(value).strip().lower()
+
+
+def is_listing_ready(draft: dict) -> bool:
+    marketplace_status = normalize_status(compact(draft.get("MarketplaceStatus")))
+    lifecycle_status = normalize_status(compact(draft.get("ListingLifecycleStatus")))
+    blocked_marketplace = {
+        "pending seller action",
+        "archived",
+        "needs review",
+        "draft",
+    }
+    blocked_lifecycle = {
+        "expired",
+        "terminated",
+        "closed",
+        "suspended",
+    }
+    if marketplace_status in blocked_marketplace:
+        return False
+    if lifecycle_status in blocked_lifecycle:
+        return False
+    return True
+
+
 def rank_drafts(query: str, drafts: List[dict], limit: int = 3) -> List[dict]:
     q_tokens = tokenize(query)
     if not q_tokens:
         return []
 
+    ready_drafts = [draft for draft in drafts if is_listing_ready(draft)]
+    candidate_drafts = ready_drafts or drafts
+
     scored: List[Tuple[int, dict]] = []
-    for draft in drafts:
+    for draft in candidate_drafts:
         haystack = draft_text(draft)
         score = 0
         for token in q_tokens:
@@ -197,6 +228,27 @@ def listing_context(draft: dict) -> dict:
     return {field: draft.get(field) for field in fields if draft.get(field) not in (None, "", [])}
 
 
+def looks_like_booking_request(query: str) -> bool:
+    q = query.lower()
+    phrases = [
+        "book",
+        "booking",
+        "schedule",
+        "meeting",
+        "viewing",
+        "showing",
+        "call",
+        "available tomorrow",
+        "available today",
+        "availability",
+    ]
+    return any(phrase in q for phrase in phrases)
+
+
+def shortlist_for_booking(matches: List[dict]) -> List[dict]:
+    return [draft for draft in matches if is_listing_ready(draft)]
+
+
 def build_openai_headers(api_key: str) -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {api_key}",
@@ -222,22 +274,30 @@ def generate_ai_reply(
     query: str,
     matches: List[dict],
     listing_doc_url: str,
+    calendly_url: str,
+    agent_name: str,
     api_key: str,
     model: str,
 ) -> Optional[str]:
     listing_payload = [listing_context(match) for match in matches[:3]]
     system_prompt = (
-        "You are Durham New Homes, an AI real-estate leasing and sales assistant. "
-        "Answer like a high-quality leasing coordinator: concise, helpful, natural, and action-oriented. "
+        "You are Durham New Homes, a real-estate leasing and sales assistant for Nabeel. "
+        "Answer like a capable human leasing coordinator: warm, concise, natural, and practical. "
         "Use only the provided listing data and provided packet link. "
         "Do not invent features, pricing, amenities, policies, or availability. "
         "If the user asks something not present in the data, say that it is not confirmed yet and ask a targeted follow-up. "
         "If the query is generic and no exact answer is available, guide the user to share the address, ListingKey, or unit number. "
-        "Prefer short paragraphs, not bullets, unless the user explicitly asks for a list."
+        "Prefer short conversational paragraphs, not bullets, unless the user explicitly asks for a list. "
+        "Avoid sounding robotic, overly formal, or repetitive. "
+        "Only describe listings as available if their marketplace/listing status indicates they are active or ready. "
+        "If a listing is pending seller action, needs review, archived, or otherwise not ready, say that clearly and do not pitch it as bookable. "
+        "If the user wants to book a call, meeting, or showing and a Calendly URL is provided, offer that booking link naturally."
     )
     user_prompt = {
         "user_message": query,
         "listing_packet_url": listing_doc_url,
+        "calendly_url": calendly_url,
+        "agent_name": agent_name,
         "matched_listings": listing_payload,
     }
     payload = {
@@ -269,6 +329,8 @@ def build_reply(
     query: str,
     drafts: List[dict],
     listing_doc_url: str,
+    calendly_url: str = "",
+    agent_name: str = "Nabeel",
     openai_api_key: str = "",
     openai_model: str = "gpt-4.1-mini",
     use_ai: bool = True,
@@ -293,9 +355,38 @@ def build_reply(
         return "I do not have the document URL configured yet."
 
     matches = rank_drafts(query, drafts, limit=3)
+    ready_matches = shortlist_for_booking(matches)
+
+    if looks_like_booking_request(query):
+        if ready_matches:
+            chosen = ready_matches[0]
+            title = compact(chosen.get("MarketplaceTitle")) or compact(chosen.get("Address")) or "that listing"
+            if calendly_url:
+                return (
+                    f"Absolutely. The best next step is to book a time with {agent_name} here: {calendly_url} "
+                    f"and mention {title}. If you want, I can also share a quick summary of the listing before you book."
+                )
+            return (
+                f"Absolutely. I can help with {title}. I do not have the booking link configured yet, "
+                f"but if you send your preferred day and time I can note it for {agent_name}."
+            )
+        if calendly_url:
+            return (
+                f"I can help with that. Before booking, please send the exact address or unit you want so I point you to the right listing. "
+                f"If you already know it, you can also book directly here: {calendly_url}"
+            )
+
     if openai_api_key and use_ai:
         try:
-            ai_reply = generate_ai_reply(query, matches, listing_doc_url, openai_api_key, openai_model)
+            ai_reply = generate_ai_reply(
+                query,
+                matches,
+                listing_doc_url,
+                calendly_url,
+                agent_name,
+                openai_api_key,
+                openai_model,
+            )
             if ai_reply:
                 return ai_reply
         except Exception as exc:
@@ -336,6 +427,22 @@ def send_message(page_access_token: str, recipient_id: str, text: str) -> dict:
     return resp.json()
 
 
+def send_sender_action(page_access_token: str, recipient_id: str, action: str) -> dict:
+    url = f"{GRAPH_BASE}/me/messages"
+    payload = {
+        "recipient": {"id": recipient_id},
+        "sender_action": action,
+    }
+    resp = requests.post(
+        url,
+        params={"access_token": page_access_token},
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 def verify_signature(app_secret: str, raw_body: bytes, signature_header: Optional[str]) -> bool:
     if not signature_header:
         return False
@@ -352,6 +459,8 @@ class MessengerConfig:
     app_secret: str = ""
     drafts_path: Path = Path("marketplace_drafts.json")
     listing_doc_url: str = ""
+    calendly_url: str = ""
+    agent_name: str = "Nabeel"
     page_id: str = ""
     poll_state_path: Path = Path("messenger_poll_state.json")
     openai_api_key: str = ""
@@ -382,6 +491,8 @@ def make_config() -> MessengerConfig:
         app_secret=os.getenv("META_APP_SECRET", ""),
         drafts_path=Path(os.getenv("MARKETPLACE_DRAFTS_JSON", "marketplace_drafts.json")),
         listing_doc_url=os.getenv("LISTING_DOC_URL", ""),
+        calendly_url=os.getenv("CALENDLY_URL", ""),
+        agent_name=os.getenv("AGENT_NAME", "Nabeel"),
         page_id=page_id,
         poll_state_path=Path(os.getenv("POLL_STATE_FILE", "messenger_poll_state.json")),
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
@@ -525,13 +636,20 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                 if not sender_id or not text:
                     continue
 
+                try:
+                    send_sender_action(self.config.page_access_token, sender_id, "typing_on")
+                except Exception as exc:
+                    print(f"Failed sending typing indicator to {sender_id}: {exc}")
+
                 reply = build_reply(
                     text,
                     drafts,
                     self.config.listing_doc_url,
-                    self.config.openai_api_key,
-                    self.config.openai_model,
-                    True,
+                    calendly_url=self.config.calendly_url,
+                    agent_name=self.config.agent_name,
+                    openai_api_key=self.config.openai_api_key,
+                    openai_model=self.config.openai_model,
+                    use_ai=True,
                 )
                 try:
                     send_message(self.config.page_access_token, sender_id, reply)
@@ -661,12 +779,19 @@ def poll_conversations_once(
             result["skipped_page_or_empty_count"] += 1
             continue
 
+        try:
+            send_sender_action(config.page_access_token, sender_id, "typing_on")
+        except Exception as exc:
+            print(f"Poll failed sending typing indicator to {sender_id}: {exc}")
+
         reply = build_reply(
             text,
             drafts,
             config.listing_doc_url,
-            config.openai_api_key,
-            config.openai_model,
+            calendly_url=config.calendly_url,
+            agent_name=config.agent_name,
+            openai_api_key=config.openai_api_key,
+            openai_model=config.openai_model,
             use_ai=use_ai,
         )
         try:
