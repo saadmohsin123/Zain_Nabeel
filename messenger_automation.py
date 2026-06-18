@@ -34,6 +34,7 @@ Optional env vars:
 from __future__ import annotations
 
 import argparse
+import calendar
 import hashlib
 import hmac
 import json
@@ -94,6 +95,16 @@ def compact(value) -> str:
     if isinstance(value, list):
         return ", ".join(compact(v) for v in value if compact(v))
     return str(value).strip()
+
+
+def parse_graph_time(value: str) -> Optional[int]:
+    value = compact(value)
+    if not value:
+        return None
+    try:
+        return calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%S%z"))
+    except Exception:
+        return None
 
 
 def tokenize(text: str) -> List[str]:
@@ -345,6 +356,7 @@ class MessengerConfig:
     openai_api_key: str = ""
     openai_model: str = "gpt-4.1-mini"
     token_source: str = "page"
+    bootstrap_reply_lookback_seconds: int = 86400
 
 
 def make_config() -> MessengerConfig:
@@ -374,6 +386,7 @@ def make_config() -> MessengerConfig:
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
         openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
         token_source=token_source,
+        bootstrap_reply_lookback_seconds=int(os.getenv("POLL_BOOTSTRAP_LOOKBACK_SECONDS", "86400") or "86400"),
     )
 
 
@@ -572,17 +585,28 @@ def poll_conversations_once(config: MessengerConfig, initialize_only: bool = Fal
     seen = load_seen_message_ids(config.poll_state_path)
     drafts = load_drafts(config.drafts_path)
     reply_count = 0
+    now_ts = int(time.time())
+    bootstrap_cutoff_ts = now_ts - max(config.bootstrap_reply_lookback_seconds, 0)
 
     for message in list_recent_messages(config.page_id, config.page_access_token):
         message_id = compact(message.get("id"))
         if not message_id or message_id in seen:
             continue
-        seen.add(message_id)
 
         sender = message.get("from", {}) or {}
         sender_id = compact(sender.get("id"))
         text = compact(message.get("message"))
-        if initialize_only or not sender_id or sender_id == config.page_id or not text:
+        created_ts = parse_graph_time(compact(message.get("created_time")))
+
+        if initialize_only:
+            # On cold start, keep recent inbound messages unseen so the next poll can answer them.
+            is_old = created_ts is not None and created_ts < bootstrap_cutoff_ts
+            if not sender_id or sender_id == config.page_id or not text or is_old:
+                seen.add(message_id)
+            continue
+
+        if not sender_id or sender_id == config.page_id or not text:
+            seen.add(message_id)
             continue
 
         reply = build_reply(
@@ -594,6 +618,7 @@ def poll_conversations_once(config: MessengerConfig, initialize_only: bool = Fal
         )
         try:
             send_message(config.page_access_token, sender_id, reply)
+            seen.add(message_id)
             reply_count += 1
             print(f"Poll replied to {sender_id}: {text[:80]}")
         except Exception as exc:
