@@ -258,7 +258,7 @@ def generate_ai_reply(
         OPENAI_RESPONSES_API,
         headers=build_openai_headers(api_key),
         json=payload,
-        timeout=60,
+        timeout=int(os.getenv("OPENAI_REQUEST_TIMEOUT_SECONDS", "20") or "20"),
     )
     resp.raise_for_status()
     output_text = extract_response_text(resp.json())
@@ -271,6 +271,7 @@ def build_reply(
     listing_doc_url: str,
     openai_api_key: str = "",
     openai_model: str = "gpt-4.1-mini",
+    use_ai: bool = True,
 ) -> str:
     normalized = query.lower().strip()
     link_only_patterns = [
@@ -292,7 +293,7 @@ def build_reply(
         return "I do not have the document URL configured yet."
 
     matches = rank_drafts(query, drafts, limit=3)
-    if openai_api_key:
+    if openai_api_key and use_ai:
         try:
             ai_reply = generate_ai_reply(query, matches, listing_doc_url, openai_api_key, openai_model)
             if ai_reply:
@@ -445,19 +446,33 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
             token = params.get("token", [""])[0]
             initialize_only = params.get("initialize_only", ["0"])[0] in ("1", "true", "yes")
             reset_seen = params.get("reset_seen", ["0"])[0] in ("1", "true", "yes")
+            use_ai = params.get("use_ai", ["1"])[0] not in ("0", "false", "no")
+            conversation_limit = int(params.get("conversation_limit", ["10"])[0] or "10")
+            per_conversation_limit = int(params.get("per_conversation_limit", ["5"])[0] or "5")
             if token != self.config.verify_token:
                 self.send_error(403, "Forbidden")
                 return
             try:
                 if reset_seen and self.config.poll_state_path.exists():
                     self.config.poll_state_path.unlink()
-                replies = poll_conversations_once(self.config, initialize_only=initialize_only)
-                self._send_json(200, {
-                    "ok": True,
-                    "reply_count": replies,
-                    "initialize_only": initialize_only,
-                    "reset_seen": reset_seen,
-                })
+                result = poll_conversations_once(
+                    self.config,
+                    initialize_only=initialize_only,
+                    conversation_limit=conversation_limit,
+                    per_conversation_limit=per_conversation_limit,
+                    use_ai=use_ai,
+                )
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "reset_seen": reset_seen,
+                        "use_ai": use_ai,
+                        "conversation_limit": conversation_limit,
+                        "per_conversation_limit": per_conversation_limit,
+                        **result,
+                    },
+                )
             except Exception as exc:
                 self._send_json(500, {"ok": False, "error": str(exc)})
             return
@@ -516,6 +531,7 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                     self.config.listing_doc_url,
                     self.config.openai_api_key,
                     self.config.openai_model,
+                    True,
                 )
                 try:
                     send_message(self.config.page_access_token, sender_id, reply)
@@ -565,8 +581,13 @@ def save_seen_message_ids(path: Path, seen: set[str]):
     path.write_text(json.dumps({"seen_message_ids": recent}, indent=2), encoding="utf-8")
 
 
-def list_recent_messages(page_id: str, page_access_token: str, limit: int = 10) -> List[dict]:
-    conversations = list_conversations(page_id, page_access_token, limit=limit).get("data", [])
+def list_recent_messages(
+    page_id: str,
+    page_access_token: str,
+    conversation_limit: int = 10,
+    per_conversation_limit: int = 5,
+) -> List[dict]:
+    conversations = list_conversations(page_id, page_access_token, limit=conversation_limit).get("data", [])
     messages: List[dict] = []
     for conversation in conversations:
         conversation_id = conversation.get("id")
@@ -576,7 +597,7 @@ def list_recent_messages(page_id: str, page_access_token: str, limit: int = 10) 
             f"{GRAPH_BASE}/{conversation_id}/messages",
             params={
                 "access_token": page_access_token,
-                "limit": 5,
+                "limit": per_conversation_limit,
                 "fields": "id,created_time,from,message",
             },
             timeout=30,
@@ -586,21 +607,42 @@ def list_recent_messages(page_id: str, page_access_token: str, limit: int = 10) 
     return messages
 
 
-def poll_conversations_once(config: MessengerConfig, initialize_only: bool = False) -> int:
+def poll_conversations_once(
+    config: MessengerConfig,
+    initialize_only: bool = False,
+    conversation_limit: int = 10,
+    per_conversation_limit: int = 5,
+    use_ai: bool = True,
+) -> dict:
     if not config.page_id:
         raise RuntimeError("META_PAGE_ID is required when polling is enabled")
 
     seen = load_seen_message_ids(config.poll_state_path)
     drafts = load_drafts(config.drafts_path)
-    reply_count = 0
+    result = {
+        "reply_count": 0,
+        "initialize_only": initialize_only,
+        "processed_count": 0,
+        "seen_before_count": 0,
+        "skipped_page_or_empty_count": 0,
+        "initialized_seen_count": 0,
+        "errors": [],
+    }
     now_ts = int(time.time())
     bootstrap_cutoff_ts = now_ts - max(config.bootstrap_reply_lookback_seconds, 0)
 
-    for message in list_recent_messages(config.page_id, config.page_access_token):
+    for message in list_recent_messages(
+        config.page_id,
+        config.page_access_token,
+        conversation_limit=conversation_limit,
+        per_conversation_limit=per_conversation_limit,
+    ):
         message_id = compact(message.get("id"))
         if not message_id or message_id in seen:
+            result["seen_before_count"] += 1
             continue
 
+        result["processed_count"] += 1
         sender = message.get("from", {}) or {}
         sender_id = compact(sender.get("id"))
         text = compact(message.get("message"))
@@ -611,10 +653,12 @@ def poll_conversations_once(config: MessengerConfig, initialize_only: bool = Fal
             is_old = created_ts is not None and created_ts < bootstrap_cutoff_ts
             if not sender_id or sender_id == config.page_id or not text or is_old:
                 seen.add(message_id)
+                result["initialized_seen_count"] += 1
             continue
 
         if not sender_id or sender_id == config.page_id or not text:
             seen.add(message_id)
+            result["skipped_page_or_empty_count"] += 1
             continue
 
         reply = build_reply(
@@ -623,23 +667,33 @@ def poll_conversations_once(config: MessengerConfig, initialize_only: bool = Fal
             config.listing_doc_url,
             config.openai_api_key,
             config.openai_model,
+            use_ai=use_ai,
         )
         try:
             send_message(config.page_access_token, sender_id, reply)
             seen.add(message_id)
-            reply_count += 1
+            result["reply_count"] += 1
             print(f"Poll replied to {sender_id}: {text[:80]}")
         except Exception as exc:
             print(f"Poll failed sending to {sender_id}: {exc}")
+            result["errors"].append(
+                {
+                    "message_id": message_id,
+                    "sender_id": sender_id,
+                    "text_preview": text[:120],
+                    "error": str(exc),
+                }
+            )
 
     save_seen_message_ids(config.poll_state_path, seen)
-    return reply_count
+    return result
 
 
 def start_conversation_poller(config: MessengerConfig, interval_seconds: int):
     def worker():
         try:
-            poll_conversations_once(config, initialize_only=True)
+            init_result = poll_conversations_once(config, initialize_only=True)
+            print(f"Conversation poller initialized existing messages as seen: {json.dumps(init_result)}")
             print("Conversation poller initialized existing messages as seen")
         except Exception as exc:
             print(f"Conversation poller init failed: {exc}")
@@ -647,7 +701,9 @@ def start_conversation_poller(config: MessengerConfig, interval_seconds: int):
         while True:
             time.sleep(interval_seconds)
             try:
-                poll_conversations_once(config)
+                result = poll_conversations_once(config)
+                if result.get("reply_count") or result.get("errors"):
+                    print(f"Conversation poll result: {json.dumps(result)}")
             except Exception as exc:
                 print(f"Conversation poller failed: {exc}")
 
