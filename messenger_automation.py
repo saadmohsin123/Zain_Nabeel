@@ -444,12 +444,20 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
         if parsed.path == "/poll-once":
             token = params.get("token", [""])[0]
             initialize_only = params.get("initialize_only", ["0"])[0] in ("1", "true", "yes")
+            reset_seen = params.get("reset_seen", ["0"])[0] in ("1", "true", "yes")
             if token != self.config.verify_token:
                 self.send_error(403, "Forbidden")
                 return
             try:
+                if reset_seen and self.config.poll_state_path.exists():
+                    self.config.poll_state_path.unlink()
                 replies = poll_conversations_once(self.config, initialize_only=initialize_only)
-                self._send_json(200, {"ok": True, "reply_count": replies, "initialize_only": initialize_only})
+                self._send_json(200, {
+                    "ok": True,
+                    "reply_count": replies,
+                    "initialize_only": initialize_only,
+                    "reset_seen": reset_seen,
+                })
             except Exception as exc:
                 self._send_json(500, {"ok": False, "error": str(exc)})
             return
