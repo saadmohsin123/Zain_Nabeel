@@ -54,6 +54,20 @@ import requests
 
 GRAPH_BASE = "https://graph.facebook.com/v20.0"
 OPENAI_RESPONSES_API = "https://api.openai.com/v1/responses"
+QUALIFICATION_QUESTIONS = [
+    ("move_in_date", "Perfect. What’s your expected move-in date?"),
+    ("people_on_lease", "How many people will be on the lease?"),
+    ("adults_in_unit", "How many adults will be living in the unit?"),
+    ("kids_in_unit", "How many kids will be living in the unit?"),
+    (
+        "family_gross_income",
+        "What is your total family gross income? Please do not include cash income.",
+    ),
+    ("occupation", "What do you do for work?"),
+    ("resident_status", "What is your resident status in Canada?"),
+    ("working_with_agent", "Are you currently working with an agent?"),
+    ("phone_number", "What is the best phone number to reach you on?"),
+]
 
 
 def must_env(name: str, default: Optional[str] = None) -> str:
@@ -249,6 +263,147 @@ def shortlist_for_booking(matches: List[dict]) -> List[dict]:
     return [draft for draft in matches if is_listing_ready(draft)]
 
 
+def looks_like_affirmative(query: str) -> bool:
+    q = query.lower().strip()
+    affirmatives = {
+        "yes",
+        "y",
+        "yeah",
+        "yup",
+        "sure",
+        "okay",
+        "ok",
+        "please do",
+        "sounds good",
+        "why not",
+        "interested",
+    }
+    return q in affirmatives or q.startswith("yes ") or q.startswith("yup ")
+
+
+def wants_listing_help(query: str) -> bool:
+    q = query.lower()
+    phrases = [
+        "looking for",
+        "show me",
+        "send me listings",
+        "send listings",
+        "properties",
+        "rent",
+        "lease",
+        "apartment",
+        "condo",
+        "house",
+        "bedroom",
+    ]
+    return any(phrase in q for phrase in phrases)
+
+
+def load_lead_state(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_lead_state(path: Path, payload: dict):
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def get_lead_session(state: dict, sender_id: str) -> dict:
+    sessions = state.setdefault("sessions", {})
+    return sessions.setdefault(sender_id, {"active": False, "step": 0, "answers": {}})
+
+
+def format_lead_summary(answers: dict) -> str:
+    labels = {
+        "move_in_date": "Move-in date",
+        "people_on_lease": "No. of people on lease",
+        "adults_in_unit": "No. of adults in the unit",
+        "kids_in_unit": "No. of kids in the unit",
+        "family_gross_income": "Total family gross income",
+        "occupation": "Occupation",
+        "resident_status": "Resident status",
+        "working_with_agent": "Working with an agent",
+        "phone_number": "Phone number",
+    }
+    lines = []
+    for key, _ in QUALIFICATION_QUESTIONS:
+        value = compact(answers.get(key))
+        if value:
+            lines.append(f"{labels[key]}: {value}")
+    return "\n".join(lines)
+
+
+def begin_qualification_flow(agent_name: str) -> str:
+    intro = (
+        f"That’s great. Allow me to introduce myself, I’m {agent_name}, a local realtor here in Toronto. "
+        "If you’re open to it, I can make your home search a lot easier because I have access to rentals across the market, "
+        "including ones not posted on Facebook, and there is no cost to you because the landlord pays my fee.\n\n"
+        "Before I send you the best active options, I just need a few quick details to qualify your search."
+    )
+    return f"{intro}\n\n{QUALIFICATION_QUESTIONS[0][1]}"
+
+
+def should_start_qualification(query: str, calendly_url: str) -> bool:
+    q = query.lower()
+    if looks_like_booking_request(query):
+        return True
+    if "send me" in q and "listing" in q:
+        return True
+    if "help me" in q and ("find" in q or "search" in q):
+        return True
+    if calendly_url and ("call" in q or "viewing" in q or "meeting" in q):
+        return True
+    return False
+
+
+def maybe_handle_qualification(
+    sender_id: str,
+    query: str,
+    lead_state_path: Path,
+    agent_name: str,
+    calendly_url: str,
+) -> Optional[str]:
+    state = load_lead_state(lead_state_path)
+    session = get_lead_session(state, sender_id)
+
+    if session.get("active"):
+        step = int(session.get("step", 0))
+        answers = session.setdefault("answers", {})
+        if step < len(QUALIFICATION_QUESTIONS):
+            key, _ = QUALIFICATION_QUESTIONS[step]
+            answers[key] = compact(query)
+            step += 1
+            session["step"] = step
+            if step < len(QUALIFICATION_QUESTIONS):
+                save_lead_state(lead_state_path, state)
+                return QUALIFICATION_QUESTIONS[step][1]
+
+            session["active"] = False
+            session["completed_at"] = int(time.time())
+            save_lead_state(lead_state_path, state)
+            summary = format_lead_summary(answers)
+            closing = (
+                "Perfect, I’ve got everything I need. I’ll use this to narrow down the strongest active options for you."
+            )
+            if calendly_url:
+                closing += f" If you’d like, you can also book a call or viewing here: {calendly_url}"
+            return f"{closing}\n\nHere’s what I collected:\n{summary}"
+
+    if should_start_qualification(query, calendly_url):
+        session["active"] = True
+        session["step"] = 0
+        session["answers"] = {}
+        save_lead_state(lead_state_path, state)
+        return begin_qualification_flow(agent_name)
+
+    return None
+
+
 def build_openai_headers(api_key: str) -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {api_key}",
@@ -326,15 +481,27 @@ def generate_ai_reply(
 
 
 def build_reply(
+    sender_id: str,
     query: str,
     drafts: List[dict],
     listing_doc_url: str,
     calendly_url: str = "",
     agent_name: str = "Nabeel",
+    lead_state_path: Path = Path("lead_intake_state.json"),
     openai_api_key: str = "",
     openai_model: str = "gpt-4.1-mini",
     use_ai: bool = True,
 ) -> str:
+    qualification_reply = maybe_handle_qualification(
+        sender_id,
+        query,
+        lead_state_path,
+        agent_name,
+        calendly_url,
+    )
+    if qualification_reply:
+        return qualification_reply
+
     normalized = query.lower().strip()
     link_only_patterns = [
         "doc",
@@ -461,6 +628,7 @@ class MessengerConfig:
     listing_doc_url: str = ""
     calendly_url: str = ""
     agent_name: str = "Nabeel"
+    lead_state_path: Path = Path("lead_intake_state.json")
     page_id: str = ""
     poll_state_path: Path = Path("messenger_poll_state.json")
     openai_api_key: str = ""
@@ -493,6 +661,7 @@ def make_config() -> MessengerConfig:
         listing_doc_url=os.getenv("LISTING_DOC_URL", ""),
         calendly_url=os.getenv("CALENDLY_URL", ""),
         agent_name=os.getenv("AGENT_NAME", "Nabeel"),
+        lead_state_path=Path(os.getenv("LEAD_STATE_FILE", "lead_intake_state.json")),
         page_id=page_id,
         poll_state_path=Path(os.getenv("POLL_STATE_FILE", "messenger_poll_state.json")),
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
@@ -642,11 +811,13 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                     print(f"Failed sending typing indicator to {sender_id}: {exc}")
 
                 reply = build_reply(
+                    sender_id,
                     text,
                     drafts,
                     self.config.listing_doc_url,
                     calendly_url=self.config.calendly_url,
                     agent_name=self.config.agent_name,
+                    lead_state_path=self.config.lead_state_path,
                     openai_api_key=self.config.openai_api_key,
                     openai_model=self.config.openai_model,
                     use_ai=True,
@@ -785,11 +956,13 @@ def poll_conversations_once(
             print(f"Poll failed sending typing indicator to {sender_id}: {exc}")
 
         reply = build_reply(
+            sender_id,
             text,
             drafts,
             config.listing_doc_url,
             calendly_url=config.calendly_url,
             agent_name=config.agent_name,
+            lead_state_path=config.lead_state_path,
             openai_api_key=config.openai_api_key,
             openai_model=config.openai_model,
             use_ai=use_ai,
