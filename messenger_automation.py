@@ -92,18 +92,18 @@ QUERY_STOPWORDS = {
     "you",
 }
 QUALIFICATION_QUESTIONS = [
-    ("move_in_date", "Perfect. What’s your expected move-in date?"),
+    ("move_in_date", "Perfect. First, what’s your expected move-in date?"),
     ("people_on_lease", "How many people will be on the lease?"),
     ("adults_in_unit", "How many adults will be living in the unit?"),
     ("kids_in_unit", "How many kids will be living in the unit?"),
     (
         "family_gross_income",
-        "What is your total family gross income? Please do not include cash income.",
+        "What’s your total family gross income? Please do not include cash income.",
     ),
     ("occupation", "What do you do for work?"),
     ("resident_status", "What is your resident status in Canada?"),
     ("working_with_agent", "Are you currently working with an agent?"),
-    ("phone_number", "What is the best phone number to reach you on?"),
+    ("phone_number", "And what’s the best phone number to reach you on?"),
 ]
 
 
@@ -398,7 +398,15 @@ def save_lead_state(path: Path, payload: dict):
 
 def get_lead_session(state: dict, sender_id: str) -> dict:
     sessions = state.setdefault("sessions", {})
-    return sessions.setdefault(sender_id, {"active": False, "step": 0, "answers": {}})
+    return sessions.setdefault(
+        sender_id,
+        {
+            "active": False,
+            "awaiting_opt_in": False,
+            "step": 0,
+            "answers": {},
+        },
+    )
 
 
 def format_lead_summary(answers: dict) -> str:
@@ -422,18 +430,20 @@ def format_lead_summary(answers: dict) -> str:
 
 
 def begin_qualification_flow(agent_name: str) -> str:
-    intro = (
-        f"That’s great. Allow me to introduce myself, I’m {agent_name}, a local realtor here in Toronto. "
-        "If you’re open to it, I can make your home search a lot easier because I have access to rentals across the market, "
-        "including ones not posted on Facebook, and there is no cost to you because the landlord pays my fee.\n\n"
-        "Before I send you the best active options, I just need a few quick details to qualify your search."
+    return (
+        f"That’s great! Allow me to introduce myself, I’m {agent_name}, a local realtor here in Toronto. "
+        "If you’re open to it, I can actually make your home search a lot easier as I have access to all the rentals on the market "
+        "(including ones not on Facebook), and the best part is there’s no cost to you at all. The landlord pays my fee!\n\n"
+        "Would you like me to send you a list of the best active listings in your area and price range? "
+        "You can pick your favourites and we can go from there."
     )
-    return f"{intro}\n\n{QUALIFICATION_QUESTIONS[0][1]}"
 
 
 def should_start_qualification(query: str, calendly_url: str) -> bool:
     q = query.lower()
     if looks_like_booking_request(query):
+        return True
+    if wants_listing_help(query):
         return True
     if "send me" in q and "listing" in q:
         return True
@@ -454,6 +464,25 @@ def maybe_handle_qualification(
     state = load_lead_state(lead_state_path)
     session = get_lead_session(state, sender_id)
 
+    if session.get("awaiting_opt_in"):
+        if looks_like_affirmative(query):
+            session["awaiting_opt_in"] = False
+            session["active"] = True
+            session["step"] = 0
+            session["answers"] = {}
+            save_lead_state(lead_state_path, state)
+            return (
+                "Perfect. Before we proceed ahead please let me know the following details.\n\n"
+                + QUALIFICATION_QUESTIONS[0][1]
+            )
+
+        session["awaiting_opt_in"] = False
+        save_lead_state(lead_state_path, state)
+        return (
+            "No problem. Whenever you’re ready, just tell me your preferred area, budget, and unit type, "
+            "and I’ll help from there."
+        )
+
     if session.get("active"):
         step = int(session.get("step", 0))
         answers = session.setdefault("answers", {})
@@ -470,15 +499,14 @@ def maybe_handle_qualification(
             session["completed_at"] = int(time.time())
             save_lead_state(lead_state_path, state)
             summary = format_lead_summary(answers)
-            closing = (
-                "Perfect, I’ve got everything I need. I’ll use this to narrow down the strongest active options for you."
-            )
+            closing = "Perfect, I’ve got everything I need. I’ll use this to narrow down the best active listings for you."
             if calendly_url:
-                closing += f" If you’d like, you can also book a call or viewing here: {calendly_url}"
+                closing += f"\n\nIf you’d like to book a call as well, here’s the link: {calendly_url}"
             return f"{closing}\n\nHere’s what I collected:\n{summary}"
 
     if should_start_qualification(query, calendly_url):
-        session["active"] = True
+        session["awaiting_opt_in"] = True
+        session["active"] = False
         session["step"] = 0
         session["answers"] = {}
         save_lead_state(lead_state_path, state)
