@@ -37,8 +37,10 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import csv
 import hashlib
 import hmac
+import io
 import json
 import os
 import re
@@ -48,12 +50,47 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
 import requests
 
 
 GRAPH_BASE = "https://graph.facebook.com/v20.0"
 OPENAI_RESPONSES_API = "https://api.openai.com/v1/responses"
+DEFAULT_SHEET_GID = "0"
+_DRAFT_CACHE: dict = {"source": "", "fetched_at": 0.0, "drafts": []}
+QUERY_STOPWORDS = {
+    "a",
+    "an",
+    "any",
+    "are",
+    "available",
+    "book",
+    "can",
+    "could",
+    "for",
+    "find",
+    "help",
+    "i",
+    "in",
+    "is",
+    "listings",
+    "listing",
+    "me",
+    "please",
+    "properties",
+    "property",
+    "rentals",
+    "search",
+    "show",
+    "tell",
+    "the",
+    "there",
+    "to",
+    "want",
+    "what",
+    "you",
+}
 QUALIFICATION_QUESTIONS = [
     ("move_in_date", "Perfect. What’s your expected move-in date?"),
     ("people_on_lease", "How many people will be on the lease?"),
@@ -105,6 +142,42 @@ def load_drafts(path: Path) -> List[dict]:
     return payload if isinstance(payload, list) else []
 
 
+def parse_spreadsheet_id(listing_doc_url: str) -> str:
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", listing_doc_url)
+    return match.group(1) if match else ""
+
+
+def parse_sheet_gid(listing_doc_url: str) -> str:
+    parsed = urlparse(listing_doc_url)
+    params = parse_qs(parsed.query)
+    gid = compact(params.get("gid", [""])[0])
+    if gid:
+        return gid
+    fragment_params = parse_qs(parsed.fragment)
+    gid = compact(fragment_params.get("gid", [""])[0])
+    return gid or DEFAULT_SHEET_GID
+
+
+def build_sheet_csv_url(listing_doc_url: str) -> str:
+    spreadsheet_id = parse_spreadsheet_id(listing_doc_url)
+    if not spreadsheet_id:
+        return ""
+    gid = parse_sheet_gid(listing_doc_url)
+    return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?format=csv&gid={gid}"
+
+
+def fetch_sheet_drafts(csv_url: str) -> List[dict]:
+    resp = requests.get(csv_url, timeout=30)
+    resp.raise_for_status()
+    rows = csv.DictReader(io.StringIO(resp.text))
+    drafts: List[dict] = []
+    for row in rows:
+        normalized = {compact(key): value for key, value in row.items() if compact(key)}
+        if compact(normalized.get("ListingKey")):
+            drafts.append(normalized)
+    return drafts
+
+
 def compact(value) -> str:
     if value in (None, "", []):
         return ""
@@ -124,7 +197,7 @@ def parse_graph_time(value: str) -> Optional[int]:
 
 
 def tokenize(text: str) -> List[str]:
-    return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t]
+    return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t and t not in QUERY_STOPWORDS]
 
 
 def draft_text(draft: dict) -> str:
@@ -594,6 +667,33 @@ def build_reply(
     return "\n".join(lines)
 
 
+def current_drafts(config: MessengerConfig) -> List[dict]:
+    now = time.time()
+    source = config.drafts_sheet_csv_url or str(config.drafts_path)
+    cached_source = compact(_DRAFT_CACHE.get("source"))
+    cached_at = float(_DRAFT_CACHE.get("fetched_at") or 0.0)
+    cached_drafts = _DRAFT_CACHE.get("drafts") or []
+    if cached_source == source and now - cached_at < max(config.drafts_cache_seconds, 1):
+        return list(cached_drafts)
+
+    drafts: List[dict] = []
+    if config.drafts_sheet_csv_url:
+        try:
+            drafts = fetch_sheet_drafts(config.drafts_sheet_csv_url)
+            print(f"Loaded {len(drafts)} drafts from sheet CSV")
+        except Exception as exc:
+            print(f"Failed loading sheet drafts: {exc}")
+
+    if not drafts:
+        drafts = current_drafts(config)
+        print(f"Loaded {len(drafts)} drafts from local JSON fallback")
+
+    _DRAFT_CACHE["source"] = source
+    _DRAFT_CACHE["fetched_at"] = now
+    _DRAFT_CACHE["drafts"] = list(drafts)
+    return drafts
+
+
 def send_message(page_access_token: str, recipient_id: str, text: str) -> dict:
     url = f"{GRAPH_BASE}/me/messages"
     payload = {
@@ -641,6 +741,8 @@ class MessengerConfig:
     verify_token: str
     app_secret: str = ""
     drafts_path: Path = Path("marketplace_drafts.json")
+    drafts_sheet_csv_url: str = ""
+    drafts_cache_seconds: int = 30
     listing_doc_url: str = ""
     calendly_url: str = ""
     agent_name: str = "Nabeel"
@@ -669,12 +771,17 @@ def make_config() -> MessengerConfig:
         page_access_token = resolve_page_access_token(user_access_token, page_id)
         token_source = "derived-from-user"
 
+    listing_doc_url = os.getenv("LISTING_DOC_URL", "")
+    drafts_sheet_csv_url = optional_env("MARKETPLACE_DRAFTS_SHEET_CSV_URL", "") or build_sheet_csv_url(listing_doc_url)
+
     return MessengerConfig(
         page_access_token=page_access_token,
         verify_token=must_env("META_VERIFY_TOKEN"),
         app_secret=os.getenv("META_APP_SECRET", ""),
         drafts_path=Path(os.getenv("MARKETPLACE_DRAFTS_JSON", "marketplace_drafts.json")),
-        listing_doc_url=os.getenv("LISTING_DOC_URL", ""),
+        drafts_sheet_csv_url=drafts_sheet_csv_url,
+        drafts_cache_seconds=int(os.getenv("DRAFTS_CACHE_SECONDS", "30") or "30"),
+        listing_doc_url=listing_doc_url,
         calendly_url=os.getenv("CALENDLY_URL", ""),
         agent_name=os.getenv("AGENT_NAME", "Nabeel"),
         lead_state_path=Path(os.getenv("LEAD_STATE_FILE", "lead_intake_state.json")),
@@ -726,7 +833,8 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                 200,
                 {
                     "ok": True,
-                    "draft_count": len(load_drafts(self.config.drafts_path)),
+                    "draft_count": len(current_drafts(self.config)),
+                    "draft_source": self.config.drafts_sheet_csv_url or str(self.config.drafts_path),
                     "has_page_access_token": bool(self.config.page_access_token),
                     "token_source": self.config.token_source,
                     "has_app_secret": bool(self.config.app_secret),
@@ -810,7 +918,7 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"status": "ok"})
 
     def process_webhook(self, payload: dict):
-        drafts = load_drafts(self.config.drafts_path)
+        drafts = current_drafts(self.config)
         entry_list = payload.get("entry", [])
         for entry in entry_list:
             messaging = entry.get("messaging", [])
@@ -923,7 +1031,7 @@ def poll_conversations_once(
         raise RuntimeError("META_PAGE_ID is required when polling is enabled")
 
     seen = load_seen_message_ids(config.poll_state_path)
-    drafts = load_drafts(config.drafts_path)
+    drafts = current_drafts(config)
     result = {
         "reply_count": 0,
         "initialize_only": initialize_only,

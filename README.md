@@ -6,7 +6,7 @@ Messenger automation for the Durham New Homes Meta Page.
 
 - Verifies Meta webhook challenges at `GET /webhook`.
 - Receives Messenger webhook events at `POST /webhook`.
-- Matches incoming messages against `marketplace_drafts.json`.
+- Matches incoming messages against the shared Google Sheet `Overview` tab when available, with `marketplace_drafts.json` as a fallback.
 - Replies with the matching listing summary and the seller packet link.
 - Optionally polls Page conversations as a fallback when Meta does not deliver production webhooks while the app is still in development/review.
 
@@ -21,6 +21,7 @@ META_APP_SECRET=
 META_PAGE_ID=803463962847979
 LISTING_DOC_URL=https://docs.google.com/spreadsheets/d/13u__qGNeV46Q9rREPbbDnzhZdNeNvxID4FGaH7Y47xo/edit
 MARKETPLACE_DRAFTS_JSON=marketplace_drafts.json
+DRAFTS_CACHE_SECONDS=30
 ```
 
 Optional polling fallback:
