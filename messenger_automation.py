@@ -146,26 +146,41 @@ def normalize_status(value: str) -> str:
     return compact(value).strip().lower()
 
 
+def is_rental_listing(draft: dict) -> bool:
+    transaction_type = normalize_status(compact(draft.get("TransactionType")))
+    allowed = {
+        "for lease",
+        "for rent",
+        "lease",
+        "rent",
+    }
+    return transaction_type in allowed
+
+
 def is_listing_ready(draft: dict) -> bool:
     marketplace_status = normalize_status(compact(draft.get("MarketplaceStatus")))
     lifecycle_status = normalize_status(compact(draft.get("ListingLifecycleStatus")))
-    blocked_marketplace = {
-        "pending seller action",
-        "archived",
-        "needs review",
-        "draft",
+    allowed_marketplace = {
+        "posted",
+        "active",
+        "approved",
     }
     blocked_lifecycle = {
         "expired",
         "terminated",
         "closed",
         "suspended",
+        "leased",
     }
-    if marketplace_status in blocked_marketplace:
+    if marketplace_status not in allowed_marketplace:
         return False
-    if lifecycle_status in blocked_lifecycle:
+    if lifecycle_status and lifecycle_status in blocked_lifecycle:
         return False
-    return True
+    return is_rental_listing(draft)
+
+
+def customer_visible_drafts(drafts: List[dict]) -> List[dict]:
+    return [draft for draft in drafts if is_listing_ready(draft)]
 
 
 def rank_drafts(query: str, drafts: List[dict], limit: int = 3) -> List[dict]:
@@ -173,8 +188,9 @@ def rank_drafts(query: str, drafts: List[dict], limit: int = 3) -> List[dict]:
     if not q_tokens:
         return []
 
-    ready_drafts = [draft for draft in drafts if is_listing_ready(draft)]
-    candidate_drafts = ready_drafts or drafts
+    candidate_drafts = customer_visible_drafts(drafts)
+    if not candidate_drafts:
+        return []
 
     scored: List[Tuple[int, dict]] = []
     for draft in candidate_drafts:
@@ -197,8 +213,6 @@ def rank_drafts(query: str, drafts: List[dict], limit: int = 3) -> List[dict]:
 def summarize_draft(draft: dict) -> str:
     title = compact(draft.get("MarketplaceTitle")) or compact(draft.get("Address")) or "Listing"
     price = compact(draft.get("MarketplacePriceDisplay")) or compact(draft.get("MarketplacePrice"))
-    status = compact(draft.get("MarketplaceStatus")) or "Unknown"
-    lifecycle = compact(draft.get("ListingLifecycleStatus")) or "Unknown"
     tx = compact(draft.get("TransactionType"))
     city = compact(draft.get("City"))
     parts = [title]
@@ -208,8 +222,6 @@ def summarize_draft(draft: dict) -> str:
         parts.append(f"Transaction: {tx}")
     if city:
         parts.append(f"City: {city}")
-    parts.append(f"Marketplace: {status}")
-    parts.append(f"MLS: {lifecycle}")
     return " | ".join(parts)
 
 
@@ -236,8 +248,6 @@ def listing_context(draft: dict) -> dict:
         "ParkingFeatures",
         "ParkingSpaces",
         "MarketplaceDescription",
-        "ListingLifecycleStatus",
-        "MarketplaceStatus",
     ]
     return {field: draft.get(field) for field in fields if draft.get(field) not in (None, "", [])}
 
@@ -440,12 +450,13 @@ def generate_ai_reply(
         "Answer like a capable human leasing coordinator: warm, concise, natural, and practical. "
         "Use only the provided listing data and provided packet link. "
         "Do not invent features, pricing, amenities, policies, or availability. "
+        "Never mention internal workflow labels, back-office statuses, review states, or marketplace pipeline terms to the customer. "
         "If the user asks something not present in the data, say that it is not confirmed yet and ask a targeted follow-up. "
         "If the query is generic and no exact answer is available, guide the user to share the address, ListingKey, or unit number. "
         "Prefer short conversational paragraphs, not bullets, unless the user explicitly asks for a list. "
         "Avoid sounding robotic, overly formal, or repetitive. "
-        "Only describe listings as available if their marketplace/listing status indicates they are active or ready. "
-        "If a listing is pending seller action, needs review, archived, or otherwise not ready, say that clearly and do not pitch it as bookable. "
+        "Only describe listings as available if the provided data clearly shows they are customer-ready active rental listings. "
+        "If there are no customer-ready matches, say there are no active matches ready to share right now and offer to refine the search or follow up later. "
         "If the user wants to book a call, meeting, or showing and a Calendly URL is provided, offer that booking link naturally."
     )
     user_prompt = {
@@ -560,9 +571,14 @@ def build_reply(
             print(f"AI reply generation failed: {exc}")
 
     if not matches:
+        if customer_visible_drafts(drafts):
+            return (
+                "I do not have an exact active match for that search yet. Send me the area, address, price range, "
+                "or unit type you want, and I will narrow it down."
+            )
         return (
-            "I could not match that listing yet. Send me the address, ListingKey, or unit number, "
-            "and I will pull the closest draft."
+            "I do not have any active rental listings ready to share right now. If you tell me the area, budget, "
+            "and unit type you want, I can note your search and help refine it."
         )
 
     lines = ["I found these matching listings:"]
