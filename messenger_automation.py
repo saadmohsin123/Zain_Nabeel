@@ -26,6 +26,8 @@ Optional env vars:
 - META_USER_ACCESS_TOKEN      # optional fallback to derive a page token for META_PAGE_ID
 - OPENAI_API_KEY              # optional conversational answer generation
 - OPENAI_MODEL                # default: gpt-4.1-mini
+- CALENDLY_URL                # optional booking link for calls/showings
+- AGENT_NAME                  # default: Nabeel
 - POLL_CONVERSATIONS_SECONDS  # optional fallback when Meta does not deliver webhooks
 - POLL_STATE_FILE             # default: messenger_poll_state.json
 - MESSENGER_PORT              # default: 8000
@@ -35,8 +37,10 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import csv
 import hashlib
 import hmac
+import io
 import json
 import os
 import re
@@ -46,181 +50,82 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
 import requests
 
 
 GRAPH_BASE = "https://graph.facebook.com/v20.0"
 OPENAI_RESPONSES_API = "https://api.openai.com/v1/responses"
-LEAD_QUESTION_GROUPS = [
-    {
-        "fields": ["move_in_date", "people_on_lease"],
-        "prompt": "Perfect. Before we proceed, please let me know your move-in date and how many people will be on the lease.",
-    },
-    {
-        "fields": ["adults_in_unit", "kids_in_unit"],
-        "prompt": "Thanks. How many adults and how many kids will be living in the unit?",
-    },
-    {
-        "fields": ["gross_income"],
-        "prompt": "What is your total family gross income before taxes? Please do not include cash income.",
-    },
-    {
-        "fields": ["occupation", "resident_status"],
-        "prompt": "What is your occupation, and what is your resident status in Canada?",
-    },
-    {
-        "fields": ["working_with_agent", "phone_number"],
-        "prompt": "Last two: are you currently working with an agent, and what is the best phone number to reach you on?",
-    },
-]
-QUALIFICATION_POSITIVE_SIGNALS = [
-    "yes",
-    "yeah",
-    "yup",
-    "sure",
-    "okay",
-    "ok",
-    "please",
-    "sounds good",
-    "go ahead",
-    "send me listings",
-    "send listings",
-    "show me",
-    "help me",
-    "move forward",
-    "interested",
-    "schedule",
-    "meeting",
-    "viewing",
-    "showing",
+DEFAULT_SHEET_GID = "0"
+_DRAFT_CACHE: dict = {"source": "", "fetched_at": 0.0, "drafts": []}
+QUERY_STOPWORDS = {
+    "a",
+    "an",
+    "any",
+    "are",
+    "available",
     "book",
-    "call",
-    "tour",
-    "find me",
-]
-QUALIFICATION_NEGATIVE_SIGNALS = [
-    "no",
-    "not now",
-    "later",
-    "no thanks",
-    "stop",
-    "skip",
-]
-DOWNTOWN_TORONTO_CODES = {"c01", "c08", "c02"}
-GREETING_ONLY_MESSAGES = {
-    "hi",
-    "hello",
-    "hey",
-    "yo",
-    "sup",
-    "good morning",
-    "good afternoon",
-    "good evening",
+    "can",
+    "could",
+    "for",
+    "find",
+    "help",
+    "i",
+    "in",
+    "is",
+    "listings",
+    "listing",
+    "me",
+    "please",
+    "properties",
+    "property",
+    "rentals",
+    "search",
+    "show",
+    "tell",
+    "the",
+    "there",
+    "to",
+    "want",
+    "what",
+    "you",
 }
-
-
-def normalize_text(value: str) -> str:
-    return compact(value).lower()
-
-
-def search_request_detected(query: str) -> bool:
-    normalized = normalize_text(query)
-    if not normalized:
-        return False
-    if normalized in GREETING_ONLY_MESSAGES:
-        return False
-    if re.search(r"\b\d+\s*bed(room)?\b", normalized):
-        return True
-    if re.search(r"\b\d+\s*bath(room)?\b", normalized):
-        return True
-    search_markers = [
-        "looking for",
-        "need a",
-        "need an",
-        "want a",
-        "want an",
-        "apartment",
-        "condo",
-        "house",
-        "townhouse",
-        "studio",
-        "basement",
-        "lease",
-        "rent",
-        "downtown",
-        "toronto",
-        "mississauga",
-        "scarborough",
-        "north york",
-        "etobicoke",
-        "markham",
-        "brampton",
-        "oakville",
-        "vaughan",
-        "richmond hill",
-    ]
-    return any(marker in normalized for marker in search_markers)
-
-
-def parse_price_ceiling(query: str) -> Optional[int]:
-    normalized = normalize_text(query).replace(",", "")
-    match = re.search(r"\$?\s*(\d{3,6})\s*(?:/month|monthly|month)?", normalized)
-    if not match:
-        return None
-    try:
-        value = int(match.group(1))
-    except Exception:
-        return None
-    if value < 400:
-        return None
-    return value
-
-
-def extract_search_preferences(query: str) -> dict:
-    normalized = normalize_text(query)
-    prefs: dict = {"raw_query": compact(query)}
-
-    bed_match = re.search(r"\b(\d+)\s*bed(?:room)?s?\b", normalized)
-    if bed_match:
-        prefs["bedrooms"] = int(bed_match.group(1))
-
-    bath_match = re.search(r"\b(\d+)\s*bath(?:room)?s?\b", normalized)
-    if bath_match:
-        prefs["bathrooms"] = int(bath_match.group(1))
-
-    price_ceiling = parse_price_ceiling(query)
-    if price_ceiling:
-        prefs["max_price"] = price_ceiling
-
-    if "downtown toronto" in normalized or "downtown" in normalized:
-        prefs["city"] = "toronto"
-        prefs["downtown"] = True
-    else:
-        city_aliases = [
-            "toronto",
-            "mississauga",
-            "scarborough",
-            "north york",
-            "etobicoke",
-            "markham",
-            "brampton",
-            "oakville",
-            "vaughan",
-            "richmond hill",
-        ]
-        for city in city_aliases:
-            if city in normalized:
-                prefs["city"] = city
-                break
-
-    unit_types = ["apartment", "condo", "house", "townhouse", "studio", "basement"]
-    for unit_type in unit_types:
-        if unit_type in normalized:
-            prefs["property_type"] = unit_type
-            break
-
-    return prefs
+QUALIFICATION_STEPS = [
+    {"key": "move_in_date", "prompt": "What’s your expected move-in date?"},
+    {"key": "people_on_lease", "prompt": "How many people will be on the lease?"},
+    {"key": "adults_in_unit", "prompt": "How many adults will be living in the unit?"},
+    {"key": "kids_in_unit", "prompt": "How many kids will be living in the unit?"},
+    {
+        "key": "family_gross_income",
+        "prompt": "What’s your total family gross income? Please do not include cash income.",
+    },
+    {"key": "occupation", "prompt": "What do you do for work?"},
+    {"key": "resident_status", "prompt": "What is your resident status in Canada?"},
+    {"key": "working_with_agent", "prompt": "Are you currently working with an agent?"},
+    {"key": "phone_number", "prompt": "And what’s the best phone number to reach you on?"},
+]
+QUALIFICATION_BATCHES = [
+    {
+        "keys": ["move_in_date", "people_on_lease"],
+        "prompt": "Perfect. First, what’s your expected move-in date, and how many people will be on the lease?",
+    },
+    {
+        "keys": ["adults_in_unit", "kids_in_unit"],
+        "prompt": "Got it. How many adults will be living in the unit, and how many kids will be living there?",
+    },
+    {
+        "keys": ["family_gross_income", "occupation"],
+        "prompt": "Thanks. What’s your total family gross income excluding cash income, and what do you do for work?",
+    },
+    {
+        "keys": ["resident_status", "working_with_agent", "phone_number"],
+        "prompt": (
+            "Last few details. What’s your resident status in Canada, are you currently working with an agent, "
+            "and what’s the best phone number to reach you on?"
+        ),
+    },
+]
 
 
 def must_env(name: str, default: Optional[str] = None) -> str:
@@ -258,18 +163,40 @@ def load_drafts(path: Path) -> List[dict]:
     return payload if isinstance(payload, list) else []
 
 
-def load_lead_state(path: Path) -> Dict[str, dict]:
-    if not path.exists():
-        return {}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return payload if isinstance(payload, dict) else {}
+def parse_spreadsheet_id(listing_doc_url: str) -> str:
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", listing_doc_url)
+    return match.group(1) if match else ""
 
 
-def save_lead_state(path: Path, state: Dict[str, dict]):
-    path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+def parse_sheet_gid(listing_doc_url: str) -> str:
+    parsed = urlparse(listing_doc_url)
+    params = parse_qs(parsed.query)
+    gid = compact(params.get("gid", [""])[0])
+    if gid:
+        return gid
+    fragment_params = parse_qs(parsed.fragment)
+    gid = compact(fragment_params.get("gid", [""])[0])
+    return gid or DEFAULT_SHEET_GID
+
+
+def build_sheet_csv_url(listing_doc_url: str) -> str:
+    spreadsheet_id = parse_spreadsheet_id(listing_doc_url)
+    if not spreadsheet_id:
+        return ""
+    gid = parse_sheet_gid(listing_doc_url)
+    return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?format=csv&gid={gid}"
+
+
+def fetch_sheet_drafts(csv_url: str) -> List[dict]:
+    resp = requests.get(csv_url, timeout=30)
+    resp.raise_for_status()
+    rows = csv.DictReader(io.StringIO(resp.text))
+    drafts: List[dict] = []
+    for row in rows:
+        normalized = {compact(key): value for key, value in row.items() if compact(key)}
+        if compact(normalized.get("ListingKey")):
+            drafts.append(normalized)
+    return drafts
 
 
 def compact(value) -> str:
@@ -291,7 +218,7 @@ def parse_graph_time(value: str) -> Optional[int]:
 
 
 def tokenize(text: str) -> List[str]:
-    return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t]
+    return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t and t not in QUERY_STOPWORDS]
 
 
 def draft_text(draft: dict) -> str:
@@ -309,128 +236,58 @@ def draft_text(draft: dict) -> str:
     return " ".join(bits).lower()
 
 
-def is_customer_visible(draft: dict) -> bool:
-    marketplace_status = compact(draft.get("MarketplaceStatus")).lower()
-    lifecycle_status = compact(draft.get("ListingLifecycleStatus")).lower()
-    transaction_type = compact(draft.get("TransactionType")).lower()
+def normalize_status(value: str) -> str:
+    return compact(value).strip().lower()
 
-    if marketplace_status != "posted":
+
+def is_rental_listing(draft: dict) -> bool:
+    transaction_type = normalize_status(compact(draft.get("TransactionType")))
+    allowed = {
+        "for lease",
+        "for rent",
+        "lease",
+        "rent",
+    }
+    return transaction_type in allowed
+
+
+def is_listing_ready(draft: dict) -> bool:
+    marketplace_status = normalize_status(compact(draft.get("MarketplaceStatus")))
+    lifecycle_status = normalize_status(compact(draft.get("ListingLifecycleStatus")))
+    allowed_marketplace = {
+        "posted",
+        "active",
+        "approved",
+    }
+    blocked_lifecycle = {
+        "expired",
+        "terminated",
+        "closed",
+        "suspended",
+        "leased",
+    }
+    if marketplace_status not in allowed_marketplace:
         return False
-    if lifecycle_status and lifecycle_status not in {"active", "new", "price change", "extension"}:
+    if lifecycle_status and lifecycle_status in blocked_lifecycle:
         return False
-    if transaction_type and not any(token in transaction_type for token in ("lease", "rent")):
-        return False
-    return True
+    return is_rental_listing(draft)
 
 
 def customer_visible_drafts(drafts: List[dict]) -> List[dict]:
-    return [draft for draft in drafts if is_customer_visible(draft)]
+    return [draft for draft in drafts if is_listing_ready(draft)]
 
 
-def matches_downtown_toronto(draft: dict) -> bool:
-    haystack = " ".join(
-        [
-            normalize_text(draft.get("Address")),
-            normalize_text(draft.get("City")),
-            normalize_text(draft.get("MarketplaceDescription")),
-        ]
-    )
-    if any(code in haystack for code in DOWNTOWN_TORONTO_CODES):
-        return True
-    downtown_markers = [
-        "downtown",
-        "cityplace",
-        "king west",
-        "queen west",
-        "entertainment district",
-        "waterfront",
-        "fort york",
-        "liberty village",
-    ]
-    return any(marker in haystack for marker in downtown_markers)
-
-
-def draft_price_value(draft: dict) -> Optional[int]:
-    for value in (draft.get("MarketplacePrice"), draft.get("MarketplacePriceDisplay")):
-        text = normalize_text(value).replace(",", "")
-        if not text:
-            continue
-        match = re.search(r"(\d{3,6})", text)
-        if match:
-            try:
-                return int(match.group(1))
-            except Exception:
-                pass
-    return None
-
-
-def preference_filtered_drafts(drafts: List[dict], prefs: dict) -> List[dict]:
-    filtered = list(drafts)
-
-    bedrooms = prefs.get("bedrooms")
-    if bedrooms is not None:
-        exact = [draft for draft in filtered if compact(draft.get("BedroomsTotal")) == str(bedrooms)]
-        filtered = exact
-        if not filtered:
-            return []
-
-    bathrooms = prefs.get("bathrooms")
-    if bathrooms is not None and filtered:
-        exact = [draft for draft in filtered if compact(draft.get("BathroomsTotal")) == str(bathrooms)]
-        filtered = exact
-        if not filtered:
-            return []
-
-    city = normalize_text(prefs.get("city"))
-    if city and filtered:
-        exact = [
-            draft
-            for draft in filtered
-            if city in normalize_text(draft.get("City")) or city in normalize_text(draft.get("Address"))
-        ]
-        filtered = exact
-        if not filtered:
-            return []
-
-    if prefs.get("downtown") and filtered:
-        exact = [draft for draft in filtered if matches_downtown_toronto(draft)]
-        filtered = exact
-        if not filtered:
-            return []
-
-    property_type = normalize_text(prefs.get("property_type"))
-    if property_type and filtered:
-        mapped_type = "condo" if property_type == "apartment" else property_type
-        exact = [
-            draft
-            for draft in filtered
-            if mapped_type in normalize_text(draft.get("PropertyType"))
-            or mapped_type in normalize_text(draft.get("MarketplaceTitle"))
-            or mapped_type in normalize_text(draft.get("MarketplaceDescription"))
-        ]
-        filtered = exact
-        if not filtered:
-            return []
-
-    max_price = prefs.get("max_price")
-    if max_price is not None and filtered:
-        exact = [draft for draft in filtered if (draft_price_value(draft) or 10**9) <= max_price]
-        filtered = exact
-        if not filtered:
-            return []
-
-    return filtered
-
-
-def rank_drafts(query: str, drafts: List[dict], limit: int = 3, prefs: Optional[dict] = None) -> List[dict]:
-    prefs = prefs or extract_search_preferences(query)
-    pool = preference_filtered_drafts(drafts, prefs)
+def rank_drafts(query: str, drafts: List[dict], limit: int = 3) -> List[dict]:
     q_tokens = tokenize(query)
     if not q_tokens:
         return []
 
+    candidate_drafts = customer_visible_drafts(drafts)
+    if not candidate_drafts:
+        return []
+
     scored: List[Tuple[int, dict]] = []
-    for draft in pool:
+    for draft in candidate_drafts:
         haystack = draft_text(draft)
         score = 0
         for token in q_tokens:
@@ -440,17 +297,6 @@ def rank_drafts(query: str, drafts: List[dict], limit: int = 3, prefs: Optional[
                 score += 5
             if token in compact(draft.get("Address")).lower():
                 score += 4
-        if prefs.get("bedrooms") is not None and compact(draft.get("BedroomsTotal")) == str(prefs["bedrooms"]):
-            score += 20
-        if prefs.get("bathrooms") is not None and compact(draft.get("BathroomsTotal")) == str(prefs["bathrooms"]):
-            score += 10
-        if normalize_text(prefs.get("city")) and (
-            normalize_text(prefs.get("city")) in normalize_text(draft.get("City"))
-            or normalize_text(prefs.get("city")) in normalize_text(draft.get("Address"))
-        ):
-            score += 12
-        if prefs.get("downtown") and matches_downtown_toronto(draft):
-            score += 20
         if score:
             scored.append((score, draft))
 
@@ -463,18 +309,9 @@ def summarize_draft(draft: dict) -> str:
     price = compact(draft.get("MarketplacePriceDisplay")) or compact(draft.get("MarketplacePrice"))
     tx = compact(draft.get("TransactionType"))
     city = compact(draft.get("City"))
-    beds = compact(draft.get("BedroomsTotal"))
-    baths = compact(draft.get("BathroomsTotal"))
-    area = compact(draft.get("LivingAreaRange"))
     parts = [title]
     if price:
         parts.append(f"Price: {price}")
-    if beds or baths:
-        label = " / ".join(part for part in [f"{beds} bed" if beds else "", f"{baths} bath" if baths else ""] if part)
-        if label:
-            parts.append(label)
-    if area:
-        parts.append(f"Size: {area}")
     if tx:
         parts.append(f"Transaction: {tx}")
     if city:
@@ -509,168 +346,519 @@ def listing_context(draft: dict) -> dict:
     return {field: draft.get(field) for field in fields if draft.get(field) not in (None, "", [])}
 
 
-def list_intent_detected(query: str) -> bool:
-    normalized = compact(query).lower()
-    if not normalized:
-        return False
-    return any(trigger in normalized for trigger in QUALIFICATION_POSITIVE_SIGNALS)
+def looks_like_booking_request(query: str) -> bool:
+    q = query.lower()
+    phrases = [
+        "book",
+        "booking",
+        "schedule",
+        "meeting",
+        "viewing",
+        "showing",
+        "call",
+        "available tomorrow",
+        "available today",
+        "availability",
+    ]
+    return any(phrase in q for phrase in phrases)
 
 
-def qualification_declined(query: str) -> bool:
-    normalized = compact(query).lower()
-    if not normalized:
-        return False
-    return any(trigger == normalized or trigger in normalized for trigger in QUALIFICATION_NEGATIVE_SIGNALS)
+def shortlist_for_booking(matches: List[dict]) -> List[dict]:
+    return [draft for draft in matches if is_listing_ready(draft)]
 
 
-def qualification_intro(search_summary: str = "") -> str:
-    context_line = f"Got it — you're looking for {search_summary}.\n\n" if search_summary else ""
+def looks_like_affirmative(query: str) -> bool:
+    q = query.lower().strip()
+    affirmatives = {
+        "yes",
+        "y",
+        "yeah",
+        "yup",
+        "sure",
+        "okay",
+        "ok",
+        "please do",
+        "sounds good",
+        "why not",
+        "interested",
+    }
+    return q in affirmatives or q.startswith("yes ") or q.startswith("yup ")
+
+
+def wants_listing_help(query: str) -> bool:
+    q = query.lower()
+    phrases = [
+        "looking for",
+        "show me",
+        "send me listings",
+        "send listings",
+        "properties",
+        "rent",
+        "lease",
+        "apartment",
+        "condo",
+        "house",
+        "bedroom",
+    ]
+    return any(phrase in q for phrase in phrases)
+
+def looks_like_greeting(query: str) -> bool:
+    q = query.lower().strip()
+    greetings = {
+        "hi",
+        "hello",
+        "hey",
+        "hiya",
+        "good morning",
+        "good afternoon",
+        "good evening",
+    }
+    return q in greetings
+
+
+def qualification_opt_in_prompt(agent_name: str) -> str:
     return (
-        f"{context_line}"
-        "I can help with that. Before I shortlist the best active options for you, "
-        "I just need a few quick details so I can qualify you properly."
+        begin_qualification_flow(agent_name)
+        + "\n\nWould you like me to send you a list of the best active listings in your area and price range? You can pick your favourites and we can go from there."
     )
 
 
-def qualification_group_index(state: dict) -> int:
+def load_lead_state(path: Path) -> dict:
+    if not path.exists():
+        return {}
     try:
-        return max(0, int(state.get("group_index", 0)))
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return 0
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
-def current_qualification_group(state: dict) -> Optional[dict]:
-    index = qualification_group_index(state)
-    if index >= len(LEAD_QUESTION_GROUPS):
-        return None
-    return LEAD_QUESTION_GROUPS[index]
+def save_lead_state(path: Path, payload: dict):
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def advance_qualification_group(state: dict) -> Optional[str]:
-    state["group_index"] = qualification_group_index(state) + 1
-    next_group = current_qualification_group(state)
-    if next_group is None:
-        state["awaiting_fields"] = []
-        return None
-    state["awaiting_fields"] = list(next_group["fields"])
-    return next_group["prompt"]
-
-
-def start_qualification_questions(state: dict, prefaced: bool = True) -> str:
-    state["started"] = True
-    state["intro_offered"] = True
-    state["group_index"] = 0
-    first_group = current_qualification_group(state)
-    state["awaiting_fields"] = list(first_group["fields"]) if first_group else []
-    intro = "Perfect. Before we proceed, I just need a few quick details so I can qualify you properly and send the best options.\n\n" if prefaced else ""
-    return f"{intro}{first_group['prompt']}"
-
-
-def parse_group_answers(raw_text: str, expected_fields: List[str]) -> Dict[str, str]:
-    lines = [line.strip(" -•\t") for line in raw_text.splitlines() if compact(line)]
-    if len(lines) >= len(expected_fields):
-        return {field: lines[i] for i, field in enumerate(expected_fields)}
-
-    text = compact(raw_text)
-    if len(expected_fields) == 2:
-        parts = [part.strip() for part in re.split(r"\s*(?:,|/| and | & )\s*", text, maxsplit=1) if compact(part)]
-        if len(parts) >= 2:
-            return {expected_fields[0]: parts[0], expected_fields[1]: parts[1]}
-
-    return {expected_fields[0]: text} if expected_fields else {}
-
-
-def qualification_completion_message(calendly_url: str) -> str:
-    base = (
-        "Perfect, thank you. I have all the details I need.\n\n"
-        "The next step is to book a quick call with Nabeel so he can review the best active listings for you and guide you on the next step."
-    )
-    if calendly_url:
-        return f"{base}\n\nYou can book here: {calendly_url}"
-    return base
-
-
-def describe_preferences(prefs: dict) -> str:
-    parts: List[str] = []
-    if prefs.get("bedrooms") is not None:
-        parts.append(f"{prefs['bedrooms']} bedroom")
-    if prefs.get("bathrooms") is not None:
-        parts.append(f"{prefs['bathrooms']} bathroom")
-    if prefs.get("property_type"):
-        parts.append(compact(prefs["property_type"]))
-    location = "downtown Toronto" if prefs.get("downtown") else compact(prefs.get("city"))
-    if location:
-        parts.append(f"in {location}")
-    if prefs.get("max_price") is not None:
-        parts.append(f"up to ${prefs['max_price']:,}")
-    return " ".join(parts).strip()
-
-
-def handle_qualification_turn(query: str, sender_id: str, lead_state: Dict[str, dict], calendly_url: str = "") -> Optional[str]:
-    if not sender_id:
-        return None
-
-    prefs = extract_search_preferences(query)
-    search_detected = search_request_detected(query)
-    state = lead_state.setdefault(
+def get_lead_session(state: dict, sender_id: str) -> dict:
+    sessions = state.setdefault("sessions", {})
+    return sessions.setdefault(
         sender_id,
         {
+            "active": False,
+            "awaiting_opt_in": False,
+            "step": 0,
+            "batch": 0,
             "answers": {},
-            "awaiting_fields": [],
-            "qualified": False,
-            "started": False,
-            "intro_offered": False,
-            "group_index": 0,
+            "raw_answers": {},
             "search_query": "",
-            "search_preferences": {},
+            "qualified": False,
+            "last_shared_listing_keys": [],
         },
     )
-    if search_detected:
-        state["search_query"] = compact(query)
-        state["search_preferences"] = prefs
-    awaiting_fields = state.get("awaiting_fields", []) or []
 
-    if awaiting_fields:
-        parsed_answers = parse_group_answers(query, awaiting_fields)
-        answers = state.setdefault("answers", {})
-        for field in awaiting_fields:
-            if compact(parsed_answers.get(field)):
-                answers[field] = compact(parsed_answers.get(field))
-        next_prompt = advance_qualification_group(state)
-        if next_prompt:
-            return next_prompt
-        state["qualified"] = True
-        return qualification_completion_message(calendly_url)
 
-    if state.get("qualified"):
-        return None
+def format_lead_summary(answers: dict) -> str:
+    labels = {
+        "move_in_date": "Move-in date",
+        "people_on_lease": "No. of people on lease",
+        "adults_in_unit": "No. of adults in the unit",
+        "kids_in_unit": "No. of kids in the unit",
+        "family_gross_income": "Total family gross income",
+        "occupation": "Occupation",
+        "resident_status": "Resident status",
+        "working_with_agent": "Working with an agent",
+        "phone_number": "Phone number",
+    }
+    lines = []
+    for step in QUALIFICATION_STEPS:
+        key = step["key"]
+        value = compact(answers.get(key))
+        if value:
+            lines.append(f"{labels[key]}: {value}")
+    return "\n".join(lines)
 
-    if state.get("intro_offered") and not state.get("started"):
-        if qualification_declined(query):
-            state["intro_offered"] = False
-            return (
-                "No problem. If you want, send me your preferred area, budget, and property type, "
-                "and I can still point you in the right direction."
+
+def begin_qualification_flow(agent_name: str) -> str:
+    return (
+        f"That’s great! Allow me to introduce myself, I’m {agent_name}, a local realtor here in Toronto. "
+        "If you’re open to it, I can actually make your home search a lot easier as I have access to all the rentals on the market "
+        "(including ones not on Facebook), and the best part is there’s no cost to you at all. The landlord pays my fee!\n\n"
+        "To narrow down the best active listings for you, I just need a few quick details first."
+    )
+
+
+def normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", compact(text)).strip()
+
+
+def parse_int_from_text(text: str) -> str:
+    normalized = normalize_whitespace(text).lower()
+    if not normalized:
+        return ""
+    if any(phrase in normalized for phrase in ("just me", "only me", "me only", "single applicant")):
+        return "1"
+    if any(phrase in normalized for phrase in ("no kids", "none", "zero")):
+        return "0"
+    match = re.search(r"\b(\d+)\b", normalized)
+    return match.group(1) if match else ""
+
+
+def extract_phone_number(text: str) -> str:
+    digits = re.sub(r"\D", "", compact(text))
+    if len(digits) >= 10:
+        return digits[-10:]
+    return ""
+
+
+def extract_income_value(text: str) -> str:
+    normalized = normalize_whitespace(text)
+    if not normalized:
+        return ""
+    money = re.search(r"([$€£]?\s?\d[\d,]*(?:\.\d+)?(?:\s*/\s*(?:year|month))?)", normalized, re.I)
+    return money.group(1).replace(" ", "") if money else normalized
+
+
+def extract_resident_status(text: str) -> str:
+    normalized = normalize_whitespace(text)
+    lowered = normalized.lower()
+    patterns = [
+        "permanent resident",
+        "citizen",
+        "work permit",
+        "student",
+        "visitor",
+        "refugee",
+        "open work permit",
+        "closed work permit",
+    ]
+    for pattern in patterns:
+        if pattern in lowered:
+            return pattern.title()
+    return normalized
+
+
+def extract_agent_answer(text: str) -> str:
+    lowered = normalize_whitespace(text).lower()
+    if not lowered:
+        return ""
+    if any(token in lowered for token in ("no", "nope", "not working", "just you", "only you")):
+        return "No"
+    if any(token in lowered for token in ("yes", "yeah", "yup", "working with", "i am")):
+        return "Yes"
+    return normalize_whitespace(text)
+
+
+def build_missing_field_prompt(keys: List[str]) -> str:
+    prompts = []
+    by_key = {step["key"]: step["prompt"] for step in QUALIFICATION_STEPS}
+    for key in keys:
+        prompt = by_key.get(key, "").rstrip("?")
+        if prompt:
+            prompts.append(f"- {prompt}")
+    if not prompts:
+        return "I’m missing a couple of details. Please send them in one message."
+    return "I’m just missing these details:\n" + "\n".join(prompts)
+
+
+def parse_batch_answers(batch_index: int, query: str) -> Dict[str, str]:
+    text = compact(query)
+    normalized = normalize_whitespace(text)
+    lowered = normalized.lower()
+    lines = [normalize_whitespace(line) for line in re.split(r"[\n\r]+", text) if normalize_whitespace(line)]
+    cleaned_lines = [re.sub(r"^\s*(?:\d+[\).\-\:]\s*|[-*]\s*)", "", line).strip() for line in lines]
+    answers: Dict[str, str] = {}
+
+    if batch_index == 0:
+        if len(cleaned_lines) >= 2:
+            answers["move_in_date"] = cleaned_lines[0]
+            answers["people_on_lease"] = parse_int_from_text(cleaned_lines[1])
+            return {k: v for k, v in answers.items() if compact(v)}
+
+        if "," in normalized:
+            parts = [part.strip() for part in normalized.split(",") if part.strip()]
+            if len(parts) >= 2:
+                answers["move_in_date"] = parts[0]
+                answers["people_on_lease"] = parse_int_from_text(parts[1])
+
+        if not answers.get("move_in_date") and normalized:
+            date_match = re.search(
+                r"\b(?:\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+|[A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?|[A-Za-z]+\s+\d{4}|immediately|asap|next month|this month)\b",
+                normalized,
+                re.I,
             )
-        if list_intent_detected(query) or search_detected:
-            return start_qualification_questions(state)
-        return "If you'd like me to shortlist the best active rentals for you, just say yes and I'll ask a few quick questions first."
+            if date_match:
+                answers["move_in_date"] = date_match.group(0)
 
-    if search_detected:
-        summary = describe_preferences(prefs)
-        first_question = start_qualification_questions(state, prefaced=False)
-        intro = qualification_intro(summary)
-        return f"{intro}\n\n{first_question}"
+        people_match = re.search(r"(\d+)\s+(?:people|person|tenant|tenants).*(?:lease|living|unit)?", lowered)
+        if people_match:
+            answers["people_on_lease"] = people_match.group(1)
 
-    if list_intent_detected(query):
-        state["intro_offered"] = True
-        return qualification_intro()
+    elif batch_index == 1:
+        if len(cleaned_lines) >= 2:
+            answers["adults_in_unit"] = parse_int_from_text(cleaned_lines[0])
+            answers["kids_in_unit"] = parse_int_from_text(cleaned_lines[1])
+            return {k: v for k, v in answers.items() if compact(v)}
 
-    if normalize_text(query) in GREETING_ONLY_MESSAGES:
+        if "," in normalized:
+            parts = [part.strip() for part in normalized.split(",") if part.strip()]
+            if len(parts) >= 2:
+                answers["adults_in_unit"] = parse_int_from_text(parts[0])
+                answers["kids_in_unit"] = parse_int_from_text(parts[1])
+
+        adults_match = re.search(r"(\d+)\s+adult", lowered)
+        kids_match = re.search(r"(\d+)\s+(?:kid|kids|child|children)", lowered)
+        if adults_match:
+            answers["adults_in_unit"] = adults_match.group(1)
+        if kids_match:
+            answers["kids_in_unit"] = kids_match.group(1)
+        elif "no kids" in lowered:
+            answers["kids_in_unit"] = "0"
+
+    elif batch_index == 2:
+        if len(cleaned_lines) >= 2:
+            answers["family_gross_income"] = extract_income_value(cleaned_lines[0])
+            answers["occupation"] = cleaned_lines[1]
+            return {k: v for k, v in answers.items() if compact(v)}
+
+        if "," in normalized:
+            parts = [part.strip() for part in normalized.split(",") if part.strip()]
+            if len(parts) >= 2:
+                answers["family_gross_income"] = extract_income_value(parts[0])
+                answers["occupation"] = parts[1]
+
+        if not answers.get("family_gross_income"):
+            income_match = re.search(r"[$€£]?\s?\d[\d,]*(?:\.\d+)?(?:\s*/\s*(?:year|month))?", normalized, re.I)
+            if income_match:
+                answers["family_gross_income"] = extract_income_value(income_match.group(0))
+
+        if normalized and not answers.get("occupation"):
+            occupation_text = normalized
+            if answers.get("family_gross_income"):
+                occupation_text = occupation_text.replace(answers["family_gross_income"], "").strip(" ,.-")
+            if occupation_text and len(occupation_text.split()) <= 12:
+                answers["occupation"] = occupation_text
+
+    elif batch_index == 3:
+        if len(cleaned_lines) >= 3:
+            answers["resident_status"] = extract_resident_status(cleaned_lines[0])
+            answers["working_with_agent"] = extract_agent_answer(cleaned_lines[1])
+            answers["phone_number"] = extract_phone_number(cleaned_lines[2]) or cleaned_lines[2]
+            return {k: v for k, v in answers.items() if compact(v)}
+
+        if "," in normalized:
+            parts = [part.strip() for part in normalized.split(",") if part.strip()]
+            if len(parts) >= 3:
+                answers["resident_status"] = extract_resident_status(parts[0])
+                answers["working_with_agent"] = extract_agent_answer(parts[1])
+                answers["phone_number"] = extract_phone_number(parts[2]) or parts[2]
+
+        resident = extract_resident_status(normalized)
+        if resident and (
+            resident.lower() != lowered
+            or any(
+                token in lowered
+                for token in ("permanent resident", "citizen", "work permit", "student", "visitor", "refugee")
+            )
+        ):
+            answers["resident_status"] = resident
+
+        agent_answer = extract_agent_answer(normalized)
+        if agent_answer in ("Yes", "No"):
+            answers["working_with_agent"] = agent_answer
+        phone = extract_phone_number(normalized)
+        if phone:
+            answers["phone_number"] = phone
+
+    return {k: v for k, v in answers.items() if compact(v)}
+
+def summarize_shared_listing(draft: dict) -> str:
+    title = compact(draft.get("MarketplaceTitle")) or compact(draft.get("Address")) or "Listing"
+    price = compact(draft.get("MarketplacePriceDisplay")) or compact(draft.get("MarketplacePrice"))
+    city = compact(draft.get("City"))
+    details: List[str] = []
+    if price:
+        details.append(price)
+    if city:
+        details.append(city)
+    detail_suffix = f" ({', '.join(details)})" if details else ""
+    return f"{title}{detail_suffix}"
+
+
+def build_post_qualification_reply(
+    session: dict,
+    drafts: List[dict],
+    listing_doc_url: str,
+) -> str:
+    summary = format_lead_summary(session.get("answers", {}))
+    search_query = compact(session.get("search_query"))
+    matches = rank_drafts(search_query, drafts, limit=3) if search_query else []
+    session["last_shared_listing_keys"] = [compact(match.get("ListingKey")) for match in matches if compact(match.get("ListingKey"))]
+
+    intro = "Perfect, I’ve got everything I need and I’ll use this to narrow down the best active listings for you."
+    if summary:
+        intro += f"\n\nHere’s what I collected:\n{summary}"
+
+    if not matches:
         return (
-            "Hi there! I can help with rentals in Toronto and nearby areas. "
-            "Send me your preferred area, budget, and unit type, and I’ll take it from there."
+            intro
+            + "\n\nI don’t see any active listings that match closely enough right now. "
+            "If you want, I can help refine the area, budget, or unit type and keep an eye out for new options as they come up."
         )
+
+    lines = [intro, "", "Here are a few active options that look relevant:"]
+    for match in matches:
+        lines.append(f"- {summarize_shared_listing(match)}")
+    lines.append("")
+    lines.append(
+        "If one stands out, send me the address or ListingKey and I can help you move forward with the next step."
+    )
+    if listing_doc_url:
+        lines.append(f"You can also review the latest listing packet here: {listing_doc_url}")
+    return "\n".join(lines)
+
+
+def handle_post_qualification_booking(
+    session: dict,
+    query: str,
+    drafts: List[dict],
+    calendly_url: str,
+) -> Optional[str]:
+    if not session.get("qualified"):
+        return None
+    if not looks_like_booking_request(query):
+        return None
+    if not calendly_url:
+        return "I can help you move forward on that. Nabeel’s booking link is not configured yet, but I can still note your interest."
+
+    matches = rank_drafts(query, drafts, limit=3)
+    ready_matches = shortlist_for_booking(matches)
+    if ready_matches:
+        if len(ready_matches) == 1:
+            listing = summarize_shared_listing(ready_matches[0])
+            return (
+                f"Perfect. For {listing}, you can book a time with Nabeel here: {calendly_url} "
+                "When you book, please add the property address or ListingKey in the notes so we can prepare properly."
+            )
+        options = "; ".join(summarize_shared_listing(match) for match in ready_matches[:3])
+        return (
+            "I can help with that. I found a few matching listings tied to your message: "
+            f"{options}. Reply with the address or ListingKey you want, and I’ll point you to the right next step."
+        )
+
+    last_shared = [key for key in session.get("last_shared_listing_keys", []) if key]
+    if len(last_shared) == 1:
+        return (
+            f"Perfect. You can book a time with Nabeel here: {calendly_url} "
+            f"When you book, please add this ListingKey in the notes: {last_shared[0]}."
+        )
+    if len(last_shared) > 1:
+        return (
+            "I can help with that. Please send me the address or ListingKey for the unit you want, "
+            "and then I’ll share the booking link for the next step."
+        )
+    return (
+        "I can help with that. Send me the address or ListingKey for the listing you want to move forward with, "
+        "and I’ll share the booking link."
+    )
+
+
+def should_start_qualification(query: str, calendly_url: str) -> bool:
+    q = query.lower()
+    if looks_like_booking_request(query):
+        return True
+    if wants_listing_help(query):
+        return True
+    if "send me" in q and "listing" in q:
+        return True
+    if "help me" in q and ("find" in q or "search" in q):
+        return True
+    if calendly_url and ("call" in q or "viewing" in q or "meeting" in q):
+        return True
+    return False
+
+
+def maybe_handle_qualification(
+    sender_id: str,
+    query: str,
+    lead_state_path: Path,
+    agent_name: str,
+    calendly_url: str,
+    drafts: List[dict],
+    listing_doc_url: str,
+) -> Optional[str]:
+    state = load_lead_state(lead_state_path)
+    session = get_lead_session(state, sender_id)
+
+    if session.get("active"):
+        batch_index = int(session.get("batch", 0))
+        answers = session.setdefault("answers", {})
+        raw_answers = session.setdefault("raw_answers", {})
+
+        if batch_index < len(QUALIFICATION_BATCHES):
+            raw_answers[f"batch_{batch_index + 1}"] = compact(query)
+            parsed_answers = parse_batch_answers(batch_index, query)
+            answers.update(parsed_answers)
+
+            batch_keys = QUALIFICATION_BATCHES[batch_index]["keys"]
+            missing_keys = [key for key in batch_keys if not compact(answers.get(key))]
+            if missing_keys:
+                save_lead_state(lead_state_path, state)
+                return build_missing_field_prompt(missing_keys)
+
+            batch_index += 1
+            session["batch"] = batch_index
+            if batch_index < len(QUALIFICATION_BATCHES):
+                save_lead_state(lead_state_path, state)
+                return QUALIFICATION_BATCHES[batch_index]["prompt"]
+
+            session["active"] = False
+            session["qualified"] = True
+            session["completed_at"] = int(time.time())
+            reply = build_post_qualification_reply(session, drafts, listing_doc_url)
+            save_lead_state(lead_state_path, state)
+            return reply
+
+    booking_reply = handle_post_qualification_booking(session, query, drafts, calendly_url)
+    if booking_reply:
+        save_lead_state(lead_state_path, state)
+        return booking_reply
+
+    if session.get("awaiting_opt_in"):
+        if looks_like_affirmative(query):
+            session["awaiting_opt_in"] = False
+            session["active"] = True
+            session["step"] = 0
+            session["batch"] = 0
+            session["qualified"] = False
+            session["answers"] = {}
+            session["raw_answers"] = {}
+            session["last_shared_listing_keys"] = []
+            save_lead_state(lead_state_path, state)
+            return (
+                "Perfect. Before we proceed ahead, I just need a few quick details.\n\n"
+                + QUALIFICATION_BATCHES[0]["prompt"]
+            )
+
+        if wants_listing_help(query):
+            session["search_query"] = compact(query)
+            save_lead_state(lead_state_path, state)
+            return qualification_opt_in_prompt(agent_name)
+
+        save_lead_state(lead_state_path, state)
+        return (
+            "No problem. If you’d like me to narrow down the best active listings for you, just reply yes and I’ll ask a few quick questions first."
+        )
+
+    if should_start_qualification(query, calendly_url):
+        session["awaiting_opt_in"] = True
+        session["active"] = False
+        session["step"] = 0
+        session["batch"] = 0
+        session["qualified"] = False
+        session["answers"] = {}
+        session["raw_answers"] = {}
+        session["search_query"] = compact(query)
+        session["last_shared_listing_keys"] = []
+        save_lead_state(lead_state_path, state)
+        return qualification_opt_in_prompt(agent_name)
 
     return None
 
@@ -700,26 +888,31 @@ def generate_ai_reply(
     query: str,
     matches: List[dict],
     listing_doc_url: str,
+    calendly_url: str,
+    agent_name: str,
     api_key: str,
     model: str,
 ) -> Optional[str]:
     listing_payload = [listing_context(match) for match in matches[:3]]
     system_prompt = (
-        "You are Durham New Homes, an AI real-estate leasing and sales assistant. "
-        "Answer like a high-quality leasing coordinator: concise, helpful, natural, warm, and action-oriented. "
+        "You are Durham New Homes, a real-estate leasing and sales assistant for Nabeel. "
+        "Answer like a capable human leasing coordinator: warm, concise, natural, and practical. "
         "Use only the provided listing data and provided packet link. "
         "Do not invent features, pricing, amenities, policies, or availability. "
-        "Never mention internal workflow labels, internal approval stages, or operational statuses such as Pending Seller Action, "
-        "Needs Review, Posted, Archived, or MLS lifecycle codes. Those are internal only. "
-        "If no active customer-ready listing matches, simply say there is no active match available right now and offer to refine the search. "
+        "Never mention internal workflow labels, back-office statuses, review states, or marketplace pipeline terms to the customer. "
         "If the user asks something not present in the data, say that it is not confirmed yet and ask a targeted follow-up. "
         "If the query is generic and no exact answer is available, guide the user to share the address, ListingKey, or unit number. "
-        "If the user wants help finding a rental, scheduling a viewing, or moving forward, speak as Nabeel's assistant and naturally ask qualifying questions. "
-        "Prefer short paragraphs, not bullets, unless the user explicitly asks for a list."
+        "Prefer short conversational paragraphs, not bullets, unless the user explicitly asks for a list. "
+        "Avoid sounding robotic, overly formal, or repetitive. "
+        "Only describe listings as available if the provided data clearly shows they are customer-ready active rental listings. "
+        "If there are no customer-ready matches, say there are no active matches ready to share right now and offer to refine the search or follow up later. "
+        "Do not offer or send any booking link unless the lead qualification flow has already been completed."
     )
     user_prompt = {
         "user_message": query,
         "listing_packet_url": listing_doc_url,
+        "calendly_url": calendly_url,
+        "agent_name": agent_name,
         "matched_listings": listing_payload,
     }
     payload = {
@@ -740,67 +933,47 @@ def generate_ai_reply(
         OPENAI_RESPONSES_API,
         headers=build_openai_headers(api_key),
         json=payload,
-        timeout=60,
+        timeout=int(os.getenv("OPENAI_REQUEST_TIMEOUT_SECONDS", "20") or "20"),
     )
     resp.raise_for_status()
     output_text = extract_response_text(resp.json())
     return output_text or None
 
 
-def build_match_response(matches: List[dict], listing_doc_url: str, qualified: bool, calendly_url: str = "") -> str:
-    if not matches:
-        return (
-            "I could not find an active customer-ready match for that exact search right now. "
-            "Send me your preferred area, budget, and unit type, and I’ll refine it for you."
-        )
-
-    lines = ["Here are the best active matches I found for you:"]
-    for draft in matches:
-        lines.append("")
-        lines.append(summarize_draft(draft))
-        desc = compact(draft.get("MarketplaceDescription"))
-        if desc:
-            lines.append(desc[:500])
-    if listing_doc_url:
-        lines.append("")
-        lines.append(f"Packet: {listing_doc_url}")
-    if calendly_url:
-        lines.append("")
-        lines.append(f"If you'd like, you can also book a quick call with Nabeel here: {calendly_url}")
-    elif not qualified:
-        lines.append("")
-        lines.append(
-            "If you'd like, I can help narrow this down for you and shortlist the best active options. "
-            "Just tell me if you want to move forward and I’ll ask a few quick questions."
-        )
-    return "\n".join(lines)
-
-
 def build_reply(
+    sender_id: str,
     query: str,
     drafts: List[dict],
     listing_doc_url: str,
+    calendly_url: str = "",
+    agent_name: str = "Nabeel",
+    lead_state_path: Path = Path("lead_intake_state.json"),
     openai_api_key: str = "",
     openai_model: str = "gpt-4.1-mini",
-    sender_id: str = "",
-    lead_state_path: Optional[Path] = None,
-    calendly_url: str = "",
+    use_ai: bool = True,
 ) -> str:
-    lead_state = load_lead_state(lead_state_path) if lead_state_path else {}
-    existing_state = lead_state.get(sender_id, {}) if sender_id else {}
-    was_qualified = bool(existing_state.get("qualified"))
-    qualification_reply = handle_qualification_turn(query, sender_id, lead_state, calendly_url)
-    if qualification_reply is not None:
-        updated_state = lead_state.get(sender_id, {}) if sender_id else {}
-        just_qualified = bool(updated_state.get("qualified")) and not was_qualified
-        if lead_state_path:
-            save_lead_state(lead_state_path, lead_state)
-        if just_qualified:
-            search_query = compact(updated_state.get("search_query")) or compact(query)
-            prefs = updated_state.get("search_preferences") or extract_search_preferences(search_query)
-            visible_drafts = customer_visible_drafts(drafts)
-            matches = rank_drafts(search_query, visible_drafts, limit=3, prefs=prefs)
-            return build_match_response(matches, listing_doc_url, qualified=True, calendly_url=calendly_url)
+    state = load_lead_state(lead_state_path)
+    session = get_lead_session(state, sender_id)
+    if (
+        not session.get("active")
+        and not session.get("awaiting_opt_in")
+        and not session.get("qualified")
+        and looks_like_greeting(query)
+    ):
+        return (
+            "Hi there! How can I assist you with your home search today? If you have a particular area, budget, address, ListingKey, or unit type in mind, I can help find the best options for you."
+        )
+
+    qualification_reply = maybe_handle_qualification(
+        sender_id,
+        query,
+        lead_state_path,
+        agent_name,
+        calendly_url,
+        drafts,
+        listing_doc_url,
+    )
+    if qualification_reply:
         return qualification_reply
 
     normalized = query.lower().strip()
@@ -822,20 +995,74 @@ def build_reply(
             return f"Here is the current listing packet: {listing_doc_url}"
         return "I do not have the document URL configured yet."
 
-    active_search_query = compact(existing_state.get("search_query")) if existing_state.get("started") else ""
-    effective_query = active_search_query or query
-    prefs = existing_state.get("search_preferences") if active_search_query else extract_search_preferences(query)
-    visible_drafts = customer_visible_drafts(drafts)
-    matches = rank_drafts(effective_query, visible_drafts, limit=3, prefs=prefs)
-    if openai_api_key:
+    matches = rank_drafts(query, drafts, limit=3)
+    ready_matches = shortlist_for_booking(matches)
+
+    if openai_api_key and use_ai:
         try:
-            ai_reply = generate_ai_reply(effective_query, matches, listing_doc_url, openai_api_key, openai_model)
+            ai_reply = generate_ai_reply(
+                query,
+                matches,
+                listing_doc_url,
+                calendly_url,
+                agent_name,
+                openai_api_key,
+                openai_model,
+            )
             if ai_reply:
                 return ai_reply
         except Exception as exc:
             print(f"AI reply generation failed: {exc}")
 
-    return build_match_response(matches, listing_doc_url, qualified=bool(existing_state.get("qualified")), calendly_url=calendly_url)
+    if not matches:
+        if customer_visible_drafts(drafts):
+            return (
+                "I do not have an exact active match for that search yet. Send me the area, address, price range, "
+                "or unit type you want, and I will narrow it down."
+            )
+        return (
+            "I do not have any active rental listings ready to share right now. If you tell me the area, budget, "
+            "and unit type you want, I can note your search and help refine it."
+        )
+
+    lines = ["I found these matching listings:"]
+    for draft in matches:
+        lines.append("")
+        lines.append(summarize_draft(draft))
+        desc = compact(draft.get("MarketplaceDescription"))
+        if desc:
+            lines.append(desc[:500])
+    if listing_doc_url:
+        lines.append("")
+        lines.append(f"Packet: {listing_doc_url}")
+    return "\n".join(lines)
+
+
+def current_drafts(config: MessengerConfig) -> List[dict]:
+    now = time.time()
+    source = config.drafts_sheet_csv_url or str(config.drafts_path)
+    cached_source = compact(_DRAFT_CACHE.get("source"))
+    cached_at = float(_DRAFT_CACHE.get("fetched_at") or 0.0)
+    cached_drafts = _DRAFT_CACHE.get("drafts") or []
+    if cached_source == source and now - cached_at < max(config.drafts_cache_seconds, 1):
+        return list(cached_drafts)
+
+    drafts: List[dict] = []
+    if config.drafts_sheet_csv_url:
+        try:
+            drafts = fetch_sheet_drafts(config.drafts_sheet_csv_url)
+            print(f"Loaded {len(drafts)} drafts from sheet CSV")
+        except Exception as exc:
+            print(f"Failed loading sheet drafts: {exc}")
+
+    if not drafts:
+        drafts = load_drafts(config.drafts_path)
+        print(f"Loaded {len(drafts)} drafts from local JSON fallback")
+
+    _DRAFT_CACHE["source"] = source
+    _DRAFT_CACHE["fetched_at"] = now
+    _DRAFT_CACHE["drafts"] = list(drafts)
+    return drafts
 
 
 def send_message(page_access_token: str, recipient_id: str, text: str) -> dict:
@@ -843,6 +1070,22 @@ def send_message(page_access_token: str, recipient_id: str, text: str) -> dict:
     payload = {
         "recipient": {"id": recipient_id},
         "message": {"text": text},
+    }
+    resp = requests.post(
+        url,
+        params={"access_token": page_access_token},
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def send_sender_action(page_access_token: str, recipient_id: str, action: str) -> dict:
+    url = f"{GRAPH_BASE}/me/messages"
+    payload = {
+        "recipient": {"id": recipient_id},
+        "sender_action": action,
     }
     resp = requests.post(
         url,
@@ -869,15 +1112,18 @@ class MessengerConfig:
     verify_token: str
     app_secret: str = ""
     drafts_path: Path = Path("marketplace_drafts.json")
+    drafts_sheet_csv_url: str = ""
+    drafts_cache_seconds: int = 30
     listing_doc_url: str = ""
+    calendly_url: str = ""
+    agent_name: str = "Nabeel"
+    lead_state_path: Path = Path("lead_intake_state.json")
     page_id: str = ""
     poll_state_path: Path = Path("messenger_poll_state.json")
     openai_api_key: str = ""
     openai_model: str = "gpt-4.1-mini"
     token_source: str = "page"
     bootstrap_reply_lookback_seconds: int = 86400
-    lead_state_path: Path = Path("messenger_lead_state.json")
-    calendly_url: str = ""
 
 
 def make_config() -> MessengerConfig:
@@ -896,20 +1142,26 @@ def make_config() -> MessengerConfig:
         page_access_token = resolve_page_access_token(user_access_token, page_id)
         token_source = "derived-from-user"
 
+    listing_doc_url = os.getenv("LISTING_DOC_URL", "")
+    drafts_sheet_csv_url = optional_env("MARKETPLACE_DRAFTS_SHEET_CSV_URL", "") or build_sheet_csv_url(listing_doc_url)
+
     return MessengerConfig(
         page_access_token=page_access_token,
         verify_token=must_env("META_VERIFY_TOKEN"),
         app_secret=os.getenv("META_APP_SECRET", ""),
         drafts_path=Path(os.getenv("MARKETPLACE_DRAFTS_JSON", "marketplace_drafts.json")),
-        listing_doc_url=os.getenv("LISTING_DOC_URL", ""),
+        drafts_sheet_csv_url=drafts_sheet_csv_url,
+        drafts_cache_seconds=int(os.getenv("DRAFTS_CACHE_SECONDS", "30") or "30"),
+        listing_doc_url=listing_doc_url,
+        calendly_url=os.getenv("CALENDLY_URL", ""),
+        agent_name=os.getenv("AGENT_NAME", "Nabeel"),
+        lead_state_path=Path(os.getenv("LEAD_STATE_FILE", "lead_intake_state.json")),
         page_id=page_id,
         poll_state_path=Path(os.getenv("POLL_STATE_FILE", "messenger_poll_state.json")),
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
         openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
         token_source=token_source,
         bootstrap_reply_lookback_seconds=int(os.getenv("POLL_BOOTSTRAP_LOOKBACK_SECONDS", "86400") or "86400"),
-        lead_state_path=Path(os.getenv("LEAD_STATE_FILE", "messenger_lead_state.json")),
-        calendly_url=os.getenv("CALENDLY_URL", ""),
     )
 
 
@@ -935,13 +1187,70 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
         from urllib.parse import parse_qs, urlparse
 
         parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
         if parsed.path == "/healthz":
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             self.wfile.write(b"ok")
             return
-        params = parse_qs(parsed.query)
+        if parsed.path == "/debug/status":
+            token = params.get("token", [""])[0]
+            if token != self.config.verify_token:
+                self.send_error(403, "Forbidden")
+                return
+            seen = load_seen_message_ids(self.config.poll_state_path)
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "draft_count": len(current_drafts(self.config)),
+                    "draft_source": self.config.drafts_sheet_csv_url or str(self.config.drafts_path),
+                    "has_page_access_token": bool(self.config.page_access_token),
+                    "token_source": self.config.token_source,
+                    "has_app_secret": bool(self.config.app_secret),
+                    "has_listing_doc_url": bool(self.config.listing_doc_url),
+                    "page_id": self.config.page_id,
+                    "poll_interval_seconds": getattr(self.server, "poll_interval_seconds", 0),
+                    "poll_state_file": str(self.config.poll_state_path),
+                    "seen_message_count": len(seen),
+                },
+            )
+            return
+        if parsed.path == "/poll-once":
+            token = params.get("token", [""])[0]
+            initialize_only = params.get("initialize_only", ["0"])[0] in ("1", "true", "yes")
+            reset_seen = params.get("reset_seen", ["0"])[0] in ("1", "true", "yes")
+            use_ai = params.get("use_ai", ["1"])[0] not in ("0", "false", "no")
+            conversation_limit = int(params.get("conversation_limit", ["10"])[0] or "10")
+            per_conversation_limit = int(params.get("per_conversation_limit", ["5"])[0] or "5")
+            if token != self.config.verify_token:
+                self.send_error(403, "Forbidden")
+                return
+            try:
+                if reset_seen and self.config.poll_state_path.exists():
+                    self.config.poll_state_path.unlink()
+                result = poll_conversations_once(
+                    self.config,
+                    initialize_only=initialize_only,
+                    conversation_limit=conversation_limit,
+                    per_conversation_limit=per_conversation_limit,
+                    use_ai=use_ai,
+                )
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "reset_seen": reset_seen,
+                        "use_ai": use_ai,
+                        "conversation_limit": conversation_limit,
+                        "per_conversation_limit": per_conversation_limit,
+                        **result,
+                    },
+                )
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": str(exc)})
+            return
         if parsed.path != "/webhook":
             self.send_error(404, "Not found")
             return
@@ -980,7 +1289,7 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"status": "ok"})
 
     def process_webhook(self, payload: dict):
-        drafts = load_drafts(self.config.drafts_path)
+        drafts = current_drafts(self.config)
         entry_list = payload.get("entry", [])
         for entry in entry_list:
             messaging = entry.get("messaging", [])
@@ -991,15 +1300,22 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                 if not sender_id or not text:
                     continue
 
+                try:
+                    send_sender_action(self.config.page_access_token, sender_id, "typing_on")
+                except Exception as exc:
+                    print(f"Failed sending typing indicator to {sender_id}: {exc}")
+
                 reply = build_reply(
+                    sender_id,
                     text,
                     drafts,
                     self.config.listing_doc_url,
-                    self.config.openai_api_key,
-                    self.config.openai_model,
-                    sender_id,
-                    self.config.lead_state_path,
-                    self.config.calendly_url,
+                    calendly_url=self.config.calendly_url,
+                    agent_name=self.config.agent_name,
+                    lead_state_path=self.config.lead_state_path,
+                    openai_api_key=self.config.openai_api_key,
+                    openai_model=self.config.openai_model,
+                    use_ai=True,
                 )
                 try:
                     send_message(self.config.page_access_token, sender_id, reply)
@@ -1011,6 +1327,7 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
 def run_server(config: MessengerConfig, port: int):
     httpd = ThreadingHTTPServer(("0.0.0.0", port), MessengerWebhookHandler)
     httpd.config = config  # type: ignore[attr-defined]
+    httpd.poll_interval_seconds = int(os.getenv("POLL_CONVERSATIONS_SECONDS", "0") or "0")  # type: ignore[attr-defined]
     print(f"Messenger webhook listening on http://0.0.0.0:{port}/webhook")
     httpd.serve_forever()
 
@@ -1048,8 +1365,13 @@ def save_seen_message_ids(path: Path, seen: set[str]):
     path.write_text(json.dumps({"seen_message_ids": recent}, indent=2), encoding="utf-8")
 
 
-def list_recent_messages(page_id: str, page_access_token: str, limit: int = 10) -> List[dict]:
-    conversations = list_conversations(page_id, page_access_token, limit=limit).get("data", [])
+def list_recent_messages(
+    page_id: str,
+    page_access_token: str,
+    conversation_limit: int = 10,
+    per_conversation_limit: int = 5,
+) -> List[dict]:
+    conversations = list_conversations(page_id, page_access_token, limit=conversation_limit).get("data", [])
     messages: List[dict] = []
     for conversation in conversations:
         conversation_id = conversation.get("id")
@@ -1059,7 +1381,7 @@ def list_recent_messages(page_id: str, page_access_token: str, limit: int = 10) 
             f"{GRAPH_BASE}/{conversation_id}/messages",
             params={
                 "access_token": page_access_token,
-                "limit": 5,
+                "limit": per_conversation_limit,
                 "fields": "id,created_time,from,message",
             },
             timeout=30,
@@ -1069,21 +1391,42 @@ def list_recent_messages(page_id: str, page_access_token: str, limit: int = 10) 
     return messages
 
 
-def poll_conversations_once(config: MessengerConfig, initialize_only: bool = False) -> int:
+def poll_conversations_once(
+    config: MessengerConfig,
+    initialize_only: bool = False,
+    conversation_limit: int = 10,
+    per_conversation_limit: int = 5,
+    use_ai: bool = True,
+) -> dict:
     if not config.page_id:
         raise RuntimeError("META_PAGE_ID is required when polling is enabled")
 
     seen = load_seen_message_ids(config.poll_state_path)
-    drafts = load_drafts(config.drafts_path)
-    reply_count = 0
+    drafts = current_drafts(config)
+    result = {
+        "reply_count": 0,
+        "initialize_only": initialize_only,
+        "processed_count": 0,
+        "seen_before_count": 0,
+        "skipped_page_or_empty_count": 0,
+        "initialized_seen_count": 0,
+        "errors": [],
+    }
     now_ts = int(time.time())
     bootstrap_cutoff_ts = now_ts - max(config.bootstrap_reply_lookback_seconds, 0)
 
-    for message in list_recent_messages(config.page_id, config.page_access_token):
+    for message in list_recent_messages(
+        config.page_id,
+        config.page_access_token,
+        conversation_limit=conversation_limit,
+        per_conversation_limit=per_conversation_limit,
+    ):
         message_id = compact(message.get("id"))
         if not message_id or message_id in seen:
+            result["seen_before_count"] += 1
             continue
 
+        result["processed_count"] += 1
         sender = message.get("from", {}) or {}
         sender_id = compact(sender.get("id"))
         text = compact(message.get("message"))
@@ -1094,38 +1437,56 @@ def poll_conversations_once(config: MessengerConfig, initialize_only: bool = Fal
             is_old = created_ts is not None and created_ts < bootstrap_cutoff_ts
             if not sender_id or sender_id == config.page_id or not text or is_old:
                 seen.add(message_id)
+                result["initialized_seen_count"] += 1
             continue
 
         if not sender_id or sender_id == config.page_id or not text:
             seen.add(message_id)
+            result["skipped_page_or_empty_count"] += 1
             continue
 
+        try:
+            send_sender_action(config.page_access_token, sender_id, "typing_on")
+        except Exception as exc:
+            print(f"Poll failed sending typing indicator to {sender_id}: {exc}")
+
         reply = build_reply(
+            sender_id,
             text,
             drafts,
             config.listing_doc_url,
-            config.openai_api_key,
-            config.openai_model,
-            sender_id,
-            config.lead_state_path,
-            config.calendly_url,
+            calendly_url=config.calendly_url,
+            agent_name=config.agent_name,
+            lead_state_path=config.lead_state_path,
+            openai_api_key=config.openai_api_key,
+            openai_model=config.openai_model,
+            use_ai=use_ai,
         )
         try:
             send_message(config.page_access_token, sender_id, reply)
             seen.add(message_id)
-            reply_count += 1
+            result["reply_count"] += 1
             print(f"Poll replied to {sender_id}: {text[:80]}")
         except Exception as exc:
             print(f"Poll failed sending to {sender_id}: {exc}")
+            result["errors"].append(
+                {
+                    "message_id": message_id,
+                    "sender_id": sender_id,
+                    "text_preview": text[:120],
+                    "error": str(exc),
+                }
+            )
 
     save_seen_message_ids(config.poll_state_path, seen)
-    return reply_count
+    return result
 
 
 def start_conversation_poller(config: MessengerConfig, interval_seconds: int):
     def worker():
         try:
-            poll_conversations_once(config, initialize_only=True)
+            init_result = poll_conversations_once(config, initialize_only=True)
+            print(f"Conversation poller initialized existing messages as seen: {json.dumps(init_result)}")
             print("Conversation poller initialized existing messages as seen")
         except Exception as exc:
             print(f"Conversation poller init failed: {exc}")
@@ -1133,7 +1494,9 @@ def start_conversation_poller(config: MessengerConfig, interval_seconds: int):
         while True:
             time.sleep(interval_seconds)
             try:
-                poll_conversations_once(config)
+                result = poll_conversations_once(config)
+                if result.get("reply_count") or result.get("errors"):
+                    print(f"Conversation poll result: {json.dumps(result)}")
             except Exception as exc:
                 print(f"Conversation poller failed: {exc}")
 
