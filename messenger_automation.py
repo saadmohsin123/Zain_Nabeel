@@ -91,19 +91,36 @@ QUERY_STOPWORDS = {
     "what",
     "you",
 }
-QUALIFICATION_QUESTIONS = [
-    ("move_in_date", "Perfect. First, what’s your expected move-in date?"),
-    ("people_on_lease", "How many people will be on the lease?"),
-    ("adults_in_unit", "How many adults will be living in the unit?"),
-    ("kids_in_unit", "How many kids will be living in the unit?"),
-    (
-        "family_gross_income",
-        "What’s your total family gross income? Please do not include cash income.",
-    ),
-    ("occupation", "What do you do for work?"),
-    ("resident_status", "What is your resident status in Canada?"),
-    ("working_with_agent", "Are you currently working with an agent?"),
-    ("phone_number", "And what’s the best phone number to reach you on?"),
+QUALIFICATION_STEPS = [
+    {
+        "keys": ["move_in_date", "people_on_lease"],
+        "prompt": (
+            "Perfect. First, I’m wondering what date you’re looking to move in "
+            "and how many people will be on the lease?"
+        ),
+    },
+    {
+        "keys": ["adults_in_unit", "kids_in_unit", "family_gross_income"],
+        "prompt": (
+            "Thank you for your response. Would you be able to tell me how many adults "
+            "will be living there, how many kids, and what your gross household income is "
+            "(excluding cash income)?"
+        ),
+    },
+    {
+        "keys": ["occupation", "resident_status"],
+        "prompt": (
+            "Amazing. What do you do for work, and could you also share your current "
+            "residential status in Canada?"
+        ),
+    },
+    {
+        "keys": ["working_with_agent", "phone_number", "email"],
+        "prompt": (
+            "Thank you for answering all of that. Lastly, are you currently working with "
+            "a realtor or agent? And please share your phone number and email as well."
+        ),
+    },
 ]
 
 
@@ -405,6 +422,7 @@ def get_lead_session(state: dict, sender_id: str) -> dict:
             "awaiting_opt_in": False,
             "step": 0,
             "answers": {},
+            "raw_answers": {},
         },
     )
 
@@ -420,9 +438,13 @@ def format_lead_summary(answers: dict) -> str:
         "resident_status": "Resident status",
         "working_with_agent": "Working with an agent",
         "phone_number": "Phone number",
+        "email": "Email",
     }
     lines = []
-    for key, _ in QUALIFICATION_QUESTIONS:
+    ordered_keys = []
+    for step in QUALIFICATION_STEPS:
+        ordered_keys.extend(step["keys"])
+    for key in ordered_keys:
         value = compact(answers.get(key))
         if value:
             lines.append(f"{labels[key]}: {value}")
@@ -470,10 +492,11 @@ def maybe_handle_qualification(
             session["active"] = True
             session["step"] = 0
             session["answers"] = {}
+            session["raw_answers"] = {}
             save_lead_state(lead_state_path, state)
             return (
                 "Perfect. Before we proceed ahead please let me know the following details.\n\n"
-                + QUALIFICATION_QUESTIONS[0][1]
+                + QUALIFICATION_STEPS[0]["prompt"]
             )
 
         session["awaiting_opt_in"] = False
@@ -486,29 +509,35 @@ def maybe_handle_qualification(
     if session.get("active"):
         step = int(session.get("step", 0))
         answers = session.setdefault("answers", {})
-        if step < len(QUALIFICATION_QUESTIONS):
-            key, _ = QUALIFICATION_QUESTIONS[step]
-            answers[key] = compact(query)
+        raw_answers = session.setdefault("raw_answers", {})
+        if step < len(QUALIFICATION_STEPS):
+            step_config = QUALIFICATION_STEPS[step]
+            raw_answers[f"step_{step + 1}"] = compact(query)
+            for key in step_config["keys"]:
+                answers[key] = compact(query)
             step += 1
             session["step"] = step
-            if step < len(QUALIFICATION_QUESTIONS):
+            if step < len(QUALIFICATION_STEPS):
                 save_lead_state(lead_state_path, state)
-                return QUALIFICATION_QUESTIONS[step][1]
+                return QUALIFICATION_STEPS[step]["prompt"]
 
             session["active"] = False
             session["completed_at"] = int(time.time())
             save_lead_state(lead_state_path, state)
-            summary = format_lead_summary(answers)
-            closing = "Perfect, I’ve got everything I need. I’ll use this to narrow down the best active listings for you."
+            closing = (
+                "Perfect, I’ve got everything I need. I’ll use this to narrow down the best active "
+                "listings for you and the next step would be to book a quick call here."
+            )
             if calendly_url:
-                closing += f"\n\nIf you’d like to book a call as well, here’s the link: {calendly_url}"
-            return f"{closing}\n\nHere’s what I collected:\n{summary}"
+                closing += f"\n\nYou can book here: {calendly_url}"
+            return closing
 
     if should_start_qualification(query, calendly_url):
         session["awaiting_opt_in"] = True
         session["active"] = False
         session["step"] = 0
         session["answers"] = {}
+        session["raw_answers"] = {}
         save_lead_state(lead_state_path, state)
         return begin_qualification_flow(agent_name)
 
@@ -713,7 +742,7 @@ def current_drafts(config: MessengerConfig) -> List[dict]:
             print(f"Failed loading sheet drafts: {exc}")
 
     if not drafts:
-        drafts = current_drafts(config)
+        drafts = load_drafts(config.drafts_path)
         print(f"Loaded {len(drafts)} drafts from local JSON fallback")
 
     _DRAFT_CACHE["source"] = source
