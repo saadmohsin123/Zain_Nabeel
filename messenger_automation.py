@@ -587,7 +587,7 @@ def generate_ai_reply(
         "Avoid sounding robotic, overly formal, or repetitive. "
         "Only describe listings as available if the provided data clearly shows they are customer-ready active rental listings. "
         "If there are no customer-ready matches, say there are no active matches ready to share right now and offer to refine the search or follow up later. "
-        "If the user wants to book a call, meeting, or showing and a Calendly URL is provided, offer that booking link naturally."
+        "Do not offer or send any booking link unless the lead qualification flow has already been completed."
     )
     user_prompt = {
         "user_message": query,
@@ -664,25 +664,6 @@ def build_reply(
 
     matches = rank_drafts(query, drafts, limit=3)
     ready_matches = shortlist_for_booking(matches)
-
-    if looks_like_booking_request(query):
-        if ready_matches:
-            chosen = ready_matches[0]
-            title = compact(chosen.get("MarketplaceTitle")) or compact(chosen.get("Address")) or "that listing"
-            if calendly_url:
-                return (
-                    f"Absolutely. The best next step is to book a time with {agent_name} here: {calendly_url} "
-                    f"and mention {title}. If you want, I can also share a quick summary of the listing before you book."
-                )
-            return (
-                f"Absolutely. I can help with {title}. I do not have the booking link configured yet, "
-                f"but if you send your preferred day and time I can note it for {agent_name}."
-            )
-        if calendly_url:
-            return (
-                f"I can help with that. Before booking, please send the exact address or unit you want so I point you to the right listing. "
-                f"If you already know it, you can also book directly here: {calendly_url}"
-            )
 
     if openai_api_key and use_ai:
         try:
