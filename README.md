@@ -24,7 +24,14 @@ MARKETPLACE_DRAFTS_JSON=marketplace_drafts.json
 DRAFTS_CACHE_SECONDS=30
 ```
 
-Optional polling fallback:
+Optional but recommended:
+
+```env
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4.1-mini
+```
+
+`OPENAI_API_KEY` powers intelligent qualification parsing (understanding messy natural answers), post-qualification search intent, and natural listing replies. Without it, the bot falls back to basic rule-based parsing.
 
 ```env
 POLL_CONVERSATIONS_SECONDS=15

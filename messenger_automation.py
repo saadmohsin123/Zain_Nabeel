@@ -24,7 +24,7 @@ Optional env vars:
 - MARKETPLACE_DRAFTS_JSON     # default: marketplace_drafts.json
 - LISTING_DOC_URL             # optional URL to send when user asks for the doc
 - META_USER_ACCESS_TOKEN      # optional fallback to derive a page token for META_PAGE_ID
-- OPENAI_API_KEY              # optional conversational answer generation
+- OPENAI_API_KEY              # recommended for intelligent qualification parsing and natural replies
 - OPENAI_MODEL                # default: gpt-4.1-mini
 - CALENDLY_URL                # optional booking link for calls/showings
 - AGENT_NAME                  # default: Nabeel
@@ -456,6 +456,7 @@ def get_lead_session(state: dict, sender_id: str) -> dict:
             "search_query": "",
             "qualified": False,
             "last_shared_listing_keys": [],
+            "last_prompt": "",
         },
     )
 
@@ -987,12 +988,36 @@ def handle_qualified_listing_search(
     session: dict,
     query: str,
     drafts: List[dict],
+    openai_api_key: str = "",
+    openai_model: str = "gpt-4.1-mini",
+    use_ai: bool = True,
 ) -> Optional[str]:
-    if not wants_listing_refresh(query):
+    search_query = compact(query)
+    should_search = False
+    if use_ai and openai_api_key:
+        interpretation = ai_interpret_qualified_message(
+            openai_api_key,
+            openai_model,
+            query,
+            session.get("answers", {}),
+            compact(session.get("search_query")),
+        )
+        intent = compact(interpretation.get("intent")).lower()
+        if intent == "search_listings":
+            should_search = True
+            search_query = compact(interpretation.get("search_query")) or search_query
+        elif intent in ("booking", "general_question", "other"):
+            return None
+        else:
+            should_search = wants_listing_refresh(query)
+    else:
+        should_search = wants_listing_refresh(query)
+
+    if not should_search:
         return None
 
-    session["search_query"] = compact(query)
-    matches = rank_drafts(query, drafts, limit=3)
+    session["search_query"] = search_query
+    matches = rank_drafts(search_query, drafts, limit=3)
     session["last_shared_listing_keys"] = [
         compact(match.get("ListingKey")) for match in matches if compact(match.get("ListingKey"))
     ]
@@ -1030,44 +1055,57 @@ def maybe_handle_qualification(
     calendly_url: str,
     drafts: List[dict],
     listing_doc_url: str,
+    openai_api_key: str = "",
+    openai_model: str = "gpt-4.1-mini",
+    use_ai: bool = True,
 ) -> Optional[str]:
     state = load_lead_state(lead_state_path)
     session = get_lead_session(state, sender_id)
 
     if session.get("active"):
-        batch_index = int(session.get("batch", 0))
         answers = session.setdefault("answers", {})
         raw_answers = session.setdefault("raw_answers", {})
+        batch_index = int(session.get("batch", 0))
+        batch_index = min(batch_index, max(len(QUALIFICATION_BATCHES) - 1, 0))
 
         if batch_index < len(QUALIFICATION_BATCHES):
-            raw_answers[f"batch_{batch_index + 1}"] = compact(query)
-            parsed_answers = parse_batch_answers(batch_index, query)
+            raw_answers[f"turn_{len(raw_answers) + 1}"] = compact(query)
+            parsed_answers, follow_up_hint = extract_qualification_from_message(
+                batch_index,
+                query,
+                answers,
+                openai_api_key=openai_api_key,
+                openai_model=openai_model,
+                use_ai=use_ai,
+                last_prompt=compact(session.get("last_prompt")),
+                search_query=compact(session.get("search_query")),
+            )
             for key, value in parsed_answers.items():
                 if compact(value):
-                    answers[key] = compact(value)
+                    answers[key] = normalize_qualification_value(key, compact(value))
 
-            batch_keys = QUALIFICATION_BATCHES[batch_index]["keys"]
-            missing_keys = [key for key in batch_keys if not compact(answers.get(key))]
-            if missing_keys:
-                followup_answers = parse_missing_fields(missing_keys, query)
-                for key, value in followup_answers.items():
-                    if key in missing_keys and compact(value):
-                        answers[key] = compact(value)
-                missing_keys = [key for key in batch_keys if not compact(answers.get(key))]
-            if missing_keys:
-                save_lead_state(lead_state_path, state)
-                return build_missing_field_prompt(missing_keys, answers)
-
-            batch_index += 1
+            batch_index = first_incomplete_batch_index(answers)
             session["batch"] = batch_index
+
             if batch_index < len(QUALIFICATION_BATCHES):
+                batch_keys = QUALIFICATION_BATCHES[batch_index]["keys"]
+                missing_keys = [key for key in batch_keys if not compact(answers.get(key))]
+                if missing_keys:
+                    reply = follow_up_hint or build_missing_field_prompt(missing_keys, answers)
+                    session["last_prompt"] = reply
+                    save_lead_state(lead_state_path, state)
+                    return reply
+
+                next_prompt = QUALIFICATION_BATCHES[batch_index]["prompt"]
+                session["last_prompt"] = next_prompt
                 save_lead_state(lead_state_path, state)
-                return QUALIFICATION_BATCHES[batch_index]["prompt"]
+                return next_prompt
 
             session["active"] = False
             session["qualified"] = True
             session["completed_at"] = int(time.time())
             reply = build_post_qualification_reply(session, drafts, listing_doc_url)
+            session["last_prompt"] = reply
             save_lead_state(lead_state_path, state)
             return reply
 
@@ -1077,7 +1115,14 @@ def maybe_handle_qualification(
         return booking_reply
 
     if session.get("qualified"):
-        listing_reply = handle_qualified_listing_search(session, query, drafts)
+        listing_reply = handle_qualified_listing_search(
+            session,
+            query,
+            drafts,
+            openai_api_key=openai_api_key,
+            openai_model=openai_model,
+            use_ai=use_ai,
+        )
         if listing_reply:
             save_lead_state(lead_state_path, state)
             return listing_reply
@@ -1092,6 +1137,7 @@ def maybe_handle_qualification(
             session["answers"] = {}
             session["raw_answers"] = {}
             session["last_shared_listing_keys"] = []
+            session["last_prompt"] = QUALIFICATION_BATCHES[0]["prompt"]
             save_lead_state(lead_state_path, state)
             return QUALIFICATION_BATCHES[0]["prompt"]
 
@@ -1144,6 +1190,213 @@ def extract_response_text(response_json: dict) -> str:
             if text:
                 chunks.append(text)
     return "\n".join(chunk for chunk in chunks if chunk).strip()
+
+
+def parse_json_object(text: str) -> dict:
+    text = compact(text)
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        match = re.search(r"\{.*\}", text, re.S)
+        if not match:
+            return {}
+        try:
+            payload = json.loads(match.group(0))
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+
+
+def call_openai_json(api_key: str, model: str, system_prompt: str, user_payload: dict, max_tokens: int = 400) -> dict:
+    payload = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": json.dumps(user_payload, ensure_ascii=False)}],
+            },
+        ],
+        "max_output_tokens": max_tokens,
+    }
+    resp = requests.post(
+        OPENAI_RESPONSES_API,
+        headers=build_openai_headers(api_key),
+        json=payload,
+        timeout=int(os.getenv("OPENAI_REQUEST_TIMEOUT_SECONDS", "25") or "25"),
+    )
+    resp.raise_for_status()
+    return parse_json_object(extract_response_text(resp.json()))
+
+
+def normalize_qualification_value(key: str, value: str) -> str:
+    value = compact(value)
+    if not value:
+        return ""
+    if key in COUNT_FIELDS:
+        count = parse_int_from_text(value)
+        return count if count != "" else value
+    if key == "family_gross_income":
+        return extract_income_value(value) or value
+    if key == "resident_status":
+        return extract_resident_status(value) or value
+    if key == "working_with_agent":
+        agent_answer = extract_agent_answer(value)
+        return agent_answer if agent_answer in ("Yes", "No") else value
+    if key == "phone_number":
+        return extract_phone_number(value) or value
+    return value
+
+
+def unfilled_qualification_fields(answers: dict) -> Dict[str, str]:
+    unfilled: Dict[str, str] = {}
+    for step in QUALIFICATION_STEPS:
+        key = step["key"]
+        if not compact(answers.get(key)):
+            unfilled[key] = step["prompt"]
+    return unfilled
+
+
+def first_incomplete_batch_index(answers: dict) -> int:
+    for index, batch in enumerate(QUALIFICATION_BATCHES):
+        if any(not compact(answers.get(key)) for key in batch["keys"]):
+            return index
+    return len(QUALIFICATION_BATCHES)
+
+
+def ai_extract_qualification_fields(
+    api_key: str,
+    model: str,
+    user_message: str,
+    existing_answers: dict,
+    target_fields: Dict[str, str],
+    last_prompt: str = "",
+    search_query: str = "",
+) -> Tuple[Dict[str, str], str]:
+    if not api_key or not target_fields:
+        return {}, ""
+
+    system_prompt = (
+        "You extract rental lead qualification details from natural conversational messages. "
+        "Return JSON only with this exact shape:\n"
+        '{"fields": {"field_key": "value"}, "follow_up": "string"}\n'
+        "Rules:\n"
+        "- Only extract values clearly stated or strongly implied in the latest user message.\n"
+        "- Only use field keys from target_fields.\n"
+        "- Do not repeat or overwrite existing answers unless the user is clearly correcting them.\n"
+        "- Understand messy grammar, typos, shorthand, and partial answers.\n"
+        "- If the user answers only one part of a multi-part question, only fill that field.\n"
+        "- If the user volunteers later-step details early, fill those too when clear.\n"
+        "- working_with_agent must be exactly Yes or No.\n"
+        "- If the user mentions only adults, set kids_in_unit to 0.\n"
+        "- Keep resident_status short (for example Permanent Resident, Work Permit).\n"
+        "- Keep occupation as a job title, not income.\n"
+        "- follow_up should be a short natural question only for still-missing target fields from this turn. "
+        "Leave follow_up empty if the current target fields are complete."
+    )
+    user_payload = {
+        "user_message": user_message,
+        "search_query": search_query,
+        "existing_answers": existing_answers,
+        "target_fields": target_fields,
+        "last_assistant_prompt": last_prompt,
+    }
+    try:
+        result = call_openai_json(api_key, model, system_prompt, user_payload)
+    except Exception as exc:
+        print(f"AI qualification extraction failed: {exc}")
+        return {}, ""
+
+    fields = result.get("fields", {})
+    if not isinstance(fields, dict):
+        fields = {}
+    cleaned = {
+        key: normalize_qualification_value(key, compact(value))
+        for key, value in fields.items()
+        if key in target_fields and compact(value)
+    }
+    return cleaned, compact(result.get("follow_up"))
+
+
+def ai_interpret_qualified_message(
+    api_key: str,
+    model: str,
+    user_message: str,
+    existing_answers: dict,
+    prior_search_query: str = "",
+) -> dict:
+    if not api_key:
+        return {}
+    system_prompt = (
+        "You interpret messages from a qualified rental lead. Return JSON only:\n"
+        '{"intent":"search_listings|booking|general_question|other","search_query":"string","reply":"string"}\n'
+        "Rules:\n"
+        "- Use search_listings when the user wants to see, refine, or expand listing options.\n"
+        "- search_query should be a concise search phrase for inventory matching.\n"
+        "- Use prior_search_query and collected answers as context.\n"
+        "- reply should be empty unless intent is general_question."
+    )
+    user_payload = {
+        "user_message": user_message,
+        "prior_search_query": prior_search_query,
+        "collected_answers": existing_answers,
+    }
+    try:
+        return call_openai_json(api_key, model, system_prompt, user_payload, max_tokens=250)
+    except Exception as exc:
+        print(f"AI qualified-message interpretation failed: {exc}")
+        return {}
+
+
+def extract_qualification_from_message(
+    batch_index: int,
+    query: str,
+    answers: dict,
+    openai_api_key: str = "",
+    openai_model: str = "gpt-4.1-mini",
+    use_ai: bool = True,
+    last_prompt: str = "",
+    search_query: str = "",
+) -> Tuple[Dict[str, str], str]:
+    parsed: Dict[str, str] = {}
+    follow_up_hint = ""
+
+    batch_keys = QUALIFICATION_BATCHES[batch_index]["keys"] if batch_index < len(QUALIFICATION_BATCHES) else []
+    missing_in_batch = [key for key in batch_keys if not compact(answers.get(key))]
+    unfilled = unfilled_qualification_fields(answers)
+    target_fields = {key: unfilled[key] for key in unfilled}
+
+    if use_ai and openai_api_key and target_fields:
+        ai_fields, follow_up_hint = ai_extract_qualification_fields(
+            openai_api_key,
+            openai_model,
+            query,
+            answers,
+            target_fields,
+            last_prompt=last_prompt,
+            search_query=search_query,
+        )
+        parsed.update(ai_fields)
+
+    regex_fields = parse_batch_answers(batch_index, query)
+    for key, value in regex_fields.items():
+        if compact(value) and not compact(parsed.get(key)):
+            parsed[key] = compact(value)
+
+    if missing_in_batch:
+        for key, value in parse_missing_fields(missing_in_batch, query).items():
+            if compact(value) and not compact(parsed.get(key)) and not compact(answers.get(key)):
+                parsed[key] = compact(value)
+
+    normalized = {
+        key: normalize_qualification_value(key, value)
+        for key, value in parsed.items()
+        if compact(value)
+    }
+    return normalized, follow_up_hint
 
 
 def generate_ai_reply(
@@ -1236,6 +1489,9 @@ def build_reply(
         calendly_url,
         drafts,
         listing_doc_url,
+        openai_api_key=openai_api_key if use_ai else "",
+        openai_model=openai_model,
+        use_ai=use_ai,
     )
     if qualification_reply:
         return qualification_reply
