@@ -119,11 +119,12 @@ QUALIFICATION_BATCHES = [
         "prompt": "Thanks. What’s your total family gross income excluding cash income, and what do you do for work?",
     },
     {
-        "keys": ["resident_status", "working_with_agent", "phone_number"],
-        "prompt": (
-            "Last few details. What’s your resident status in Canada, are you currently working with an agent, "
-            "and what’s the best phone number to reach you on?"
-        ),
+        "keys": ["resident_status", "working_with_agent"],
+        "prompt": "Almost done. What's your resident status in Canada, and are you currently working with an agent?",
+    },
+    {
+        "keys": ["phone_number"],
+        "prompt": "Last one — what's the best phone number to reach you on?",
     },
 ]
 
@@ -416,10 +417,14 @@ def looks_like_greeting(query: str) -> bool:
     return q in greetings
 
 
-def qualification_opt_in_prompt(agent_name: str) -> str:
+def qualification_opt_in_prompt(agent_name: str, search_summary: str = "") -> str:
+    context = f"Got it — you're looking for {search_summary}.\n\n" if search_summary else ""
     return (
-        begin_qualification_flow(agent_name)
-        + "\n\nWould you like me to send you a list of the best active listings in your area and price range? You can pick your favourites and we can go from there."
+        f"{context}"
+        f"That's great. I'm {agent_name}'s assistant and I can help make your search easier. "
+        "I have access to rentals beyond Facebook as well, and there is no cost to you.\n\n"
+        "Would you like me to send you a list of the best active options? "
+        "Just say yes and I'll ask a few quick questions first."
     )
 
 
@@ -476,13 +481,24 @@ def format_lead_summary(answers: dict) -> str:
     return "\n".join(lines)
 
 
+def describe_search_preferences(query: str) -> str:
+    normalized = query.lower()
+    parts: List[str] = []
+    bed_match = re.search(r"\b(\d+)\s*bed(?:room)?s?\b", normalized)
+    if bed_match:
+        parts.append(f"{bed_match.group(1)} bedroom")
+    if "downtown" in normalized:
+        parts.append("in downtown Toronto")
+    elif "toronto" in normalized:
+        parts.append("in Toronto")
+    price_match = re.search(r"\$?\s*(\d{3,6})", normalized.replace(",", ""))
+    if price_match:
+        parts.append(f"up to ${int(price_match.group(1)):,}")
+    return " ".join(parts).strip()
+
+
 def begin_qualification_flow(agent_name: str) -> str:
-    return (
-        f"That’s great! Allow me to introduce myself, I’m {agent_name}, a local realtor here in Toronto. "
-        "If you’re open to it, I can actually make your home search a lot easier as I have access to all the rentals on the market "
-        "(including ones not on Facebook), and the best part is there’s no cost to you at all. The landlord pays my fee!\n\n"
-        "To narrow down the best active listings for you, I just need a few quick details first."
-    )
+    return qualification_opt_in_prompt(agent_name)
 
 
 def normalize_whitespace(text: str) -> str:
@@ -637,35 +653,42 @@ def parse_batch_answers(batch_index: int, query: str) -> Dict[str, str]:
                 answers["occupation"] = occupation_text
 
     elif batch_index == 3:
-        if len(cleaned_lines) >= 3:
+        if len(cleaned_lines) >= 2:
             answers["resident_status"] = extract_resident_status(cleaned_lines[0])
             answers["working_with_agent"] = extract_agent_answer(cleaned_lines[1])
-            answers["phone_number"] = extract_phone_number(cleaned_lines[2]) or cleaned_lines[2]
             return {k: v for k, v in answers.items() if compact(v)}
 
         if "," in normalized:
             parts = [part.strip() for part in normalized.split(",") if part.strip()]
-            if len(parts) >= 3:
+            if len(parts) >= 2:
                 answers["resident_status"] = extract_resident_status(parts[0])
                 answers["working_with_agent"] = extract_agent_answer(parts[1])
-                answers["phone_number"] = extract_phone_number(parts[2]) or parts[2]
 
-        resident = extract_resident_status(normalized)
-        if resident and (
-            resident.lower() != lowered
-            or any(
-                token in lowered
-                for token in ("permanent resident", "citizen", "work permit", "student", "visitor", "refugee")
-            )
-        ):
-            answers["resident_status"] = resident
+        if not answers.get("resident_status"):
+            resident = extract_resident_status(normalized)
+            if resident and (
+                resident.lower() != lowered
+                or any(
+                    token in lowered
+                    for token in ("permanent resident", "citizen", "work permit", "student", "visitor", "refugee")
+                )
+            ):
+                answers["resident_status"] = resident
 
-        agent_answer = extract_agent_answer(normalized)
-        if agent_answer in ("Yes", "No"):
-            answers["working_with_agent"] = agent_answer
-        phone = extract_phone_number(normalized)
-        if phone:
-            answers["phone_number"] = phone
+        if not answers.get("working_with_agent"):
+            agent_answer = extract_agent_answer(normalized)
+            if agent_answer in ("Yes", "No"):
+                answers["working_with_agent"] = agent_answer
+
+    elif batch_index == 4:
+        if cleaned_lines:
+            answers["phone_number"] = extract_phone_number(cleaned_lines[0]) or cleaned_lines[0]
+        else:
+            phone = extract_phone_number(normalized)
+            if phone:
+                answers["phone_number"] = phone
+            elif normalized:
+                answers["phone_number"] = normalized
 
     return {k: v for k, v in answers.items() if compact(v)}
 
@@ -708,10 +731,8 @@ def build_post_qualification_reply(
         lines.append(f"- {summarize_shared_listing(match)}")
     lines.append("")
     lines.append(
-        "If one stands out, send me the address or ListingKey and I can help you move forward with the next step."
+        "If one stands out, send me the address or ListingKey and I'll help you move forward with the next step."
     )
-    if listing_doc_url:
-        lines.append(f"You can also review the latest listing packet here: {listing_doc_url}")
     return "\n".join(lines)
 
 
@@ -762,15 +783,11 @@ def handle_post_qualification_booking(
 
 def should_start_qualification(query: str, calendly_url: str) -> bool:
     q = query.lower()
-    if looks_like_booking_request(query):
-        return True
     if wants_listing_help(query):
         return True
     if "send me" in q and "listing" in q:
         return True
     if "help me" in q and ("find" in q or "search" in q):
-        return True
-    if calendly_url and ("call" in q or "viewing" in q or "meeting" in q):
         return True
     return False
 
@@ -832,19 +849,16 @@ def maybe_handle_qualification(
             session["raw_answers"] = {}
             session["last_shared_listing_keys"] = []
             save_lead_state(lead_state_path, state)
-            return (
-                "Perfect. Before we proceed ahead, I just need a few quick details.\n\n"
-                + QUALIFICATION_BATCHES[0]["prompt"]
-            )
+            return QUALIFICATION_BATCHES[0]["prompt"]
 
         if wants_listing_help(query):
             session["search_query"] = compact(query)
             save_lead_state(lead_state_path, state)
-            return qualification_opt_in_prompt(agent_name)
+            return qualification_opt_in_prompt(agent_name, describe_search_preferences(query))
 
         save_lead_state(lead_state_path, state)
         return (
-            "No problem. If you’d like me to narrow down the best active listings for you, just reply yes and I’ll ask a few quick questions first."
+            "No problem. If you'd like me to narrow down the best active listings for you, just reply yes and I'll ask a few quick questions first."
         )
 
     if should_start_qualification(query, calendly_url):
@@ -858,7 +872,7 @@ def maybe_handle_qualification(
         session["search_query"] = compact(query)
         session["last_shared_listing_keys"] = []
         save_lead_state(lead_state_path, state)
-        return qualification_opt_in_prompt(agent_name)
+        return qualification_opt_in_prompt(agent_name, describe_search_preferences(query))
 
     return None
 
@@ -892,28 +906,30 @@ def generate_ai_reply(
     agent_name: str,
     api_key: str,
     model: str,
+    qualified: bool = False,
+    allow_booking: bool = False,
 ) -> Optional[str]:
     listing_payload = [listing_context(match) for match in matches[:3]]
     system_prompt = (
-        "You are Durham New Homes, a real-estate leasing and sales assistant for Nabeel. "
+        "You are Durham New Homes, a leasing assistant for Nabeel. "
         "Answer like a capable human leasing coordinator: warm, concise, natural, and practical. "
-        "Use only the provided listing data and provided packet link. "
+        "Use only the provided listing data. "
         "Do not invent features, pricing, amenities, policies, or availability. "
-        "Never mention internal workflow labels, back-office statuses, review states, or marketplace pipeline terms to the customer. "
+        "Never mention internal workflow labels, back-office statuses, review states, spreadsheets, packets, or marketplace pipeline terms to the customer. "
         "If the user asks something not present in the data, say that it is not confirmed yet and ask a targeted follow-up. "
         "If the query is generic and no exact answer is available, guide the user to share the address, ListingKey, or unit number. "
         "Prefer short conversational paragraphs, not bullets, unless the user explicitly asks for a list. "
         "Avoid sounding robotic, overly formal, or repetitive. "
         "Only describe listings as available if the provided data clearly shows they are customer-ready active rental listings. "
-        "If there are no customer-ready matches, say there are no active matches ready to share right now and offer to refine the search or follow up later. "
-        "Do not offer or send any booking link unless the lead qualification flow has already been completed."
+        "If there are no customer-ready matches, say there are no active matches ready to share right now and offer to refine the search. "
+        "Do not offer or send any booking link unless the lead is qualified and explicitly wants to move forward on a listing."
     )
     user_prompt = {
         "user_message": query,
-        "listing_packet_url": listing_doc_url,
-        "calendly_url": calendly_url,
+        "lead_qualified": qualified,
+        "calendly_url": calendly_url if qualified and allow_booking else "",
         "agent_name": agent_name,
-        "matched_listings": listing_payload,
+        "matched_listings": listing_payload if qualified else [],
     }
     payload = {
         "model": model,
@@ -976,6 +992,20 @@ def build_reply(
     if qualification_reply:
         return qualification_reply
 
+    is_qualified = bool(session.get("qualified"))
+    allow_booking = is_qualified and looks_like_booking_request(query) and bool(session.get("last_shared_listing_keys"))
+
+    if not is_qualified:
+        if looks_like_booking_request(query) or wants_listing_help(query):
+            session["awaiting_opt_in"] = True
+            session["search_query"] = compact(query)
+            save_lead_state(lead_state_path, state)
+            return qualification_opt_in_prompt(agent_name, describe_search_preferences(query))
+        return (
+            "I can help with that. Tell me your preferred area, budget, and unit type, "
+            "and I'll take it from there."
+        )
+
     normalized = query.lower().strip()
     link_only_patterns = [
         "doc",
@@ -1008,6 +1038,8 @@ def build_reply(
                 agent_name,
                 openai_api_key,
                 openai_model,
+                qualified=is_qualified,
+                allow_booking=allow_booking,
             )
             if ai_reply:
                 return ai_reply
@@ -1025,16 +1057,12 @@ def build_reply(
             "and unit type you want, I can note your search and help refine it."
         )
 
-    lines = ["I found these matching listings:"]
+    lines = ["Here are a few active options that look relevant:"]
     for draft in matches:
         lines.append("")
         lines.append(summarize_draft(draft))
-        desc = compact(draft.get("MarketplaceDescription"))
-        if desc:
-            lines.append(desc[:500])
-    if listing_doc_url:
-        lines.append("")
-        lines.append(f"Packet: {listing_doc_url}")
+    lines.append("")
+    lines.append("If one stands out, send me the address or ListingKey and I'll help with the next step.")
     return "\n".join(lines)
 
 
