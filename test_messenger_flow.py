@@ -120,6 +120,28 @@ class FlowTest:
         r = reply_as("partial-user", "3")
         self.check("single_number_people_count", "missing" not in r.lower() and "adult" in r.lower())
 
+        # Screenshot batch parsing
+        def full_qual(sender_id: str, messages: list[str]) -> str:
+            last = ""
+            for msg in messages:
+                last = reply_as(sender_id, msg)
+            return last
+
+        full_qual("parse-user", [
+            "condo in toronto", "yes", "1st july and 3 people", "3 adults", "60k", "engineer",
+            "Permanent yes i am working woth an agent right now", "4165551234",
+        ])
+        import json
+        answers = json.loads(Path(self.state_path).read_text())["sessions"]["parse-user"]["answers"]
+        self.check("kids_default_zero", answers.get("kids_in_unit") == "0")
+        self.check("income_60k", answers.get("family_gross_income") == "$60k")
+        self.check("agent_yes", answers.get("working_with_agent") == "Yes")
+        self.check("resident_clean", answers.get("resident_status") == "Permanent Resident")
+
+        r = reply_as("parse-user", "I want you to show me listings in Ontario")
+        self.check("qualified_no_restart", "nabeel's assistant" not in r.lower())
+        self.check("qualified_search_reply", "looked again" in r.lower() or "active options" in r.lower())
+
         return self.failures
 
 

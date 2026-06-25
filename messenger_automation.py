@@ -533,38 +533,115 @@ def extract_income_value(text: str) -> str:
     normalized = normalize_whitespace(text)
     if not normalized:
         return ""
+    lowered = normalized.lower()
+    k_match = re.search(r"(\d[\d,]*)\s*[kK]\b", normalized)
+    if k_match:
+        return f"${k_match.group(1)}k"
     money = re.search(r"([$€£]?\s?\d[\d,]*(?:\.\d+)?(?:\s*/\s*(?:year|month))?)", normalized, re.I)
-    return money.group(1).replace(" ", "") if money else normalized
+    if money:
+        return money.group(1).replace(" ", "")
+    if lowered.isdigit():
+        return normalized
+    return ""
 
 
 def extract_resident_status(text: str) -> str:
-    normalized = normalize_whitespace(text)
-    lowered = normalized.lower()
+    lowered = normalize_whitespace(text).lower()
+    if not lowered:
+        return ""
     patterns = [
-        "permanent resident",
-        "citizen",
-        "work permit",
-        "student",
-        "visitor",
-        "refugee",
-        "open work permit",
-        "closed work permit",
+        ("permanent resident", "Permanent Resident"),
+        ("permanent", "Permanent Resident"),
+        ("citizen", "Canadian Citizen"),
+        ("work permit", "Work Permit"),
+        ("open work permit", "Open Work Permit"),
+        ("closed work permit", "Closed Work Permit"),
+        ("student", "Student"),
+        ("visitor", "Visitor"),
+        ("refugee", "Refugee"),
+    ]
+    for pattern, label in patterns:
+        if pattern in lowered:
+            return label
+    if re.fullmatch(r"pr", lowered):
+        return "Permanent Resident"
+    return ""
+
+
+def scrub_agent_phrases(text: str) -> str:
+    scrubbed = normalize_whitespace(text)
+    patterns = [
+        r"yes[, ]+i am working with an agent.*$",
+        r"yes[, ]+i'?m working with an agent.*$",
+        r"i am working with an agent.*$",
+        r"i'?m working with an agent.*$",
+        r"working with an agent.*$",
+        r"working with a agent.*$",
     ]
     for pattern in patterns:
-        if pattern in lowered:
-            return pattern.title()
-    return normalized
+        scrubbed = re.sub(pattern, "", scrubbed, flags=re.I).strip(" ,.-")
+    return scrubbed
 
 
 def extract_agent_answer(text: str) -> str:
     lowered = normalize_whitespace(text).lower()
     if not lowered:
         return ""
-    if any(token in lowered for token in ("no", "nope", "not working", "just you", "only you")):
-        return "No"
-    if any(token in lowered for token in ("yes", "yeah", "yup", "working with", "i am")):
+    positive_patterns = [
+        r"\byes\b",
+        r"\bworking with an agent\b",
+        r"\bworking with a agent\b",
+        r"\bi am working with\b",
+        r"\bi'?m working with\b",
+        r"\bhave an agent\b",
+    ]
+    negative_patterns = [
+        r"\bno agent\b",
+        r"\bnot working with\b",
+        r"\bnope\b",
+        r"\bjust you\b",
+        r"\bonly you\b",
+    ]
+    if any(re.search(pattern, lowered) for pattern in positive_patterns):
         return "Yes"
-    return normalize_whitespace(text)
+    if any(re.search(pattern, lowered) for pattern in negative_patterns):
+        return "No"
+    if re.fullmatch(r"no", lowered):
+        return "No"
+    return ""
+
+
+def parse_resident_and_agent(text: str) -> Dict[str, str]:
+    answers: Dict[str, str] = {}
+    agent_answer = extract_agent_answer(text)
+    status_text = scrub_agent_phrases(text)
+    resident_status = extract_resident_status(status_text) or extract_resident_status(text)
+    if resident_status:
+        answers["resident_status"] = resident_status
+    if agent_answer in ("Yes", "No"):
+        answers["working_with_agent"] = agent_answer
+    return answers
+
+
+def parse_people_count(text: str) -> str:
+    lowered = normalize_whitespace(text).lower()
+    match = re.search(r"(\d+)\s*(?:people|person|tenant|tenants)\b", lowered)
+    if match:
+        return match.group(1)
+    return parse_int_from_text(text)
+
+
+def is_plausible_occupation(text: str) -> bool:
+    cleaned = normalize_whitespace(text)
+    if not cleaned:
+        return False
+    if len(cleaned) < 2:
+        return False
+    if re.fullmatch(r"[kK]", cleaned):
+        return False
+    if re.fullmatch(r"\$?\d+[kK]?", cleaned):
+        return False
+    return True
 
 
 COUNT_FIELDS = {"people_on_lease", "adults_in_unit", "kids_in_unit"}
@@ -591,12 +668,23 @@ def parse_missing_fields(missing_keys: List[str], query: str) -> Dict[str, str]:
         return {}
 
     answers: Dict[str, str] = {}
+    lowered = normalized.lower()
     if len(missing_keys) == 1:
         key = missing_keys[0]
-        if key in COUNT_FIELDS:
+        if key in ("people_on_lease", "adults_in_unit"):
             count = parse_int_from_text(query)
             if count != "":
                 answers[key] = count
+        elif key == "kids_in_unit":
+            kids_match = re.search(r"(\d+)\s+(?:kid|kids|child|children)\b", lowered)
+            if kids_match:
+                answers[key] = kids_match.group(1)
+            elif re.search(r"\bno kids\b|\bnone\b", lowered):
+                answers[key] = "0"
+            elif "adult" not in lowered:
+                count = parse_int_from_text(query)
+                if count != "":
+                    answers[key] = count
         elif key == "move_in_date":
             answers[key] = extract_move_in_date(query)
         elif key == "family_gross_income":
@@ -604,20 +692,19 @@ def parse_missing_fields(missing_keys: List[str], query: str) -> Dict[str, str]:
             if value:
                 answers[key] = value
         elif key == "occupation":
-            answers[key] = normalized
+            if is_plausible_occupation(normalized):
+                answers[key] = normalized
         elif key == "resident_status":
-            answers[key] = extract_resident_status(query)
+            value = extract_resident_status(query)
+            if value:
+                answers[key] = value
         elif key == "working_with_agent":
             agent_answer = extract_agent_answer(query)
             if agent_answer in ("Yes", "No"):
                 answers[key] = agent_answer
-            elif normalized:
-                answers[key] = normalized
         elif key == "phone_number":
             answers[key] = extract_phone_number(query) or normalized
         return {k: v for k, v in answers.items() if compact(v)}
-
-    if "," in normalized:
         parts = [part.strip() for part in normalized.split(",") if part.strip()]
         parsers = {
             "move_in_date": extract_move_in_date,
@@ -688,7 +775,12 @@ def parse_batch_answers(batch_index: int, query: str) -> Dict[str, str]:
             parts = [part.strip() for part in normalized.split(",") if part.strip()]
             if len(parts) >= 2:
                 answers["move_in_date"] = parts[0]
-                answers["people_on_lease"] = parse_int_from_text(parts[1])
+                answers["people_on_lease"] = parse_people_count(parts[1])
+
+        and_parts = re.split(r"\s+and\s+", normalized, maxsplit=1, flags=re.I)
+        if len(and_parts) == 2:
+            answers["move_in_date"] = extract_move_in_date(and_parts[0])
+            answers["people_on_lease"] = parse_people_count(and_parts[1])
 
         if not answers.get("move_in_date") and normalized:
             answers["move_in_date"] = extract_move_in_date(normalized)
@@ -717,6 +809,8 @@ def parse_batch_answers(batch_index: int, query: str) -> Dict[str, str]:
             answers["kids_in_unit"] = kids_match.group(1)
         elif "no kids" in lowered:
             answers["kids_in_unit"] = "0"
+        elif adults_match and re.search(r"^\d+\s+adults?\b", lowered):
+            answers["kids_in_unit"] = "0"
 
     elif batch_index == 2:
         if len(cleaned_lines) >= 2:
@@ -731,44 +825,41 @@ def parse_batch_answers(batch_index: int, query: str) -> Dict[str, str]:
                 answers["occupation"] = parts[1]
 
         if not answers.get("family_gross_income"):
-            income_match = re.search(r"[$€£]?\s?\d[\d,]*(?:\.\d+)?(?:\s*/\s*(?:year|month))?", normalized, re.I)
-            if income_match:
-                answers["family_gross_income"] = extract_income_value(income_match.group(0))
+            income_value = extract_income_value(normalized)
+            if income_value:
+                answers["family_gross_income"] = income_value
 
         if normalized and not answers.get("occupation"):
             occupation_text = normalized
-            if answers.get("family_gross_income"):
-                occupation_text = occupation_text.replace(answers["family_gross_income"], "").strip(" ,.-")
-            if occupation_text and len(occupation_text.split()) <= 12:
+            income_value = compact(answers.get("family_gross_income"))
+            if income_value:
+                occupation_text = re.sub(re.escape(income_value), "", occupation_text, flags=re.I).strip(" ,.-")
+                occupation_text = re.sub(r"\$?\d[\d,]*\s*[kK]\b", "", occupation_text).strip(" ,.-")
+            if is_plausible_occupation(occupation_text):
                 answers["occupation"] = occupation_text
 
     elif batch_index == 3:
-        if len(cleaned_lines) >= 2:
-            answers["resident_status"] = extract_resident_status(cleaned_lines[0])
-            answers["working_with_agent"] = extract_agent_answer(cleaned_lines[1])
-            return {k: v for k, v in answers.items() if compact(v)}
-
         if "," in normalized:
             parts = [part.strip() for part in normalized.split(",") if part.strip()]
             if len(parts) >= 2:
-                answers["resident_status"] = extract_resident_status(parts[0])
-                answers["working_with_agent"] = extract_agent_answer(parts[1])
+                status = extract_resident_status(parts[0])
+                if status:
+                    answers["resident_status"] = status
+                agent_answer = extract_agent_answer(parts[1])
+                if agent_answer in ("Yes", "No"):
+                    answers["working_with_agent"] = agent_answer
+                return {k: v for k, v in answers.items() if compact(v)}
 
-        if not answers.get("resident_status"):
-            resident = extract_resident_status(normalized)
-            if resident and (
-                resident.lower() != lowered
-                or any(
-                    token in lowered
-                    for token in ("permanent resident", "citizen", "work permit", "student", "visitor", "refugee")
-                )
-            ):
-                answers["resident_status"] = resident
-
-        if not answers.get("working_with_agent"):
-            agent_answer = extract_agent_answer(normalized)
+        if len(cleaned_lines) >= 2:
+            status = extract_resident_status(cleaned_lines[0])
+            if status:
+                answers["resident_status"] = status
+            agent_answer = extract_agent_answer(cleaned_lines[1])
             if agent_answer in ("Yes", "No"):
                 answers["working_with_agent"] = agent_answer
+            return {k: v for k, v in answers.items() if compact(v)}
+
+        answers.update(parse_resident_and_agent(normalized))
 
     elif batch_index == 4:
         if cleaned_lines:
@@ -871,6 +962,55 @@ def handle_post_qualification_booking(
     )
 
 
+def wants_listing_refresh(query: str) -> bool:
+    q = query.lower()
+    if looks_like_booking_request(query):
+        return False
+    refresh_markers = [
+        "show me listings",
+        "show listings",
+        "send me listings",
+        "listings in",
+        "i want you to show",
+        "want you to show",
+        "show me options",
+        "show me places",
+        "find me listings",
+        "search in",
+    ]
+    if any(marker in q for marker in refresh_markers):
+        return True
+    return "listings" in q and any(token in q for token in ("ontario", "toronto", "in ", "area", "city"))
+
+
+def handle_qualified_listing_search(
+    session: dict,
+    query: str,
+    drafts: List[dict],
+) -> Optional[str]:
+    if not wants_listing_refresh(query):
+        return None
+
+    session["search_query"] = compact(query)
+    matches = rank_drafts(query, drafts, limit=3)
+    session["last_shared_listing_keys"] = [
+        compact(match.get("ListingKey")) for match in matches if compact(match.get("ListingKey"))
+    ]
+
+    if not matches:
+        return (
+            "I looked again, but I don't see active listings that match that search closely right now. "
+            "If you want, tell me the city, budget, or unit type and I'll narrow it further."
+        )
+
+    lines = ["Here are a few active options that match what you asked for:"]
+    for match in matches:
+        lines.append(f"- {summarize_shared_listing(match)}")
+    lines.append("")
+    lines.append("If one stands out, send me the address or ListingKey and I'll help with the next step.")
+    return "\n".join(lines)
+
+
 def should_start_qualification(query: str, calendly_url: str) -> bool:
     q = query.lower()
     if wants_listing_help(query):
@@ -936,6 +1076,12 @@ def maybe_handle_qualification(
         save_lead_state(lead_state_path, state)
         return booking_reply
 
+    if session.get("qualified"):
+        listing_reply = handle_qualified_listing_search(session, query, drafts)
+        if listing_reply:
+            save_lead_state(lead_state_path, state)
+            return listing_reply
+
     if session.get("awaiting_opt_in"):
         if looks_like_affirmative(query):
             session["awaiting_opt_in"] = False
@@ -963,7 +1109,7 @@ def maybe_handle_qualification(
         save_lead_state(lead_state_path, state)
         return "Whenever you're ready, just reply yes and I'll ask a few quick questions."
 
-    if should_start_qualification(query, calendly_url):
+    if should_start_qualification(query, calendly_url) and not session.get("qualified"):
         session["awaiting_opt_in"] = True
         session["active"] = False
         session["step"] = 0
