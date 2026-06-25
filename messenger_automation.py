@@ -482,14 +482,19 @@ def format_lead_summary(answers: dict) -> str:
 
 
 def describe_search_preferences(query: str) -> str:
-    normalized = query.lower()
+    normalized = query.lower().replace("torronto", "toronto")
     parts: List[str] = []
     bed_match = re.search(r"\b(\d+)\s*bed(?:room)?s?\b", normalized)
     if bed_match:
         parts.append(f"{bed_match.group(1)} bedroom")
+    unit_types = ["condo", "apartment", "house", "townhouse", "studio", "basement"]
+    for unit_type in unit_types:
+        if re.search(rf"\b{unit_type}\b", normalized):
+            parts.append(unit_type)
+            break
     if "downtown" in normalized:
         parts.append("in downtown Toronto")
-    elif "toronto" in normalized:
+    elif re.search(r"\btoronto\b", normalized):
         parts.append("in Toronto")
     price_match = re.search(r"\$?\s*(\d{3,6})", normalized.replace(",", ""))
     if price_match:
@@ -562,7 +567,98 @@ def extract_agent_answer(text: str) -> str:
     return normalize_whitespace(text)
 
 
-def build_missing_field_prompt(keys: List[str]) -> str:
+COUNT_FIELDS = {"people_on_lease", "adults_in_unit", "kids_in_unit"}
+
+
+def extract_move_in_date(text: str) -> str:
+    normalized = normalize_whitespace(text)
+    if not normalized:
+        return ""
+    date_match = re.search(
+        r"\b(?:\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?[A-Za-z]+|[A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?(?:\s+of)?|[A-Za-z]+\s+\d{4}|immediately|asap|next month|this month)\b",
+        normalized,
+        re.I,
+    )
+    return date_match.group(0) if date_match else normalized
+
+
+def parse_missing_fields(missing_keys: List[str], query: str) -> Dict[str, str]:
+    if not missing_keys:
+        return {}
+
+    normalized = normalize_whitespace(query)
+    if not normalized:
+        return {}
+
+    answers: Dict[str, str] = {}
+    if len(missing_keys) == 1:
+        key = missing_keys[0]
+        if key in COUNT_FIELDS:
+            count = parse_int_from_text(query)
+            if count != "":
+                answers[key] = count
+        elif key == "move_in_date":
+            answers[key] = extract_move_in_date(query)
+        elif key == "family_gross_income":
+            value = extract_income_value(query)
+            if value:
+                answers[key] = value
+        elif key == "occupation":
+            answers[key] = normalized
+        elif key == "resident_status":
+            answers[key] = extract_resident_status(query)
+        elif key == "working_with_agent":
+            agent_answer = extract_agent_answer(query)
+            if agent_answer in ("Yes", "No"):
+                answers[key] = agent_answer
+            elif normalized:
+                answers[key] = normalized
+        elif key == "phone_number":
+            answers[key] = extract_phone_number(query) or normalized
+        return {k: v for k, v in answers.items() if compact(v)}
+
+    if "," in normalized:
+        parts = [part.strip() for part in normalized.split(",") if part.strip()]
+        parsers = {
+            "move_in_date": extract_move_in_date,
+            "people_on_lease": parse_int_from_text,
+            "adults_in_unit": parse_int_from_text,
+            "kids_in_unit": parse_int_from_text,
+            "family_gross_income": extract_income_value,
+            "occupation": normalize_whitespace,
+            "resident_status": extract_resident_status,
+            "working_with_agent": extract_agent_answer,
+            "phone_number": lambda value: extract_phone_number(value) or normalize_whitespace(value),
+        }
+        for index, key in enumerate(missing_keys):
+            if index >= len(parts):
+                break
+            parser = parsers.get(key, normalize_whitespace)
+            value = compact(parser(parts[index]))
+            if value:
+                answers[key] = value
+
+    return {k: v for k, v in answers.items() if compact(v)}
+
+
+def build_missing_field_prompt(keys: List[str], answers: Optional[dict] = None) -> str:
+    answers = answers or {}
+    if len(keys) == 1:
+        key = keys[0]
+        if key == "people_on_lease" and compact(answers.get("move_in_date")):
+            return (
+                f"Got it on move-in ({compact(answers['move_in_date'])}). "
+                "How many people will be on the lease?"
+            )
+        if key == "kids_in_unit" and compact(answers.get("adults_in_unit")):
+            return "Thanks. How many kids will be living in the unit?"
+        if key == "occupation" and compact(answers.get("family_gross_income")):
+            return "Thanks. What do you do for work?"
+        if key == "phone_number":
+            return "Last one — what's the best phone number to reach you on?"
+        by_key = {step["key"]: step["prompt"] for step in QUALIFICATION_STEPS}
+        return by_key.get(key, "Could you share that detail?")
+
     prompts = []
     by_key = {step["key"]: step["prompt"] for step in QUALIFICATION_STEPS}
     for key in keys:
@@ -570,8 +666,8 @@ def build_missing_field_prompt(keys: List[str]) -> str:
         if prompt:
             prompts.append(f"- {prompt}")
     if not prompts:
-        return "I’m missing a couple of details. Please send them in one message."
-    return "I’m just missing these details:\n" + "\n".join(prompts)
+        return "I still need one more detail from you."
+    return "I still need:\n" + "\n".join(prompts)
 
 
 def parse_batch_answers(batch_index: int, query: str) -> Dict[str, str]:
@@ -595,13 +691,7 @@ def parse_batch_answers(batch_index: int, query: str) -> Dict[str, str]:
                 answers["people_on_lease"] = parse_int_from_text(parts[1])
 
         if not answers.get("move_in_date") and normalized:
-            date_match = re.search(
-                r"\b(?:\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+|[A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?|[A-Za-z]+\s+\d{4}|immediately|asap|next month|this month)\b",
-                normalized,
-                re.I,
-            )
-            if date_match:
-                answers["move_in_date"] = date_match.group(0)
+            answers["move_in_date"] = extract_move_in_date(normalized)
 
         people_match = re.search(r"(\d+)\s+(?:people|person|tenant|tenants).*(?:lease|living|unit)?", lowered)
         if people_match:
@@ -812,13 +902,21 @@ def maybe_handle_qualification(
         if batch_index < len(QUALIFICATION_BATCHES):
             raw_answers[f"batch_{batch_index + 1}"] = compact(query)
             parsed_answers = parse_batch_answers(batch_index, query)
-            answers.update(parsed_answers)
+            for key, value in parsed_answers.items():
+                if compact(value):
+                    answers[key] = compact(value)
 
             batch_keys = QUALIFICATION_BATCHES[batch_index]["keys"]
             missing_keys = [key for key in batch_keys if not compact(answers.get(key))]
             if missing_keys:
+                followup_answers = parse_missing_fields(missing_keys, query)
+                for key, value in followup_answers.items():
+                    if key in missing_keys and compact(value):
+                        answers[key] = compact(value)
+                missing_keys = [key for key in batch_keys if not compact(answers.get(key))]
+            if missing_keys:
                 save_lead_state(lead_state_path, state)
-                return build_missing_field_prompt(missing_keys)
+                return build_missing_field_prompt(missing_keys, answers)
 
             batch_index += 1
             session["batch"] = batch_index
@@ -854,12 +952,16 @@ def maybe_handle_qualification(
         if wants_listing_help(query):
             session["search_query"] = compact(query)
             save_lead_state(lead_state_path, state)
-            return qualification_opt_in_prompt(agent_name, describe_search_preferences(query))
+            summary = describe_search_preferences(query)
+            if summary:
+                return (
+                    f"Got it — {summary}. "
+                    "Just reply yes when you're ready and I'll ask a few quick questions."
+                )
+            return "Got it. Just reply yes when you're ready and I'll ask a few quick questions."
 
         save_lead_state(lead_state_path, state)
-        return (
-            "No problem. If you'd like me to narrow down the best active listings for you, just reply yes and I'll ask a few quick questions first."
-        )
+        return "Whenever you're ready, just reply yes and I'll ask a few quick questions."
 
     if should_start_qualification(query, calendly_url):
         session["awaiting_opt_in"] = True
@@ -996,6 +1098,13 @@ def build_reply(
     allow_booking = is_qualified and looks_like_booking_request(query) and bool(session.get("last_shared_listing_keys"))
 
     if not is_qualified:
+        state = load_lead_state(lead_state_path)
+        session = get_lead_session(state, sender_id)
+        if session.get("awaiting_opt_in") or session.get("active"):
+            save_lead_state(lead_state_path, state)
+            return (
+                "Whenever you're ready, just reply yes and I'll ask a few quick questions."
+            )
         if looks_like_booking_request(query) or wants_listing_help(query):
             session["awaiting_opt_in"] = True
             session["search_query"] = compact(query)
@@ -1318,6 +1427,7 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
 
     def process_webhook(self, payload: dict):
         drafts = current_drafts(self.config)
+        seen = load_seen_message_ids(self.config.poll_state_path)
         entry_list = payload.get("entry", [])
         for entry in entry_list:
             messaging = entry.get("messaging", [])
@@ -1325,7 +1435,11 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                 sender_id = event.get("sender", {}).get("id")
                 message = event.get("message", {})
                 text = compact(message.get("text"))
+                message_id = compact(message.get("mid"))
                 if not sender_id or not text:
+                    continue
+                if message_id and message_id in seen:
+                    print(f"Skipping duplicate webhook message {message_id}")
                     continue
 
                 try:
@@ -1347,6 +1461,9 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                 )
                 try:
                     send_message(self.config.page_access_token, sender_id, reply)
+                    if message_id:
+                        seen.add(message_id)
+                        save_seen_message_ids(self.config.poll_state_path, seen)
                     print(f"Replied to {sender_id}: {text[:80]}")
                 except Exception as exc:
                     print(f"Failed sending to {sender_id}: {exc}")
