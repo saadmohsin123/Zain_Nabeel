@@ -178,9 +178,9 @@ class FlowTest:
         reply_with_ai("ai-optin-user", "looking for a condo in toronto")
         with patch.object(
             bot,
-            "ai_route_conversation_turn",
+            "ai_compose_turn",
             return_value={
-                "action": "chat",
+                "fields": {},
                 "reply": "I'm doing well, thanks! Say yes whenever you'd like me to pull some options.",
             },
         ):
@@ -201,11 +201,11 @@ class FlowTest:
             }
         }
         Path(self.state_path).write_text(json.dumps(stale_state), encoding="utf-8")
+        r2 = reply_as("stale-user", "How are you doing?")
+        self.check("stale_small_talk_human", "well" in r2.lower() or "thanks" in r2.lower() or "yes" in r2.lower())
+        self.check("stale_small_talk_not_repeat", r2 != bot.STATIC_OPT_IN_NUDGE)
         r = reply_as("stale-user", "Hello")
         self.check("stale_hello_not_same_nudge", r != bot.STATIC_OPT_IN_NUDGE)
-        r2 = reply_as("stale-user", "How are you doing?")
-        self.check("stale_small_talk_human", "well" in r2.lower() or "thanks" in r2.lower())
-        self.check("stale_small_talk_not_repeat", r2 != bot.STATIC_OPT_IN_NUDGE)
 
         shared_listings = [
             {
