@@ -310,6 +310,41 @@ class FlowTest:
         self.check("brother_people_count", ai_answers2.get("people_on_lease") == "2")
         self.check("brother_no_move_in_reask", "when are you looking to move" not in r.lower())
 
+        # Ahmed live-test regression: out-of-order answers + double opt-in
+        def ahmed_reply(message: str) -> str:
+            return reply_as("ahmed-user", message)
+
+        ahmed_reply("Hey")
+        ahmed_reply("Im interested in buying proprtie")
+        with patch.object(
+            bot,
+            "ai_compose_turn",
+            return_value={"fields": {}, "reply": "Great — I help with rentals. Say yes when you're ready."},
+        ):
+            ahmed_reply("Yup please go ahead")
+        ahmed_state = json.loads(Path(self.state_path).read_text())["sessions"]["ahmed-user"]
+        self.check("ahmed_starts_qual_on_first_yes", ahmed_state.get("active") is True)
+        self.check("ahmed_not_still_awaiting_opt_in", ahmed_state.get("awaiting_opt_in") is not True)
+
+        r = ahmed_reply("3 adults 1 kid")
+        ahmed_answers = json.loads(Path(self.state_path).read_text())["sessions"]["ahmed-user"]["answers"]
+        self.check("ahmed_adults_saved", ahmed_answers.get("adults_in_unit") == "3")
+        self.check("ahmed_kids_saved", ahmed_answers.get("kids_in_unit") == "1")
+        self.check("ahmed_people_inferred", ahmed_answers.get("people_on_lease") == "4")
+        self.check("ahmed_asks_move_in_only", "move-in" in r.lower() or "move in" in r.lower())
+        self.check("ahmed_no_reask_people", "people on the lease" not in r.lower())
+
+        r = ahmed_reply("1st Jul")
+        ahmed_answers2 = json.loads(Path(self.state_path).read_text())["sessions"]["ahmed-user"]["answers"]
+        self.check("ahmed_move_in_saved", "jul" in ahmed_answers2.get("move_in_date", "").lower())
+        self.check("ahmed_batch2_income", "income" in r.lower() or "work" in r.lower())
+        self.check("ahmed_no_reask_lease_after_move_in", "people on the lease" not in r.lower())
+
+        r = ahmed_reply("3 adults")
+        ahmed_answers3 = json.loads(Path(self.state_path).read_text())["sessions"]["ahmed-user"]["answers"]
+        self.check("ahmed_still_has_people", ahmed_answers3.get("people_on_lease") == "4")
+        self.check("ahmed_no_lease_loop", "people on the lease" not in r.lower())
+
         return self.failures
 
 
