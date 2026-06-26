@@ -287,6 +287,29 @@ class FlowTest:
         self.check("just_me_not_occupation", solo_answers2.get("occupation") != "Just me")
         self.check("just_me_no_move_in_reask", "when are you looking to move" not in r2.lower())
 
+        # AI-started qualification without active flag (production bug)
+        import json
+
+        ai_state = {
+            "sessions": {
+                "ai-qual-user": {
+                    "search_query": "2 bed 1 bath condo near Ontario",
+                    "last_prompt": "Great! When do you need to move in?",
+                    "answers": {},
+                    "active": False,
+                }
+            }
+        }
+        Path(self.state_path).write_text(json.dumps(ai_state), encoding="utf-8")
+        r = reply_as("ai-qual-user", "1st pf july")
+        ai_answers = json.loads(Path(self.state_path).read_text())["sessions"]["ai-qual-user"]["answers"]
+        self.check("typo_july_saved", "july" in ai_answers.get("move_in_date", "").lower())
+        self.check("typo_july_no_full_reask", "when are you looking to move" not in r.lower())
+        r = reply_as("ai-qual-user", "Me and my brother")
+        ai_answers2 = json.loads(Path(self.state_path).read_text())["sessions"]["ai-qual-user"]["answers"]
+        self.check("brother_people_count", ai_answers2.get("people_on_lease") == "2")
+        self.check("brother_no_move_in_reask", "when are you looking to move" not in r.lower())
+
         return self.failures
 
 

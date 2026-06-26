@@ -137,7 +137,7 @@ AI_CONVERSATION_SYSTEM_PROMPT = (
     "- chat — greetings, small talk, general questions\n"
     "- offer_opt_in — they want rental help; offer listings after a few quick questions (free)\n"
     "- accept_opt_in — they agreed to answer questions\n"
-    "- qualify — extract answers into fields; reply asks only what's still missing\n"
+    "- qualify — set action only; leave reply empty (server asks next question)\n"
     "- search_listings — qualified user wants to see or refine options\n"
     "- listing_detail — user asks about one listing from the last shared list (first/second/third, price, area)\n"
     "- select_listing — user picks a listing to move forward on\n"
@@ -152,6 +152,7 @@ AI_CONVERSATION_SYSTEM_PROMPT = (
     "- Don't invent listings or prices\n"
     "- When user says first/second/third or a price from the last shared list, use listing_detail — don't run a new search\n"
     "- Don't repeat last_assistant_message\n"
+    "- Keep reply empty for qualify — the server tracks state and asks what's missing\n"
     "- Keep reply short and natural"
 )
 
@@ -615,6 +616,13 @@ def apply_qualification_turn(
         query,
         allowed_keys=QUALIFICATION_BATCHES[batch_index]["keys"],
     )
+    missing_in_batch = [
+        key for key in QUALIFICATION_BATCHES[batch_index]["keys"] if not compact(answers.get(key))
+    ]
+    if missing_in_batch:
+        for key, value in parse_missing_fields(missing_in_batch, query).items():
+            if compact(value):
+                merge_parsed_answers(answers, {key: value}, query, allowed_keys=[key])
     infer_household_defaults(answers, query)
 
     batch_index = first_incomplete_batch_index(answers)
@@ -924,10 +932,86 @@ def parse_resident_and_agent(text: str) -> Dict[str, str]:
 
 def parse_people_count(text: str) -> str:
     lowered = normalize_whitespace(text).lower()
+    if re.search(
+        r"\bme and my (?:brother|sister|parent|parents|wife|husband|partner|friend|roommate|son|daughter)\b",
+        lowered,
+    ):
+        return "2"
+    if re.search(r"\bme and (?:my )?(?:brother|sister|wife|husband|partner|friend|roommate)\b", lowered):
+        return "2"
+    if re.search(r"\b(two|both) of us\b", lowered):
+        return "2"
+    if re.search(r"\bfamily of (\d+)\b", lowered):
+        return re.search(r"\bfamily of (\d+)\b", lowered).group(1)
     match = re.search(r"(\d+)\s*(?:people|person|tenant|tenants)\b", lowered)
     if match:
         return match.group(1)
     return parse_int_from_text(text)
+
+
+def qualification_in_progress(session: dict) -> bool:
+    if session.get("qualified"):
+        return False
+    if session.get("active"):
+        return True
+    answers = session.get("answers", {})
+    if any(compact(answers.get(key)) for key in QUALIFICATION_FIELD_KEYS):
+        return True
+    last = compact(session.get("last_prompt")).lower()
+    mid_qual_hints = (
+        "when do you need",
+        "when are you looking to move",
+        "how many people will be",
+        "how many people on",
+        "how many adults",
+        "how many kids",
+        "gross income",
+        "what do you do for work",
+        "resident status",
+        "phone number to reach",
+    )
+    if any(hint in last for hint in mid_qual_hints):
+        return True
+    return False
+
+
+def begin_structured_qualification(
+    session: dict,
+    query: str,
+    search_query: str = "",
+) -> None:
+    session["active"] = True
+    session["awaiting_opt_in"] = False
+    session["qualified"] = False
+    session.setdefault("answers", {})
+    session.setdefault("raw_answers", {})
+    session.setdefault("batch", 0)
+    if search_query:
+        session["search_query"] = compact(search_query)
+    elif wants_listing_help(query):
+        session["search_query"] = compact(query)
+
+
+def run_structured_qualification(
+    session: dict,
+    query: str,
+    lead_state_path: Path,
+    state: dict,
+    drafts: List[dict],
+    listing_doc_url: str,
+    openai_api_key: str,
+    openai_model: str,
+) -> str:
+    begin_structured_qualification(session, query)
+    qual_reply = apply_qualification_turn(
+        session,
+        query,
+        drafts,
+        listing_doc_url,
+        openai_api_key,
+        openai_model,
+    )
+    return save_session_reply(lead_state_path, state, session, qual_reply)
 
 
 def is_plausible_occupation(text: str) -> bool:
@@ -953,12 +1037,22 @@ def extract_move_in_date(text: str) -> str:
     normalized = normalize_whitespace(text)
     if not normalized:
         return ""
-    date_match = re.search(
-        r"\b(?:\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?[A-Za-z]+|[A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?(?:\s+of)?|[A-Za-z]+\s+\d{4}|immediately|asap|next month|this month)\b",
-        normalized,
-        re.I,
+    normalized = re.sub(r"\bpf\b", "of", normalized, flags=re.I)
+    months = (
+        r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
+        r"aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
     )
-    return date_match.group(0) if date_match else normalized
+    patterns = [
+        rf"\b(?:early|mid|late)\s+(?:{months})\b",
+        rf"\b(?:{months})\s+\d{{1,2}}(?:st|nd|rd|th)?\b",
+        rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?(?:{months})\b",
+        r"\b(?:immediately|asap|next month|this month)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, normalized, re.I)
+        if match:
+            return match.group(0)
+    return ""
 
 
 def parse_missing_fields(missing_keys: List[str], query: str) -> Dict[str, str]:
@@ -974,7 +1068,7 @@ def parse_missing_fields(missing_keys: List[str], query: str) -> Dict[str, str]:
     if len(missing_keys) == 1:
         key = missing_keys[0]
         if key in ("people_on_lease", "adults_in_unit"):
-            count = parse_int_from_text(query)
+            count = parse_people_count(query) if key == "people_on_lease" else parse_int_from_text(query)
             if count != "":
                 answers[key] = count
         elif key == "kids_in_unit":
@@ -1092,6 +1186,10 @@ def parse_batch_answers(batch_index: int, query: str) -> Dict[str, str]:
         people_match = re.search(r"(\d+)\s+(?:people|person|tenant|tenants).*(?:lease|living|unit)?", lowered)
         if people_match:
             answers["people_on_lease"] = people_match.group(1)
+        elif not answers.get("people_on_lease"):
+            people_count = parse_people_count(normalized)
+            if people_count:
+                answers["people_on_lease"] = people_count
 
     elif batch_index == 1:
         if len(cleaned_lines) >= 2:
@@ -1614,6 +1712,20 @@ def maybe_handle_qualification(
 ) -> Optional[str]:
     state = load_lead_state(lead_state_path)
     session = get_lead_session(state, sender_id)
+
+    if qualification_in_progress(session) and not session.get("qualified"):
+        begin_structured_qualification(session, query)
+        reply = apply_qualification_turn(
+            session,
+            query,
+            drafts,
+            listing_doc_url,
+            openai_api_key=openai_api_key,
+            openai_model=openai_model,
+        )
+        session["last_prompt"] = reply
+        save_lead_state(lead_state_path, state)
+        return reply
 
     if session.get("active"):
         answers = session.setdefault("answers", {})
@@ -2229,16 +2341,28 @@ def handle_ai_conversation(
     reset_stale_opt_in_session(session, query)
     stage = conversation_stage(session)
 
-    if session.get("active") and not session.get("qualified"):
-        qual_reply = apply_qualification_turn(
-            session,
-            query,
-            drafts,
-            listing_doc_url,
-            openai_api_key,
-            openai_model,
+    if session.get("awaiting_opt_in") and looks_like_affirmative(query):
+        begin_structured_qualification(session, query)
+        return run_structured_qualification(
+            session, query, lead_state_path, state, drafts, listing_doc_url, openai_api_key, openai_model
         )
-        return save_session_reply(lead_state_path, state, session, qual_reply)
+
+    if wants_listing_help(query) and not session.get("qualified") and not session.get("active"):
+        session["search_query"] = compact(query)
+        session["awaiting_opt_in"] = True
+        session["active"] = False
+        intro = qualification_opt_in_prompt(agent_name, describe_search_preferences(query))
+        return save_session_reply(lead_state_path, state, session, intro)
+
+    if qualification_in_progress(session) and not session.get("qualified"):
+        return run_structured_qualification(
+            session, query, lead_state_path, state, drafts, listing_doc_url, openai_api_key, openai_model
+        )
+
+    if session.get("active") and not session.get("qualified"):
+        return run_structured_qualification(
+            session, query, lead_state_path, state, drafts, listing_doc_url, openai_api_key, openai_model
+        )
 
     if stage == "new" and looks_like_greeting(query) and not wants_listing_help(query):
         greeting = local_conversational_fallback("new", query, agent_name, last_assistant_message=compact(session.get("last_prompt")))
@@ -2310,10 +2434,24 @@ def handle_ai_conversation(
     action = compact(result.get("action")).lower() or "chat"
     reply = compact(result.get("reply"))
     updated_search = compact(result.get("search_query"))
+    fields = result.get("fields")
     if updated_search:
         session["search_query"] = updated_search
 
-    fields = result.get("fields")
+    if action == "qualify" and not session.get("qualified"):
+        begin_structured_qualification(session, query, updated_search or compact(session.get("search_query")))
+        if isinstance(fields, dict) and fields:
+            merge_parsed_answers(
+                answers,
+                fields,
+                query,
+                allowed_keys=QUALIFICATION_FIELD_KEYS,
+            )
+            infer_household_defaults(answers, query)
+        return run_structured_qualification(
+            session, query, lead_state_path, state, drafts, listing_doc_url, openai_api_key, openai_model
+        )
+
     if isinstance(fields, dict) and stage == "qualifying":
         session.setdefault("raw_answers", {})[f"turn_{len(session.get('raw_answers', {})) + 1}"] = compact(query)
         allowed_keys = batch_keys or missing_fields
