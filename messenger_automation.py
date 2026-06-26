@@ -440,6 +440,214 @@ def looks_like_greeting(query: str) -> bool:
     return q in greetings
 
 
+def looks_like_small_talk(query: str) -> bool:
+    q = query.lower().strip()
+    if looks_like_greeting(query):
+        return True
+    phrases = (
+        "how are you",
+        "how's it going",
+        "hows it going",
+        "how are u",
+        "what's up",
+        "whats up",
+        "how do you do",
+        "good thanks",
+        "thank you",
+        "thanks",
+    )
+    return any(phrase in q for phrase in phrases)
+
+
+STATIC_OPT_IN_NUDGE = "Whenever you're ready, just reply yes and I'll ask a few quick questions."
+
+
+def replies_are_similar(left: str, right: str) -> bool:
+    left_norm = re.sub(r"\s+", " ", compact(left).lower())
+    right_norm = re.sub(r"\s+", " ", compact(right).lower())
+    if not left_norm or not right_norm:
+        return False
+    return left_norm == right_norm or left_norm in right_norm or right_norm in left_norm
+
+
+def reset_stale_opt_in_session(session: dict, query: str) -> bool:
+    if not session.get("awaiting_opt_in") or session.get("active") or session.get("qualified"):
+        return False
+    if not looks_like_small_talk(query):
+        return False
+    session["awaiting_opt_in"] = False
+    session["search_query"] = ""
+    session["last_prompt"] = ""
+    return True
+
+
+def local_conversational_fallback(
+    stage: str,
+    query: str,
+    agent_name: str,
+    last_assistant_message: str = "",
+    search_query: str = "",
+) -> str:
+    lowered = query.lower()
+    last_lower = last_assistant_message.lower()
+
+    if "how are you" in lowered or "how's it going" in lowered or "hows it going" in lowered:
+        if "reply yes" in last_lower or "whenever you're ready" in last_lower:
+            return "Doing well, thanks! Say yes whenever you'd like me to find some options."
+        return "I'm doing well, thanks! What area or type of rental are you looking for?"
+
+    if looks_like_greeting(query):
+        if stage == "awaiting_opt_in":
+            return "Hi! Say yes when you're ready and I'll ask a few quick questions to find the best rentals."
+        return "Hi! What are you looking for — area, budget, or unit type?"
+
+    if stage == "awaiting_opt_in":
+        if STATIC_OPT_IN_NUDGE.lower() in last_lower or "reply yes" in last_lower:
+            summary = describe_search_preferences(search_query)
+            if summary:
+                return f"Still here whenever you're ready. Say yes and I'll pull {summary} options for you."
+            return "Still here — just say yes when you want me to get started."
+        return "Happy to help. Say yes when you want me to ask a few quick questions first."
+
+    if stage == "qualifying":
+        return "Got it — share whatever you have and we'll fill in the rest."
+
+    return "I can help with rentals. What area or unit type are you looking for?"
+
+
+def save_session_reply(lead_state_path: Path, state: dict, session: dict, reply: str) -> str:
+    session["last_prompt"] = reply
+    save_lead_state(lead_state_path, state)
+    return reply
+
+
+def ai_conversational_fallback(
+    api_key: str,
+    model: str,
+    query: str,
+    agent_name: str,
+    stage: str,
+    search_query: str = "",
+    last_assistant_message: str = "",
+) -> str:
+    stage_key = stage if stage in {"new", "awaiting_opt_in", "pre_qual", "qualifying", "qualified"} else "pre_qual"
+    if stage_key == "qualifying":
+        stage_key = "pre_qual"
+    return ai_generate_conversational_reply(
+        api_key,
+        model,
+        query,
+        agent_name,
+        conversation_stage=stage_key,
+        search_query=search_query,
+        last_assistant_message=last_assistant_message,
+    )
+
+
+def qualification_turn_reply(
+    session: dict,
+    query: str,
+    lead_state_path: Path,
+    state: dict,
+    agent_name: str,
+    drafts: List[dict],
+    listing_doc_url: str,
+    openai_api_key: str,
+    openai_model: str,
+) -> Optional[str]:
+    answers = session.setdefault("answers", {})
+    batch_index = min(int(session.get("batch", 0)), max(len(QUALIFICATION_BATCHES) - 1, 0))
+    if batch_index >= len(QUALIFICATION_BATCHES):
+        return None
+
+    session.setdefault("raw_answers", {})[f"turn_{len(session.get('raw_answers', {})) + 1}"] = compact(query)
+    parsed_answers, follow_up_hint = extract_qualification_from_message(
+        batch_index,
+        query,
+        answers,
+        openai_api_key=openai_api_key,
+        openai_model=openai_model,
+        use_ai=bool(openai_api_key),
+        last_prompt=compact(session.get("last_prompt")),
+        search_query=compact(session.get("search_query")),
+    )
+    merge_parsed_answers(
+        answers,
+        parsed_answers,
+        query,
+        allowed_keys=QUALIFICATION_BATCHES[batch_index]["keys"],
+    )
+    batch_index = first_incomplete_batch_index(answers)
+    session["batch"] = batch_index
+
+    if batch_index < len(QUALIFICATION_BATCHES):
+        batch_keys = QUALIFICATION_BATCHES[batch_index]["keys"]
+        missing_keys = [key for key in batch_keys if not compact(answers.get(key))]
+        if missing_keys:
+            return follow_up_hint or build_missing_field_prompt(missing_keys, answers)
+        return QUALIFICATION_BATCHES[batch_index]["prompt"]
+
+    session["active"] = False
+    session["qualified"] = True
+    session["completed_at"] = int(time.time())
+    return build_post_qualification_reply(session, drafts, listing_doc_url)
+
+
+def finalize_conversation_reply(
+    reply: str,
+    session: dict,
+    query: str,
+    lead_state_path: Path,
+    state: dict,
+    agent_name: str,
+    openai_api_key: str,
+    openai_model: str,
+    drafts: List[dict],
+    listing_doc_url: str,
+) -> str:
+    last_assistant_message = compact(session.get("last_prompt"))
+    stage = conversation_stage(session)
+
+    if reply and not replies_are_similar(reply, last_assistant_message):
+        return save_session_reply(lead_state_path, state, session, reply)
+
+    if openai_api_key:
+        ai_reply = ai_conversational_fallback(
+            openai_api_key,
+            openai_model,
+            query,
+            agent_name,
+            stage,
+            search_query=compact(session.get("search_query")),
+            last_assistant_message=last_assistant_message,
+        )
+        if ai_reply and not replies_are_similar(ai_reply, last_assistant_message):
+            return save_session_reply(lead_state_path, state, session, ai_reply)
+
+    if stage == "qualifying":
+        qual_reply = qualification_turn_reply(
+            session,
+            query,
+            lead_state_path,
+            state,
+            agent_name,
+            drafts,
+            listing_doc_url,
+            openai_api_key,
+            openai_model,
+        )
+        if qual_reply and not replies_are_similar(qual_reply, last_assistant_message):
+            return save_session_reply(lead_state_path, state, session, qual_reply)
+
+    fallback = local_conversational_fallback(
+        stage,
+        query,
+        agent_name,
+        last_assistant_message=last_assistant_message,
+        search_query=compact(session.get("search_query")),
+    )
+    return save_session_reply(lead_state_path, state, session, fallback)
+
 def qualification_opt_in_prompt(agent_name: str, search_summary: str = "") -> str:
     context = f"Got it — you're looking for {search_summary}.\n\n" if search_summary else ""
     return (
@@ -1199,21 +1407,13 @@ def maybe_handle_qualification(
             return "Got it. Just reply yes when you're ready and I'll ask a few quick questions."
 
         save_lead_state(lead_state_path, state)
-        if use_ai and openai_api_key:
-            ai_reply = ai_generate_conversational_reply(
-                openai_api_key,
-                openai_model,
-                query,
-                agent_name,
-                conversation_stage="awaiting_opt_in",
-                search_query=compact(session.get("search_query")),
-                last_assistant_message=last_assistant_message,
-            )
-            if ai_reply:
-                session["last_prompt"] = ai_reply
-                save_lead_state(lead_state_path, state)
-                return ai_reply
-        return "Whenever you're ready, just reply yes and I'll ask a few quick questions."
+        return local_conversational_fallback(
+            "awaiting_opt_in",
+            query,
+            agent_name,
+            last_assistant_message=last_assistant_message,
+            search_query=compact(session.get("search_query")),
+        )
 
     if should_start_qualification(query, calendly_url) and not session.get("qualified"):
         session["awaiting_opt_in"] = True
@@ -1712,9 +1912,10 @@ def handle_ai_conversation(
     listing_doc_url: str,
     openai_api_key: str,
     openai_model: str,
-) -> Optional[str]:
+) -> str:
     state = load_lead_state(lead_state_path)
     session = get_lead_session(state, sender_id)
+    reset_stale_opt_in_session(session, query)
     stage = conversation_stage(session)
     answers = session.setdefault("answers", {})
     batch_index = min(int(session.get("batch", 0)), max(len(QUALIFICATION_BATCHES) - 1, 0))
@@ -1735,8 +1936,20 @@ def handle_ai_conversation(
         "last_assistant_message": compact(session.get("last_prompt")),
     }
     result = ai_route_conversation_turn(openai_api_key, openai_model, query, context)
+
     if not result:
-        return None
+        return finalize_conversation_reply(
+            "",
+            session,
+            query,
+            lead_state_path,
+            state,
+            agent_name,
+            openai_api_key,
+            openai_model,
+            drafts,
+            listing_doc_url,
+        )
 
     action = compact(result.get("action")).lower() or "chat"
     reply = compact(result.get("reply"))
@@ -1755,16 +1968,21 @@ def handle_ai_conversation(
             session["qualified"] = True
             session["completed_at"] = int(time.time())
             post_reply = build_post_qualification_reply(session, drafts, listing_doc_url)
-            session["last_prompt"] = post_reply
-            save_lead_state(lead_state_path, state)
             if reply and reply.lower() not in post_reply.lower():
-                return f"{reply}\n\n{post_reply}"
-            return post_reply
-        if reply:
-            session["last_prompt"] = reply
-            save_lead_state(lead_state_path, state)
-            return reply
-        return None
+                return save_session_reply(lead_state_path, state, session, f"{reply}\n\n{post_reply}")
+            return save_session_reply(lead_state_path, state, session, post_reply)
+        return finalize_conversation_reply(
+            reply,
+            session,
+            query,
+            lead_state_path,
+            state,
+            agent_name,
+            openai_api_key,
+            openai_model,
+            drafts,
+            listing_doc_url,
+        )
 
     if action == "accept_opt_in" and stage == "awaiting_opt_in":
         session["awaiting_opt_in"] = False
@@ -1778,25 +1996,17 @@ def handle_ai_conversation(
         if isinstance(fields, dict) and fields:
             merge_parsed_answers(session["answers"], fields, query, allowed_keys=QUALIFICATION_FIELD_KEYS)
             session["batch"] = first_incomplete_batch_index(session["answers"])
-        if reply:
-            session["last_prompt"] = reply
-        else:
-            session["last_prompt"] = QUALIFICATION_BATCHES[0]["prompt"]
+        if not reply:
             reply = QUALIFICATION_BATCHES[0]["prompt"]
-        save_lead_state(lead_state_path, state)
-        return reply
+        return save_session_reply(lead_state_path, state, session, reply)
 
     if action == "offer_opt_in" and stage == "new":
         session["awaiting_opt_in"] = True
         session["active"] = False
         session["search_query"] = updated_search or compact(query)
-        if reply:
-            session["last_prompt"] = reply
-        else:
+        if not reply:
             reply = qualification_opt_in_prompt(agent_name, describe_search_preferences(session["search_query"]))
-            session["last_prompt"] = reply
-        save_lead_state(lead_state_path, state)
-        return reply
+        return save_session_reply(lead_state_path, state, session, reply)
 
     if action == "qualify" and stage == "qualifying":
         if isinstance(fields, dict) and fields:
@@ -1807,42 +2017,63 @@ def handle_ai_conversation(
             session["qualified"] = True
             session["completed_at"] = int(time.time())
             post_reply = build_post_qualification_reply(session, drafts, listing_doc_url)
-            session["last_prompt"] = post_reply
-            save_lead_state(lead_state_path, state)
-            return post_reply
-        if reply:
-            session["last_prompt"] = reply
-            save_lead_state(lead_state_path, state)
-            return reply
-        return None
+            return save_session_reply(lead_state_path, state, session, post_reply)
+        return finalize_conversation_reply(
+            reply,
+            session,
+            query,
+            lead_state_path,
+            state,
+            agent_name,
+            openai_api_key,
+            openai_model,
+            drafts,
+            listing_doc_url,
+        )
 
     if action == "search_listings" and session.get("qualified"):
         search_query = updated_search or compact(query)
         listing_reply = build_qualified_listing_reply(session, search_query, drafts)
-        session["last_prompt"] = listing_reply
-        save_lead_state(lead_state_path, state)
         if reply and reply.lower() not in listing_reply.lower():
-            return f"{reply}\n\n{listing_reply}"
-        return listing_reply
+            return save_session_reply(lead_state_path, state, session, f"{reply}\n\n{listing_reply}")
+        return save_session_reply(lead_state_path, state, session, listing_reply)
 
     if action == "book" and session.get("qualified"):
         booking_reply = handle_post_qualification_booking(session, query, drafts, calendly_url)
         if booking_reply:
-            session["last_prompt"] = booking_reply
-            save_lead_state(lead_state_path, state)
-            return booking_reply
-        if reply:
-            session["last_prompt"] = reply
-            save_lead_state(lead_state_path, state)
-            return reply
-        return None
+            return save_session_reply(lead_state_path, state, session, booking_reply)
 
-    if reply:
-        session["last_prompt"] = reply
-        save_lead_state(lead_state_path, state)
-        return reply
+    if stage == "qualified" and action == "chat":
+        matches = rank_drafts(query, drafts, limit=3)
+        try:
+            ai_reply = generate_ai_reply(
+                query,
+                matches,
+                listing_doc_url,
+                calendly_url,
+                agent_name,
+                openai_api_key,
+                openai_model,
+                qualified=True,
+                allow_booking=False,
+            )
+            if ai_reply:
+                return save_session_reply(lead_state_path, state, session, ai_reply)
+        except Exception as exc:
+            print(f"AI qualified chat failed: {exc}")
 
-    return None
+    return finalize_conversation_reply(
+        reply,
+        session,
+        query,
+        lead_state_path,
+        state,
+        agent_name,
+        openai_api_key,
+        openai_model,
+        drafts,
+        listing_doc_url,
+    )
 
 
 def generate_ai_reply(
@@ -1908,7 +2139,7 @@ def build_reply(
     use_ai: bool = True,
 ) -> str:
     if use_ai and openai_api_key:
-        ai_reply = handle_ai_conversation(
+        return handle_ai_conversation(
             sender_id,
             query,
             lead_state_path,
@@ -1919,8 +2150,6 @@ def build_reply(
             openai_api_key,
             openai_model,
         )
-        if ai_reply:
-            return ai_reply
 
     state = load_lead_state(lead_state_path)
     session = get_lead_session(state, sender_id)
@@ -1986,8 +2215,12 @@ def build_reply(
                     save_lead_state(lead_state_path, state)
                     return ai_reply
             save_lead_state(lead_state_path, state)
-            return (
-                "Whenever you're ready, just reply yes and I'll ask a few quick questions."
+            return local_conversational_fallback(
+                "awaiting_opt_in" if session.get("awaiting_opt_in") else "qualifying",
+                query,
+                agent_name,
+                last_assistant_message=compact(session.get("last_prompt")),
+                search_query=compact(session.get("search_query")),
             )
         if looks_like_booking_request(query) or wants_listing_help(query):
             session["awaiting_opt_in"] = True
@@ -2246,6 +2479,8 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                     "token_source": self.config.token_source,
                     "has_app_secret": bool(self.config.app_secret),
                     "has_listing_doc_url": bool(self.config.listing_doc_url),
+                    "has_openai_api_key": bool(self.config.openai_api_key),
+                    "openai_model": self.config.openai_model,
                     "page_id": self.config.page_id,
                     "poll_interval_seconds": getattr(self.server, "poll_interval_seconds", 0),
                     "poll_state_file": str(self.config.poll_state_path),

@@ -188,6 +188,25 @@ class FlowTest:
         self.check("ai_opt_in_small_talk", "well" in r.lower() or "thanks" in r.lower())
         self.check("ai_opt_in_not_static_nudge", "whenever you're ready, just reply yes" not in r.lower())
 
+        # Stale opt-in + greeting should not repeat the static nudge
+        import json
+
+        stale_state = {
+            "sessions": {
+                "stale-user": {
+                    "awaiting_opt_in": True,
+                    "last_prompt": bot.STATIC_OPT_IN_NUDGE,
+                    "search_query": "condo in toronto",
+                }
+            }
+        }
+        Path(self.state_path).write_text(json.dumps(stale_state), encoding="utf-8")
+        r = reply_as("stale-user", "Hello")
+        self.check("stale_hello_not_same_nudge", r != bot.STATIC_OPT_IN_NUDGE)
+        r2 = reply_as("stale-user", "How are you doing?")
+        self.check("stale_small_talk_human", "well" in r2.lower() or "thanks" in r2.lower())
+        self.check("stale_small_talk_not_repeat", r2 != bot.STATIC_OPT_IN_NUDGE)
+
         return self.failures
 
 
