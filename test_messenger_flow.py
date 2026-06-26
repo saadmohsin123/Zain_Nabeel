@@ -178,10 +178,10 @@ class FlowTest:
         reply_with_ai("ai-optin-user", "looking for a condo in toronto")
         with patch.object(
             bot,
-            "ai_interpret_opt_in_message",
+            "ai_route_conversation_turn",
             return_value={
-                "accepted": False,
-                "reply": "I'm doing well, thanks for asking! Say yes whenever you'd like me to pull some options.",
+                "action": "chat",
+                "reply": "I'm doing well, thanks! Say yes whenever you'd like me to pull some options.",
             },
         ):
             r = reply_with_ai("ai-optin-user", "How are you doing?")

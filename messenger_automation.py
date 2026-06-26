@@ -127,6 +127,29 @@ QUALIFICATION_BATCHES = [
         "prompt": "Last one — what's the best phone number to reach you on?",
     },
 ]
+QUALIFICATION_FIELD_KEYS = [step["key"] for step in QUALIFICATION_STEPS]
+
+AI_CONVERSATION_SYSTEM_PROMPT = (
+    "You're Nabeel's assistant at Durham New Homes on Messenger. "
+    "Sound human: warm, relaxed, brief. Usually 1-2 short sentences.\n\n"
+    'Return JSON only: {"action":"...","search_query":"","fields":{},"reply":""}\n\n'
+    "Actions:\n"
+    "- chat — greetings, small talk, general questions\n"
+    "- offer_opt_in — they want rental help; offer listings after a few quick questions (free)\n"
+    "- accept_opt_in — they agreed to answer questions\n"
+    "- qualify — extract answers into fields; reply asks only what's still missing\n"
+    "- search_listings — qualified user wants to see or refine options\n"
+    "- book — qualified user wants a viewing or call\n\n"
+    "Fields: move_in_date, people_on_lease, adults_in_unit, kids_in_unit, "
+    "family_gross_income, occupation, resident_status, working_with_agent (Yes/No), phone_number\n\n"
+    "Rules:\n"
+    "- No listings or booking links before qualification is done\n"
+    "- Only fill fields clearly stated in this message\n"
+    "- Adults only → kids_in_unit=0\n"
+    "- Don't invent listings or prices\n"
+    "- Don't repeat last_assistant_message\n"
+    "- Keep reply short and natural"
+)
 
 
 def must_env(name: str, default: Optional[str] = None) -> str:
@@ -1016,24 +1039,8 @@ def handle_qualified_listing_search(
     if not should_search:
         return None
 
-    session["search_query"] = search_query
-    matches = rank_drafts(search_query, drafts, limit=3)
-    session["last_shared_listing_keys"] = [
-        compact(match.get("ListingKey")) for match in matches if compact(match.get("ListingKey"))
-    ]
-
-    if not matches:
-        return (
-            "I looked again, but I don't see active listings that match that search closely right now. "
-            "If you want, tell me the city, budget, or unit type and I'll narrow it further."
-        )
-
-    lines = ["Here are a few active options that match what you asked for:"]
-    for match in matches:
-        lines.append(f"- {summarize_shared_listing(match)}")
-    lines.append("")
-    lines.append("If one stands out, send me the address or ListingKey and I'll help with the next step.")
-    return "\n".join(lines)
+    listing_reply = build_qualified_listing_reply(session, search_query, drafts)
+    return listing_reply
 
 
 def should_start_qualification(query: str, calendly_url: str) -> bool:
@@ -1405,24 +1412,11 @@ def ai_extract_qualification_fields(
         return {}, ""
 
     system_prompt = (
-        "You extract rental lead qualification details from natural conversational messages. "
-        "Return JSON only with this exact shape:\n"
+        "Extract rental lead details from the latest message. Return JSON only:\n"
         '{"fields": {"field_key": "value"}, "follow_up": "string"}\n'
-        "Rules:\n"
-        "- Only extract values clearly stated or strongly implied in the latest user message.\n"
-        "- Only use field keys from target_fields.\n"
-        "- target_fields are the ONLY fields the user is being asked about in this turn.\n"
-        "- Do not map answers into other fields that are not in target_fields.\n"
-        "- Do not repeat or overwrite existing answers unless the user is clearly correcting them.\n"
-        "- Understand messy grammar, typos, shorthand, and partial answers.\n"
-        "- If the user answers only one part of a multi-part question, only fill that field.\n"
-        "- Do not infer adults_in_unit or kids_in_unit from people_on_lease unless the user clearly distinguishes adults vs kids.\n"
-        "- working_with_agent must be exactly Yes or No.\n"
-        "- If the user mentions only adults, set kids_in_unit to 0.\n"
-        "- Keep resident_status short (for example Permanent Resident, Work Permit).\n"
-        "- Keep occupation as a job title, not income.\n"
-        "- follow_up should be a short natural question only for still-missing target fields from this turn. "
-        "Leave follow_up empty if the current target fields are complete."
+        "Only use keys from target_fields. Only fill what's clearly stated. "
+        "working_with_agent: Yes or No. Adults only → kids_in_unit=0. "
+        "follow_up: one short natural question for anything still missing; empty if done."
     )
     user_payload = {
         "user_message": user_message,
@@ -1653,6 +1647,204 @@ def extract_qualification_from_message(
     return normalized, follow_up_hint
 
 
+def conversation_stage(session: dict) -> str:
+    if session.get("qualified"):
+        return "qualified"
+    if session.get("active"):
+        return "qualifying"
+    if session.get("awaiting_opt_in"):
+        return "awaiting_opt_in"
+    return "new"
+
+
+def all_qualification_fields_complete(answers: dict) -> bool:
+    return all(compact(answers.get(key)) for key in QUALIFICATION_FIELD_KEYS)
+
+
+def build_qualified_listing_reply(session: dict, search_query: str, drafts: List[dict]) -> str:
+    search_query = compact(search_query) or compact(session.get("search_query"))
+    session["search_query"] = search_query
+    matches = rank_drafts(search_query, drafts, limit=3)
+    session["last_shared_listing_keys"] = [
+        compact(match.get("ListingKey")) for match in matches if compact(match.get("ListingKey"))
+    ]
+    if not matches:
+        return (
+            "I looked again but nothing active matches that right now. "
+            "Tell me the city, budget, or unit type and I'll narrow it down."
+        )
+    lines = ["Here are a few that fit:"]
+    for match in matches:
+        lines.append(f"- {summarize_shared_listing(match)}")
+    lines.append("")
+    lines.append("Like one? Send the address or ListingKey and I'll help with next steps.")
+    return "\n".join(lines)
+
+
+def ai_route_conversation_turn(
+    api_key: str,
+    model: str,
+    user_message: str,
+    context: dict,
+) -> dict:
+    if not api_key:
+        return {}
+    try:
+        return call_openai_json(
+            api_key,
+            model,
+            AI_CONVERSATION_SYSTEM_PROMPT,
+            {"user_message": user_message, **context},
+            max_tokens=350,
+        )
+    except Exception as exc:
+        print(f"AI conversation routing failed: {exc}")
+        return {}
+
+
+def handle_ai_conversation(
+    sender_id: str,
+    query: str,
+    lead_state_path: Path,
+    agent_name: str,
+    calendly_url: str,
+    drafts: List[dict],
+    listing_doc_url: str,
+    openai_api_key: str,
+    openai_model: str,
+) -> Optional[str]:
+    state = load_lead_state(lead_state_path)
+    session = get_lead_session(state, sender_id)
+    stage = conversation_stage(session)
+    answers = session.setdefault("answers", {})
+    batch_index = min(int(session.get("batch", 0)), max(len(QUALIFICATION_BATCHES) - 1, 0))
+    batch_keys = (
+        QUALIFICATION_BATCHES[batch_index]["keys"]
+        if stage == "qualifying" and batch_index < len(QUALIFICATION_BATCHES)
+        else []
+    )
+    missing_fields = [key for key in QUALIFICATION_FIELD_KEYS if not compact(answers.get(key))]
+
+    context = {
+        "stage": stage,
+        "agent_name": agent_name,
+        "search_query": compact(session.get("search_query")),
+        "answers": answers,
+        "missing_fields": missing_fields,
+        "current_batch_keys": batch_keys,
+        "last_assistant_message": compact(session.get("last_prompt")),
+    }
+    result = ai_route_conversation_turn(openai_api_key, openai_model, query, context)
+    if not result:
+        return None
+
+    action = compact(result.get("action")).lower() or "chat"
+    reply = compact(result.get("reply"))
+    updated_search = compact(result.get("search_query"))
+    if updated_search:
+        session["search_query"] = updated_search
+
+    fields = result.get("fields")
+    if isinstance(fields, dict) and stage == "qualifying":
+        session.setdefault("raw_answers", {})[f"turn_{len(session.get('raw_answers', {})) + 1}"] = compact(query)
+        allowed_keys = batch_keys or missing_fields
+        merge_parsed_answers(answers, fields, query, allowed_keys=allowed_keys)
+        session["batch"] = first_incomplete_batch_index(answers)
+        if all_qualification_fields_complete(answers):
+            session["active"] = False
+            session["qualified"] = True
+            session["completed_at"] = int(time.time())
+            post_reply = build_post_qualification_reply(session, drafts, listing_doc_url)
+            session["last_prompt"] = post_reply
+            save_lead_state(lead_state_path, state)
+            if reply and reply.lower() not in post_reply.lower():
+                return f"{reply}\n\n{post_reply}"
+            return post_reply
+        if reply:
+            session["last_prompt"] = reply
+            save_lead_state(lead_state_path, state)
+            return reply
+        return None
+
+    if action == "accept_opt_in" and stage == "awaiting_opt_in":
+        session["awaiting_opt_in"] = False
+        session["active"] = True
+        session["step"] = 0
+        session["batch"] = 0
+        session["qualified"] = False
+        session["answers"] = {}
+        session["raw_answers"] = {}
+        session["last_shared_listing_keys"] = []
+        if isinstance(fields, dict) and fields:
+            merge_parsed_answers(session["answers"], fields, query, allowed_keys=QUALIFICATION_FIELD_KEYS)
+            session["batch"] = first_incomplete_batch_index(session["answers"])
+        if reply:
+            session["last_prompt"] = reply
+        else:
+            session["last_prompt"] = QUALIFICATION_BATCHES[0]["prompt"]
+            reply = QUALIFICATION_BATCHES[0]["prompt"]
+        save_lead_state(lead_state_path, state)
+        return reply
+
+    if action == "offer_opt_in" and stage == "new":
+        session["awaiting_opt_in"] = True
+        session["active"] = False
+        session["search_query"] = updated_search or compact(query)
+        if reply:
+            session["last_prompt"] = reply
+        else:
+            reply = qualification_opt_in_prompt(agent_name, describe_search_preferences(session["search_query"]))
+            session["last_prompt"] = reply
+        save_lead_state(lead_state_path, state)
+        return reply
+
+    if action == "qualify" and stage == "qualifying":
+        if isinstance(fields, dict) and fields:
+            merge_parsed_answers(answers, fields, query, allowed_keys=batch_keys or missing_fields)
+            session["batch"] = first_incomplete_batch_index(answers)
+        if all_qualification_fields_complete(answers):
+            session["active"] = False
+            session["qualified"] = True
+            session["completed_at"] = int(time.time())
+            post_reply = build_post_qualification_reply(session, drafts, listing_doc_url)
+            session["last_prompt"] = post_reply
+            save_lead_state(lead_state_path, state)
+            return post_reply
+        if reply:
+            session["last_prompt"] = reply
+            save_lead_state(lead_state_path, state)
+            return reply
+        return None
+
+    if action == "search_listings" and session.get("qualified"):
+        search_query = updated_search or compact(query)
+        listing_reply = build_qualified_listing_reply(session, search_query, drafts)
+        session["last_prompt"] = listing_reply
+        save_lead_state(lead_state_path, state)
+        if reply and reply.lower() not in listing_reply.lower():
+            return f"{reply}\n\n{listing_reply}"
+        return listing_reply
+
+    if action == "book" and session.get("qualified"):
+        booking_reply = handle_post_qualification_booking(session, query, drafts, calendly_url)
+        if booking_reply:
+            session["last_prompt"] = booking_reply
+            save_lead_state(lead_state_path, state)
+            return booking_reply
+        if reply:
+            session["last_prompt"] = reply
+            save_lead_state(lead_state_path, state)
+            return reply
+        return None
+
+    if reply:
+        session["last_prompt"] = reply
+        save_lead_state(lead_state_path, state)
+        return reply
+
+    return None
+
+
 def generate_ai_reply(
     query: str,
     matches: List[dict],
@@ -1666,18 +1858,10 @@ def generate_ai_reply(
 ) -> Optional[str]:
     listing_payload = [listing_context(match) for match in matches[:3]]
     system_prompt = (
-        "You are Durham New Homes, a leasing assistant for Nabeel. "
-        "Answer like a capable human leasing coordinator: warm, concise, natural, and practical. "
-        "Use only the provided listing data. "
-        "Do not invent features, pricing, amenities, policies, or availability. "
-        "Never mention internal workflow labels, back-office statuses, review states, spreadsheets, packets, or marketplace pipeline terms to the customer. "
-        "If the user asks something not present in the data, say that it is not confirmed yet and ask a targeted follow-up. "
-        "If the query is generic and no exact answer is available, guide the user to share the address, ListingKey, or unit number. "
-        "Prefer short conversational paragraphs, not bullets, unless the user explicitly asks for a list. "
-        "Avoid sounding robotic, overly formal, or repetitive. "
-        "Only describe listings as available if the provided data clearly shows they are customer-ready active rental listings. "
-        "If there are no customer-ready matches, say there are no active matches ready to share right now and offer to refine the search. "
-        "Do not offer or send any booking link unless the lead is qualified and explicitly wants to move forward on a listing."
+        "You're Nabeel's assistant at Durham New Homes. Sound human — warm, brief, practical. "
+        "Use only the listing data provided. Don't invent details. "
+        "No internal jargon, spreadsheets, or back-office terms. "
+        "No booking link unless calendly_url is provided and the user wants to book."
     )
     user_prompt = {
         "user_message": query,
@@ -1723,6 +1907,21 @@ def build_reply(
     openai_model: str = "gpt-4.1-mini",
     use_ai: bool = True,
 ) -> str:
+    if use_ai and openai_api_key:
+        ai_reply = handle_ai_conversation(
+            sender_id,
+            query,
+            lead_state_path,
+            agent_name,
+            calendly_url,
+            drafts,
+            listing_doc_url,
+            openai_api_key,
+            openai_model,
+        )
+        if ai_reply:
+            return ai_reply
+
     state = load_lead_state(lead_state_path)
     session = get_lead_session(state, sender_id)
     last_assistant_message = compact(session.get("last_prompt"))
