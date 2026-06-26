@@ -1080,9 +1080,12 @@ def maybe_handle_qualification(
                 last_prompt=compact(session.get("last_prompt")),
                 search_query=compact(session.get("search_query")),
             )
-            for key, value in parsed_answers.items():
-                if compact(value):
-                    answers[key] = normalize_qualification_value(key, compact(value))
+            merge_parsed_answers(
+                answers,
+                parsed_answers,
+                query,
+                allowed_keys=QUALIFICATION_BATCHES[batch_index]["keys"],
+            )
 
             batch_index = first_incomplete_batch_index(answers)
             session["batch"] = batch_index
@@ -1267,6 +1270,52 @@ def first_incomplete_batch_index(answers: dict) -> int:
     return len(QUALIFICATION_BATCHES)
 
 
+def is_plausible_field_value(key: str, value: str, query: str, existing_answers: Optional[dict] = None) -> bool:
+    value = compact(value)
+    query = compact(query)
+    if not value or not query:
+        return False
+
+    lowered = query.lower()
+    existing_answers = existing_answers or {}
+
+    if key == "family_gross_income":
+        if value in {"1", "2", "3", "4", "5"} and any(token in lowered for token in ("adult", "kid", "people", "person", "lease")):
+            return False
+        return bool(re.search(r"\d", value))
+    if key == "occupation":
+        if value.lower() in {"adult", "adults", "kid", "kids", "people", "person", "tenant", "tenants"}:
+            return False
+        if re.fullmatch(r"\$?\d+[kK]?", value):
+            return False
+    if key == "adults_in_unit" and compact(existing_answers.get("adults_in_unit")):
+        return False
+    if key == "kids_in_unit" and compact(existing_answers.get("kids_in_unit")):
+        return False
+    if key == "people_on_lease" and "adult" in lowered and "people" not in lowered and "person" not in lowered:
+        return False
+    if key == "adults_in_unit" and ("people" in lowered or "person" in lowered) and "adult" not in lowered:
+        return False
+    return True
+
+
+def merge_parsed_answers(
+    answers: dict,
+    parsed_answers: Dict[str, str],
+    query: str,
+    allowed_keys: Optional[Iterable[str]] = None,
+) -> None:
+    allowed = set(allowed_keys) if allowed_keys is not None else None
+    for key, value in parsed_answers.items():
+        if allowed is not None and key not in allowed:
+            continue
+        normalized = normalize_qualification_value(key, compact(value))
+        if not normalized or not is_plausible_field_value(key, normalized, query, answers):
+            continue
+        if not compact(answers.get(key)):
+            answers[key] = normalized
+
+
 def ai_extract_qualification_fields(
     api_key: str,
     model: str,
@@ -1286,10 +1335,12 @@ def ai_extract_qualification_fields(
         "Rules:\n"
         "- Only extract values clearly stated or strongly implied in the latest user message.\n"
         "- Only use field keys from target_fields.\n"
+        "- target_fields are the ONLY fields the user is being asked about in this turn.\n"
+        "- Do not map answers into other fields that are not in target_fields.\n"
         "- Do not repeat or overwrite existing answers unless the user is clearly correcting them.\n"
         "- Understand messy grammar, typos, shorthand, and partial answers.\n"
         "- If the user answers only one part of a multi-part question, only fill that field.\n"
-        "- If the user volunteers later-step details early, fill those too when clear.\n"
+        "- Do not infer adults_in_unit or kids_in_unit from people_on_lease unless the user clearly distinguishes adults vs kids.\n"
         "- working_with_agent must be exactly Yes or No.\n"
         "- If the user mentions only adults, set kids_in_unit to 0.\n"
         "- Keep resident_status short (for example Permanent Resident, Work Permit).\n"
@@ -1316,7 +1367,9 @@ def ai_extract_qualification_fields(
     cleaned = {
         key: normalize_qualification_value(key, compact(value))
         for key, value in fields.items()
-        if key in target_fields and compact(value)
+        if key in target_fields
+        and compact(value)
+        and is_plausible_field_value(key, normalize_qualification_value(key, compact(value)), user_message, existing_answers)
     }
     return cleaned, compact(result.get("follow_up"))
 
@@ -1366,8 +1419,8 @@ def extract_qualification_from_message(
 
     batch_keys = QUALIFICATION_BATCHES[batch_index]["keys"] if batch_index < len(QUALIFICATION_BATCHES) else []
     missing_in_batch = [key for key in batch_keys if not compact(answers.get(key))]
-    unfilled = unfilled_qualification_fields(answers)
-    target_fields = {key: unfilled[key] for key in unfilled}
+    step_prompts = {step["key"]: step["prompt"] for step in QUALIFICATION_STEPS}
+    target_fields = {key: step_prompts[key] for key in missing_in_batch}
 
     if use_ai and openai_api_key and target_fields:
         ai_fields, follow_up_hint = ai_extract_qualification_fields(
@@ -1383,19 +1436,16 @@ def extract_qualification_from_message(
 
     regex_fields = parse_batch_answers(batch_index, query)
     for key, value in regex_fields.items():
-        if compact(value) and not compact(parsed.get(key)):
+        if key in missing_in_batch and compact(value) and not compact(parsed.get(key)):
             parsed[key] = compact(value)
 
     if missing_in_batch:
         for key, value in parse_missing_fields(missing_in_batch, query).items():
-            if compact(value) and not compact(parsed.get(key)) and not compact(answers.get(key)):
+            if key in missing_in_batch and compact(value) and not compact(parsed.get(key)) and not compact(answers.get(key)):
                 parsed[key] = compact(value)
 
-    normalized = {
-        key: normalize_qualification_value(key, value)
-        for key, value in parsed.items()
-        if compact(value)
-    }
+    normalized: Dict[str, str] = {}
+    merge_parsed_answers(normalized, parsed, query, allowed_keys=missing_in_batch)
     return normalized, follow_up_hint
 
 

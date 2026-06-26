@@ -142,6 +142,25 @@ class FlowTest:
         self.check("qualified_no_restart", "nabeel's assistant" not in r.lower())
         self.check("qualified_search_reply", "looked again" in r.lower() or "active options" in r.lower())
 
+        # AI must not map income-batch replies into wrong fields
+        from unittest.mock import patch
+
+        answers = {"move_in_date": "1st july", "people_on_lease": "3", "adults_in_unit": "3", "kids_in_unit": "0"}
+        with patch.object(
+            bot,
+            "ai_extract_qualification_fields",
+            return_value=({"family_gross_income": "3", "occupation": "adults"}, ""),
+        ):
+            parsed, _ = bot.extract_qualification_from_message(
+                2,
+                "3 adults",
+                dict(answers),
+                openai_api_key="fake",
+                use_ai=True,
+            )
+        self.check("ai_wrong_income_rejected", "family_gross_income" not in parsed)
+        self.check("ai_wrong_occupation_rejected", "occupation" not in parsed)
+
         return self.failures
 
 
