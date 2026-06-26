@@ -1131,6 +1131,42 @@ def maybe_handle_qualification(
             return listing_reply
 
     if session.get("awaiting_opt_in"):
+        last_assistant_message = compact(session.get("last_prompt"))
+        if use_ai and openai_api_key:
+            interpretation = ai_interpret_opt_in_message(
+                openai_api_key,
+                openai_model,
+                query,
+                agent_name,
+                search_query=compact(session.get("search_query")),
+                last_assistant_message=last_assistant_message,
+            )
+            if interpretation.get("accepted") is True:
+                session["awaiting_opt_in"] = False
+                session["active"] = True
+                session["step"] = 0
+                session["batch"] = 0
+                session["qualified"] = False
+                session["answers"] = {}
+                session["raw_answers"] = {}
+                session["last_shared_listing_keys"] = []
+                updated_search = compact(interpretation.get("updated_search_query"))
+                if updated_search:
+                    session["search_query"] = updated_search
+                session["last_prompt"] = QUALIFICATION_BATCHES[0]["prompt"]
+                save_lead_state(lead_state_path, state)
+                return QUALIFICATION_BATCHES[0]["prompt"]
+
+            updated_search = compact(interpretation.get("updated_search_query"))
+            if updated_search:
+                session["search_query"] = updated_search
+
+            ai_reply = compact(interpretation.get("reply"))
+            if ai_reply:
+                session["last_prompt"] = ai_reply
+                save_lead_state(lead_state_path, state)
+                return ai_reply
+
         if looks_like_affirmative(query):
             session["awaiting_opt_in"] = False
             session["active"] = True
@@ -1156,6 +1192,20 @@ def maybe_handle_qualification(
             return "Got it. Just reply yes when you're ready and I'll ask a few quick questions."
 
         save_lead_state(lead_state_path, state)
+        if use_ai and openai_api_key:
+            ai_reply = ai_generate_conversational_reply(
+                openai_api_key,
+                openai_model,
+                query,
+                agent_name,
+                conversation_stage="awaiting_opt_in",
+                search_query=compact(session.get("search_query")),
+                last_assistant_message=last_assistant_message,
+            )
+            if ai_reply:
+                session["last_prompt"] = ai_reply
+                save_lead_state(lead_state_path, state)
+                return ai_reply
         return "Whenever you're ready, just reply yes and I'll ask a few quick questions."
 
     if should_start_qualification(query, calendly_url) and not session.get("qualified"):
@@ -1168,8 +1218,34 @@ def maybe_handle_qualification(
         session["raw_answers"] = {}
         session["search_query"] = compact(query)
         session["last_shared_listing_keys"] = []
+        intro = qualification_opt_in_prompt(agent_name, describe_search_preferences(query))
+        session["last_prompt"] = intro
         save_lead_state(lead_state_path, state)
-        return qualification_opt_in_prompt(agent_name, describe_search_preferences(query))
+        return intro
+
+    if (
+        use_ai
+        and openai_api_key
+        and not session.get("qualified")
+        and not session.get("active")
+        and not session.get("awaiting_opt_in")
+    ):
+        intent = ai_detect_search_intent(openai_api_key, openai_model, query)
+        if intent.get("wants_listing_help") is True:
+            search_query = compact(intent.get("search_query")) or compact(query)
+            session["awaiting_opt_in"] = True
+            session["active"] = False
+            session["step"] = 0
+            session["batch"] = 0
+            session["qualified"] = False
+            session["answers"] = {}
+            session["raw_answers"] = {}
+            session["search_query"] = search_query
+            session["last_shared_listing_keys"] = []
+            intro = qualification_opt_in_prompt(agent_name, describe_search_preferences(search_query))
+            session["last_prompt"] = intro
+            save_lead_state(lead_state_path, state)
+            return intro
 
     return None
 
@@ -1374,6 +1450,134 @@ def ai_extract_qualification_fields(
     return cleaned, compact(result.get("follow_up"))
 
 
+def ai_interpret_opt_in_message(
+    api_key: str,
+    model: str,
+    user_message: str,
+    agent_name: str,
+    search_query: str = "",
+    last_assistant_message: str = "",
+) -> dict:
+    if not api_key:
+        return {}
+    system_prompt = (
+        "You interpret messages while a rental lead is deciding whether to opt in to qualification. "
+        "Return JSON only:\n"
+        '{"accepted": boolean, "updated_search_query": "string", "reply": "string"}\n'
+        "Rules:\n"
+        "- accepted=true when the user clearly agrees to proceed (yes, sure, sounds good, go ahead, please, "
+        "why not, interested, okay, etc.), including informal or partial phrasing.\n"
+        "- updated_search_query: concise rental search phrase if the user states or refines what they want; else empty.\n"
+        "- reply: a warm, natural, concise human reply for greetings, small talk, questions, or hesitation.\n"
+        "- Answer small talk naturally (for example respond to 'how are you').\n"
+        "- Gently invite them to say yes when they want listing help, without sounding robotic.\n"
+        "- Never repeat last_assistant_message verbatim or near-verbatim.\n"
+        "- Do not ask qualification questions yet; only handle opt-in and conversation.\n"
+        "- If accepted=true, reply may be empty."
+    )
+    user_payload = {
+        "user_message": user_message,
+        "agent_name": agent_name,
+        "search_query": search_query,
+        "last_assistant_message": last_assistant_message,
+    }
+    try:
+        return call_openai_json(api_key, model, system_prompt, user_payload, max_tokens=300)
+    except Exception as exc:
+        print(f"AI opt-in interpretation failed: {exc}")
+        return {}
+
+
+def ai_generate_conversational_reply(
+    api_key: str,
+    model: str,
+    user_message: str,
+    agent_name: str,
+    conversation_stage: str,
+    search_query: str = "",
+    last_assistant_message: str = "",
+) -> str:
+    if not api_key:
+        return ""
+    system_prompt = (
+        "You are Durham New Homes, a leasing assistant for Nabeel. "
+        "Reply like a capable human leasing coordinator: warm, concise, natural, and practical. "
+        "Never mention internal workflow labels, spreadsheets, packets, or back-office terms. "
+        "Do not invent listings, pricing, or availability. "
+        "Avoid sounding robotic or repetitive. "
+        "Never repeat last_assistant_message verbatim or near-verbatim."
+    )
+    stage_guidance = {
+        "new": (
+            "The user has not started the listing flow yet. "
+            "Greet naturally and invite them to share area, budget, unit type, or what they are looking for."
+        ),
+        "pre_qual": (
+            "The user is exploring rentals but has not completed qualification. "
+            "Help conversationally and guide them toward sharing search preferences."
+        ),
+        "awaiting_opt_in": (
+            "The user was offered listing help and a few quick qualification questions first. "
+            "Respond naturally to greetings and small talk. "
+            "Gently invite them to say yes when they want to proceed — vary your wording."
+        ),
+    }
+    user_prompt = {
+        "user_message": user_message,
+        "agent_name": agent_name,
+        "conversation_stage": conversation_stage,
+        "stage_guidance": stage_guidance.get(conversation_stage, ""),
+        "search_query": search_query,
+        "last_assistant_message": last_assistant_message,
+    }
+    payload = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+            {"role": "user", "content": [{"type": "input_text", "text": json.dumps(user_prompt, ensure_ascii=False)}]},
+        ],
+        "max_output_tokens": 250,
+    }
+    try:
+        resp = requests.post(
+            OPENAI_RESPONSES_API,
+            headers=build_openai_headers(api_key),
+            json=payload,
+            timeout=int(os.getenv("OPENAI_REQUEST_TIMEOUT_SECONDS", "20") or "20"),
+        )
+        resp.raise_for_status()
+        return compact(extract_response_text(resp.json()))
+    except Exception as exc:
+        print(f"AI conversational reply failed: {exc}")
+        return ""
+
+
+def ai_detect_search_intent(
+    api_key: str,
+    model: str,
+    user_message: str,
+) -> dict:
+    if not api_key:
+        return {}
+    system_prompt = (
+        "Detect whether a Messenger user wants help finding rental listings. "
+        'Return JSON only: {"wants_listing_help": boolean, "search_query": "string"}\n'
+        "wants_listing_help=true for search intent even if phrased casually or indirectly. "
+        "search_query should be a concise phrase for inventory matching when true."
+    )
+    try:
+        return call_openai_json(
+            api_key,
+            model,
+            system_prompt,
+            {"user_message": user_message},
+            max_tokens=150,
+        )
+    except Exception as exc:
+        print(f"AI search-intent detection failed: {exc}")
+        return {}
+
+
 def ai_interpret_qualified_message(
     api_key: str,
     model: str,
@@ -1521,12 +1725,26 @@ def build_reply(
 ) -> str:
     state = load_lead_state(lead_state_path)
     session = get_lead_session(state, sender_id)
+    last_assistant_message = compact(session.get("last_prompt"))
     if (
         not session.get("active")
         and not session.get("awaiting_opt_in")
         and not session.get("qualified")
         and looks_like_greeting(query)
     ):
+        if use_ai and openai_api_key:
+            ai_reply = ai_generate_conversational_reply(
+                openai_api_key,
+                openai_model,
+                query,
+                agent_name,
+                conversation_stage="new",
+                last_assistant_message=last_assistant_message,
+            )
+            if ai_reply:
+                session["last_prompt"] = ai_reply
+                save_lead_state(lead_state_path, state)
+                return ai_reply
         return (
             "Hi there! How can I assist you with your home search today? If you have a particular area, budget, address, ListingKey, or unit type in mind, I can help find the best options for you."
         )
@@ -1553,6 +1771,21 @@ def build_reply(
         state = load_lead_state(lead_state_path)
         session = get_lead_session(state, sender_id)
         if session.get("awaiting_opt_in") or session.get("active"):
+            if use_ai and openai_api_key:
+                stage = "awaiting_opt_in" if session.get("awaiting_opt_in") else "pre_qual"
+                ai_reply = ai_generate_conversational_reply(
+                    openai_api_key,
+                    openai_model,
+                    query,
+                    agent_name,
+                    conversation_stage=stage,
+                    search_query=compact(session.get("search_query")),
+                    last_assistant_message=compact(session.get("last_prompt")),
+                )
+                if ai_reply:
+                    session["last_prompt"] = ai_reply
+                    save_lead_state(lead_state_path, state)
+                    return ai_reply
             save_lead_state(lead_state_path, state)
             return (
                 "Whenever you're ready, just reply yes and I'll ask a few quick questions."
@@ -1560,8 +1793,23 @@ def build_reply(
         if looks_like_booking_request(query) or wants_listing_help(query):
             session["awaiting_opt_in"] = True
             session["search_query"] = compact(query)
+            intro = qualification_opt_in_prompt(agent_name, describe_search_preferences(query))
+            session["last_prompt"] = intro
             save_lead_state(lead_state_path, state)
-            return qualification_opt_in_prompt(agent_name, describe_search_preferences(query))
+            return intro
+        if use_ai and openai_api_key:
+            ai_reply = ai_generate_conversational_reply(
+                openai_api_key,
+                openai_model,
+                query,
+                agent_name,
+                conversation_stage="pre_qual",
+                last_assistant_message=compact(session.get("last_prompt")),
+            )
+            if ai_reply:
+                session["last_prompt"] = ai_reply
+                save_lead_state(lead_state_path, state)
+                return ai_reply
         return (
             "I can help with that. Tell me your preferred area, budget, and unit type, "
             "and I'll take it from there."

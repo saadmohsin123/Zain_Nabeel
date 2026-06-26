@@ -161,6 +161,33 @@ class FlowTest:
         self.check("ai_wrong_income_rejected", "family_gross_income" not in parsed)
         self.check("ai_wrong_occupation_rejected", "occupation" not in parsed)
 
+        # AI opt-in small talk should not repeat the static nudge
+        def reply_with_ai(sender_id: str, message: str) -> str:
+            return bot.build_reply(
+                sender_id,
+                message,
+                SAMPLE_DRAFTS,
+                listing_doc_url="",
+                calendly_url=self.calendly,
+                agent_name="Nabeel",
+                lead_state_path=self.state_path,
+                openai_api_key="fake",
+                use_ai=True,
+            )
+
+        reply_with_ai("ai-optin-user", "looking for a condo in toronto")
+        with patch.object(
+            bot,
+            "ai_interpret_opt_in_message",
+            return_value={
+                "accepted": False,
+                "reply": "I'm doing well, thanks for asking! Say yes whenever you'd like me to pull some options.",
+            },
+        ):
+            r = reply_with_ai("ai-optin-user", "How are you doing?")
+        self.check("ai_opt_in_small_talk", "well" in r.lower() or "thanks" in r.lower())
+        self.check("ai_opt_in_not_static_nudge", "whenever you're ready, just reply yes" not in r.lower())
+
         return self.failures
 
 
