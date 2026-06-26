@@ -207,6 +207,71 @@ class FlowTest:
         self.check("stale_small_talk_human", "well" in r2.lower() or "thanks" in r2.lower())
         self.check("stale_small_talk_not_repeat", r2 != bot.STATIC_OPT_IN_NUDGE)
 
+        shared_listings = [
+            {
+                "ListingKey": "L1",
+                "MarketplaceStatus": "Posted",
+                "ListingLifecycleStatus": "Active",
+                "TransactionType": "For Lease",
+                "MarketplaceTitle": "1 Bed | 1 Bath | Freehold | For Rent | Unit Apt 2",
+                "City": "Toronto E01",
+                "MarketplacePriceDisplay": "$2,200/month",
+            },
+            {
+                "ListingKey": "L2",
+                "MarketplaceStatus": "Posted",
+                "ListingLifecycleStatus": "Active",
+                "TransactionType": "For Lease",
+                "MarketplaceTitle": "1 Bath | Freehold | For Rent | Unit Basement | < 700 sqft",
+                "City": "Toronto W05",
+                "MarketplacePriceDisplay": "$1,400/month",
+                "Address": "55 Basement Lane",
+                "BedroomsTotal": "1",
+                "BathroomsTotal": "1",
+            },
+            {
+                "ListingKey": "L3",
+                "MarketplaceStatus": "Posted",
+                "ListingLifecycleStatus": "Active",
+                "TransactionType": "For Lease",
+                "MarketplaceTitle": "1 Bath | Condo | For Rent | Unit 528 | 0-499 sqft",
+                "City": "Toronto C08",
+                "MarketplacePriceDisplay": "$1,690/month",
+            },
+        ]
+        session = {
+            "qualified": True,
+            "last_shared_listing_keys": ["L1", "L2", "L3"],
+            "answers": {},
+        }
+        second = bot.resolve_listing_reference("Tell me about the second one", session, shared_listings)
+        self.check("second_listing_resolves", second and second.get("ListingKey") == "L2")
+        detail = bot.handle_qualified_listing_interest(
+            session,
+            "Tell me about the second one",
+            shared_listings,
+            self.calendly,
+            "",
+            "gpt-4.1-mini",
+            "Nabeel",
+        )
+        self.check("second_listing_detail", detail and "1,400" in detail and "W05" in detail)
+        session["selected_listing_key"] = "L2"
+        booking = bot.handle_qualified_listing_interest(
+            session,
+            "Sure",
+            shared_listings,
+            self.calendly,
+            "",
+            "gpt-4.1-mini",
+            "Nabeel",
+        )
+        self.check("sure_sends_calendly", booking and "calendly.com" in booking.lower())
+
+        answers = {"people_on_lease": "1", "adults_in_unit": "2", "kids_in_unit": "0"}
+        bot.validate_household_counts(answers)
+        self.check("household_counts_fixed", answers.get("adults_in_unit") == "1")
+
         return self.failures
 
 

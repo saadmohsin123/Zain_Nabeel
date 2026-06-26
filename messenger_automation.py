@@ -139,6 +139,8 @@ AI_CONVERSATION_SYSTEM_PROMPT = (
     "- accept_opt_in — they agreed to answer questions\n"
     "- qualify — extract answers into fields; reply asks only what's still missing\n"
     "- search_listings — qualified user wants to see or refine options\n"
+    "- listing_detail — user asks about one listing from the last shared list (first/second/third, price, area)\n"
+    "- select_listing — user picks a listing to move forward on\n"
     "- book — qualified user wants a viewing or call\n\n"
     "Fields: move_in_date, people_on_lease, adults_in_unit, kids_in_unit, "
     "family_gross_income, occupation, resident_status, working_with_agent (Yes/No), phone_number\n\n"
@@ -146,7 +148,9 @@ AI_CONVERSATION_SYSTEM_PROMPT = (
     "- No listings or booking links before qualification is done\n"
     "- Only fill fields clearly stated in this message\n"
     "- Adults only → kids_in_unit=0\n"
+    "- adults_in_unit cannot exceed people_on_lease\n"
     "- Don't invent listings or prices\n"
+    "- When user says first/second/third or a price from the last shared list, use listing_detail — don't run a new search\n"
     "- Don't repeat last_assistant_message\n"
     "- Keep reply short and natural"
 )
@@ -687,6 +691,8 @@ def get_lead_session(state: dict, sender_id: str) -> dict:
             "search_query": "",
             "qualified": False,
             "last_shared_listing_keys": [],
+            "selected_listing_key": "",
+            "pending_booking_offer": False,
             "last_prompt": "",
         },
     )
@@ -1118,11 +1124,269 @@ def summarize_shared_listing(draft: dict) -> str:
     return f"{title}{detail_suffix}"
 
 
+def listings_from_session(session: dict, drafts: List[dict]) -> List[dict]:
+    by_key = {compact(draft.get("ListingKey")): draft for draft in drafts if compact(draft.get("ListingKey"))}
+    return [by_key[key] for key in session.get("last_shared_listing_keys", []) if key in by_key]
+
+
+def draft_by_listing_key(drafts: List[dict], listing_key: str) -> Optional[dict]:
+    listing_key = compact(listing_key)
+    if not listing_key:
+        return None
+    for draft in drafts:
+        if compact(draft.get("ListingKey")) == listing_key:
+            return draft
+    return None
+
+
+def resolve_listing_reference(query: str, session: dict, drafts: List[dict]) -> Optional[dict]:
+    shared = listings_from_session(session, drafts)
+    if not shared:
+        return None
+
+    q = query.lower()
+    ordinal_words = (
+        ("third", 2),
+        ("3rd", 2),
+        ("second", 1),
+        ("2nd", 1),
+        ("first", 0),
+        ("1st", 0),
+    )
+    for word, index in ordinal_words:
+        if word in q and index < len(shared):
+            if any(token in q for token in ("one", "listing", "option", "that", "this", "here")) or len(shared) > 1:
+                return shared[index]
+
+    price_match = re.search(r"\$?\s*(\d{3,5})", q.replace(",", ""))
+    if price_match:
+        target = price_match.group(1)
+        for listing in shared:
+            price = (compact(listing.get("MarketplacePriceDisplay")) or compact(listing.get("MarketplacePrice"))).replace(",", "")
+            if target in re.sub(r"[^\d]", "", price):
+                return listing
+
+    city_matches = []
+    for listing in shared:
+        city = compact(listing.get("City"))
+        title = compact(listing.get("MarketplaceTitle"))
+        address = compact(listing.get("Address"))
+        listing_key = compact(listing.get("ListingKey"))
+        haystacks = [city, title, address, listing_key]
+        if any(token and token.lower() in q for token in haystacks):
+            city_matches.append(listing)
+    if len(city_matches) == 1:
+        return city_matches[0]
+
+    selected_key = compact(session.get("selected_listing_key"))
+    if selected_key:
+        selected = draft_by_listing_key(drafts, selected_key)
+        if selected and selected in shared:
+            return selected
+
+    return None
+
+
+def looks_like_listing_detail_request(query: str) -> bool:
+    q = query.lower()
+    phrases = (
+        "tell me about",
+        "more about",
+        "more details",
+        "details on",
+        "details about",
+        "what about",
+        "the second",
+        "the first",
+        "the third",
+        "second one",
+        "first one",
+        "third one",
+        "that one",
+        "this one",
+        "listing here",
+        "what are you talking about",
+        "i'm saying",
+        "im saying",
+        "not the third",
+        "not the first",
+        "not the second",
+    )
+    return any(phrase in q for phrase in phrases) or bool(re.search(r"\$\s*\d{3,5}", q))
+
+
+def looks_like_booking_confirmation(query: str, session: dict) -> bool:
+    if not looks_like_affirmative(query):
+        return False
+    if compact(session.get("selected_listing_key")):
+        return True
+    last = compact(session.get("last_prompt")).lower()
+    return bool(session.get("pending_booking_offer")) or any(
+        phrase in last for phrase in ("viewing", "book a", "schedule", "booking", "move forward", "next step")
+    )
+
+
+def user_asking_booking_options(query: str, session: dict) -> bool:
+    q = query.lower()
+    if "options" not in q:
+        return False
+    return bool(compact(session.get("selected_listing_key"))) or bool(session.get("pending_booking_offer"))
+
+
+def validate_household_counts(answers: dict) -> None:
+    people = compact(answers.get("people_on_lease"))
+    adults = compact(answers.get("adults_in_unit"))
+    kids = compact(answers.get("kids_in_unit"))
+    if people.isdigit() and adults.isdigit() and int(adults) > int(people):
+        answers["adults_in_unit"] = people
+    people = compact(answers.get("people_on_lease"))
+    adults = compact(answers.get("adults_in_unit"))
+    kids = compact(answers.get("kids_in_unit"))
+    if people.isdigit() and adults.isdigit() and kids.isdigit():
+        overflow = int(adults) + int(kids) - int(people)
+        if overflow > 0:
+            answers["kids_in_unit"] = str(max(0, int(kids) - overflow))
+
+
+def build_calendly_booking_reply(
+    session: dict,
+    calendly_url: str,
+    drafts: List[dict],
+) -> str:
+    if not calendly_url:
+        return "I can help with that — Nabeel's booking link isn't set up yet, but I've noted your interest."
+    listing_key = compact(session.get("selected_listing_key"))
+    listing = draft_by_listing_key(drafts, listing_key) if listing_key else None
+    if listing:
+        summary = summarize_shared_listing(listing)
+        return (
+            f"Perfect — pick a time here: {calendly_url}\n"
+            f"Please mention {summary} (ListingKey {listing_key}) in the notes."
+        )
+    return (
+        f"Perfect — book here: {calendly_url}\n"
+        "Add the address or ListingKey for the unit you want in the notes."
+    )
+
+
+def format_listing_detail_short(draft: dict, position: Optional[int] = None) -> str:
+    ctx = listing_context(draft)
+    prefix = f"That's option {position} from the list — " if position else ""
+    title = summarize_shared_listing(draft)
+    bits = [prefix + title + "."]
+    for field in ("Address", "BedroomsTotal", "BathroomsTotal", "LivingAreaRange", "PetsAllowed", "MarketplaceDescription"):
+        value = compact(ctx.get(field))
+        if value:
+            bits.append(f"{field.replace('Total', '').replace('Marketplace', '')}: {value}.")
+    bits.append("Want to book a viewing?")
+    return " ".join(bits)
+
+
+def generate_listing_detail_reply(
+    query: str,
+    listing: dict,
+    api_key: str,
+    model: str,
+    agent_name: str,
+    position: Optional[int] = None,
+) -> str:
+    listing_data = listing_context(listing)
+    listing_data["list_position"] = position
+    system_prompt = (
+        "You're Nabeel's assistant at Durham New Homes. "
+        "Answer using ONLY listing_data for the listing the user asked about. "
+        "2-3 short sentences. Don't mention other listings. Don't invent details."
+    )
+    user_prompt = {
+        "user_message": query,
+        "agent_name": agent_name,
+        "listing_data": listing_data,
+    }
+    if api_key:
+        try:
+            payload = {
+                "model": model,
+                "input": [
+                    {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+                    {"role": "user", "content": [{"type": "input_text", "text": json.dumps(user_prompt, ensure_ascii=False)}]},
+                ],
+                "max_output_tokens": 220,
+            }
+            resp = requests.post(
+                OPENAI_RESPONSES_API,
+                headers=build_openai_headers(api_key),
+                json=payload,
+                timeout=int(os.getenv("OPENAI_REQUEST_TIMEOUT_SECONDS", "20") or "20"),
+            )
+            resp.raise_for_status()
+            reply = compact(extract_response_text(resp.json()))
+            if reply:
+                return reply
+        except Exception as exc:
+            print(f"AI listing detail failed: {exc}")
+    return format_listing_detail_short(listing, position=position)
+
+
+def handle_qualified_listing_interest(
+    session: dict,
+    query: str,
+    drafts: List[dict],
+    calendly_url: str,
+    openai_api_key: str,
+    openai_model: str,
+    agent_name: str,
+) -> Optional[str]:
+    if user_asking_booking_options(query, session):
+        session["pending_booking_offer"] = False
+        return build_calendly_booking_reply(session, calendly_url, drafts)
+
+    if looks_like_booking_confirmation(query, session):
+        session["pending_booking_offer"] = False
+        return build_calendly_booking_reply(session, calendly_url, drafts)
+
+    shared = listings_from_session(session, drafts)
+    listing = resolve_listing_reference(query, session, drafts)
+    if not listing and compact(session.get("selected_listing_key")):
+        listing = draft_by_listing_key(drafts, compact(session.get("selected_listing_key")))
+
+    if listing or (shared and looks_like_listing_detail_request(query)):
+        target = listing
+        if not target and shared:
+            if "second" in query.lower() and len(shared) > 1:
+                target = shared[1]
+            elif "third" in query.lower() and len(shared) > 2:
+                target = shared[2]
+            elif "first" in query.lower():
+                target = shared[0]
+        if target:
+            listing_key = compact(target.get("ListingKey"))
+            session["selected_listing_key"] = listing_key
+            position = shared.index(target) + 1 if target in shared else None
+            reply = generate_listing_detail_reply(
+                query,
+                target,
+                openai_api_key,
+                openai_model,
+                agent_name,
+                position=position,
+            )
+            if any(word in reply.lower() for word in ("viewing", "book", "schedule")):
+                session["pending_booking_offer"] = True
+            return reply
+
+    if looks_like_booking_request(query) and compact(session.get("selected_listing_key")):
+        session["pending_booking_offer"] = False
+        return build_calendly_booking_reply(session, calendly_url, drafts)
+
+    return None
+
+
 def build_post_qualification_reply(
     session: dict,
     drafts: List[dict],
     listing_doc_url: str,
 ) -> str:
+    validate_household_counts(session.setdefault("answers", {}))
     summary = format_lead_summary(session.get("answers", {}))
     search_query = compact(session.get("search_query"))
     matches = rank_drafts(search_query, drafts, limit=3) if search_query else []
@@ -1225,6 +1489,8 @@ def handle_qualified_listing_search(
 ) -> Optional[str]:
     search_query = compact(query)
     should_search = False
+    if looks_like_listing_detail_request(query) or resolve_listing_reference(query, session, drafts):
+        return None
     if use_ai and openai_api_key:
         interpretation = ai_interpret_qualified_message(
             openai_api_key,
@@ -1579,6 +1845,14 @@ def is_plausible_field_value(key: str, value: str, query: str, existing_answers:
         return False
     if key == "adults_in_unit" and ("people" in lowered or "person" in lowered) and "adult" not in lowered:
         return False
+    people_on_lease = compact(existing_answers.get("people_on_lease"))
+    if key == "adults_in_unit" and people_on_lease.isdigit() and value.isdigit():
+        if int(value) > int(people_on_lease):
+            return False
+    adults_in_unit = compact(existing_answers.get("adults_in_unit"))
+    if key == "people_on_lease" and adults_in_unit.isdigit() and value.isdigit():
+        if int(adults_in_unit) > int(value):
+            return False
     return True
 
 
@@ -1597,6 +1871,7 @@ def merge_parsed_answers(
             continue
         if not compact(answers.get(key)):
             answers[key] = normalized
+    validate_household_counts(answers)
 
 
 def ai_extract_qualification_fields(
@@ -1934,8 +2209,26 @@ def handle_ai_conversation(
         "missing_fields": missing_fields,
         "current_batch_keys": batch_keys,
         "last_assistant_message": compact(session.get("last_prompt")),
+        "last_shared_listings": [
+            {"position": index + 1, "summary": summarize_shared_listing(listing), "listing_key": compact(listing.get("ListingKey"))}
+            for index, listing in enumerate(listings_from_session(session, drafts))
+        ],
+        "selected_listing_key": compact(session.get("selected_listing_key")),
     }
     result = ai_route_conversation_turn(openai_api_key, openai_model, query, context)
+
+    if session.get("qualified"):
+        interest_reply = handle_qualified_listing_interest(
+            session,
+            query,
+            drafts,
+            calendly_url,
+            openai_api_key,
+            openai_model,
+            agent_name,
+        )
+        if interest_reply:
+            return save_session_reply(lead_state_path, state, session, interest_reply)
 
     if not result:
         return finalize_conversation_reply(
@@ -2032,19 +2325,53 @@ def handle_ai_conversation(
         )
 
     if action == "search_listings" and session.get("qualified"):
+        if looks_like_listing_detail_request(query) or resolve_listing_reference(query, session, drafts):
+            interest_reply = handle_qualified_listing_interest(
+                session,
+                query,
+                drafts,
+                calendly_url,
+                openai_api_key,
+                openai_model,
+                agent_name,
+            )
+            if interest_reply:
+                return save_session_reply(lead_state_path, state, session, interest_reply)
         search_query = updated_search or compact(query)
         listing_reply = build_qualified_listing_reply(session, search_query, drafts)
         if reply and reply.lower() not in listing_reply.lower():
             return save_session_reply(lead_state_path, state, session, f"{reply}\n\n{listing_reply}")
         return save_session_reply(lead_state_path, state, session, listing_reply)
 
+    if action in {"listing_detail", "select_listing"} and session.get("qualified"):
+        interest_reply = handle_qualified_listing_interest(
+            session,
+            query,
+            drafts,
+            calendly_url,
+            openai_api_key,
+            openai_model,
+            agent_name,
+        )
+        if interest_reply:
+            return save_session_reply(lead_state_path, state, session, interest_reply)
+
     if action == "book" and session.get("qualified"):
         booking_reply = handle_post_qualification_booking(session, query, drafts, calendly_url)
+        if not booking_reply:
+            booking_reply = build_calendly_booking_reply(session, calendly_url, drafts)
         if booking_reply:
             return save_session_reply(lead_state_path, state, session, booking_reply)
 
     if stage == "qualified" and action == "chat":
-        matches = rank_drafts(query, drafts, limit=3)
+        shared = listings_from_session(session, drafts)
+        focus = []
+        listing = resolve_listing_reference(query, session, drafts)
+        if listing:
+            focus = [listing]
+        elif shared and looks_like_listing_detail_request(query):
+            focus = shared[:1]
+        matches = focus or rank_drafts(query, drafts, limit=3)
         try:
             ai_reply = generate_ai_reply(
                 query,
