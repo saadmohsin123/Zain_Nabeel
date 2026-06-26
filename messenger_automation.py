@@ -548,23 +548,57 @@ def ai_conversational_fallback(
     )
 
 
-def qualification_turn_reply(
+def infer_household_defaults(answers: dict, query: str = "") -> None:
+    lowered = normalize_whitespace(query).lower()
+    solo_phrases = ("just me", "only me", "me only", "by myself", "just going to be me", "it'll be me", "it will be me")
+    if any(phrase in lowered for phrase in solo_phrases):
+        if not compact(answers.get("people_on_lease")):
+            answers["people_on_lease"] = "1"
+        if not compact(answers.get("adults_in_unit")):
+            answers["adults_in_unit"] = "1"
+        if not compact(answers.get("kids_in_unit")):
+            answers["kids_in_unit"] = "0"
+    people = compact(answers.get("people_on_lease"))
+    if people == "1":
+        if not compact(answers.get("adults_in_unit")):
+            answers["adults_in_unit"] = "1"
+        if not compact(answers.get("kids_in_unit")):
+            answers["kids_in_unit"] = "0"
+    validate_household_counts(answers)
+
+
+def build_next_qualification_reply(
+    session: dict,
+    answers: dict,
+    drafts: List[dict],
+    listing_doc_url: str,
+) -> str:
+    batch_index = first_incomplete_batch_index(answers)
+    session["batch"] = batch_index
+    if batch_index >= len(QUALIFICATION_BATCHES):
+        session["active"] = False
+        session["qualified"] = True
+        session["completed_at"] = int(time.time())
+        return build_post_qualification_reply(session, drafts, listing_doc_url)
+    batch_keys = QUALIFICATION_BATCHES[batch_index]["keys"]
+    missing_keys = [key for key in batch_keys if not compact(answers.get(key))]
+    if missing_keys:
+        return build_missing_field_prompt(missing_keys, answers)
+    return QUALIFICATION_BATCHES[batch_index]["prompt"]
+
+
+def apply_qualification_turn(
     session: dict,
     query: str,
-    lead_state_path: Path,
-    state: dict,
-    agent_name: str,
     drafts: List[dict],
     listing_doc_url: str,
     openai_api_key: str,
     openai_model: str,
-) -> Optional[str]:
+) -> str:
     answers = session.setdefault("answers", {})
     batch_index = min(int(session.get("batch", 0)), max(len(QUALIFICATION_BATCHES) - 1, 0))
-    if batch_index >= len(QUALIFICATION_BATCHES):
-        return None
-
     session.setdefault("raw_answers", {})[f"turn_{len(session.get('raw_answers', {})) + 1}"] = compact(query)
+
     parsed_answers, follow_up_hint = extract_qualification_from_message(
         batch_index,
         query,
@@ -581,20 +615,47 @@ def qualification_turn_reply(
         query,
         allowed_keys=QUALIFICATION_BATCHES[batch_index]["keys"],
     )
+    infer_household_defaults(answers, query)
+
     batch_index = first_incomplete_batch_index(answers)
     session["batch"] = batch_index
-
     if batch_index < len(QUALIFICATION_BATCHES):
         batch_keys = QUALIFICATION_BATCHES[batch_index]["keys"]
         missing_keys = [key for key in batch_keys if not compact(answers.get(key))]
-        if missing_keys:
-            return follow_up_hint or build_missing_field_prompt(missing_keys, answers)
-        return QUALIFICATION_BATCHES[batch_index]["prompt"]
+        if missing_keys and follow_up_hint:
+            lowered_hint = follow_up_hint.lower()
+            if not any(
+                compact(answers.get(key)) and compact(answers.get(key)).lower() in lowered_hint
+                for key in QUALIFICATION_FIELD_KEYS
+            ):
+                re_ask_move_in = "move" in lowered_hint and compact(answers.get("move_in_date"))
+                re_ask_people = "people" in lowered_hint and compact(answers.get("people_on_lease"))
+                re_ask_adults = "adult" in lowered_hint and compact(answers.get("adults_in_unit"))
+                if not (re_ask_move_in or re_ask_people or re_ask_adults):
+                    return follow_up_hint
 
-    session["active"] = False
-    session["qualified"] = True
-    session["completed_at"] = int(time.time())
-    return build_post_qualification_reply(session, drafts, listing_doc_url)
+    return build_next_qualification_reply(session, answers, drafts, listing_doc_url)
+
+
+def qualification_turn_reply(
+    session: dict,
+    query: str,
+    lead_state_path: Path,
+    state: dict,
+    agent_name: str,
+    drafts: List[dict],
+    listing_doc_url: str,
+    openai_api_key: str,
+    openai_model: str,
+) -> Optional[str]:
+    return apply_qualification_turn(
+        session,
+        query,
+        drafts,
+        listing_doc_url,
+        openai_api_key,
+        openai_model,
+    )
 
 
 def finalize_conversation_reply(
@@ -875,6 +936,9 @@ def is_plausible_occupation(text: str) -> bool:
         return False
     if len(cleaned) < 2:
         return False
+    lowered = cleaned.lower()
+    if lowered in {"just me", "only me", "me only", "me", "just", "only"}:
+        return False
     if re.fullmatch(r"[kK]", cleaned):
         return False
     if re.fullmatch(r"\$?\d+[kK]?", cleaned):
@@ -977,6 +1041,8 @@ def build_missing_field_prompt(keys: List[str], answers: Optional[dict] = None) 
             )
         if key == "kids_in_unit" and compact(answers.get("adults_in_unit")):
             return "Thanks. How many kids will be living in the unit?"
+        if key == "adults_in_unit" and compact(answers.get("people_on_lease")) == "1":
+            return "Got it — just you. What's your total family gross income excluding cash income, and what do you do for work?"
         if key == "occupation" and compact(answers.get("family_gross_income")):
             return "Thanks. What do you do for work?"
         if key == "phone_number":
@@ -1048,6 +1114,12 @@ def parse_batch_answers(batch_index: int, query: str) -> Dict[str, str]:
         elif "no kids" in lowered:
             answers["kids_in_unit"] = "0"
         elif adults_match and re.search(r"^\d+\s+adults?\b", lowered):
+            answers["kids_in_unit"] = "0"
+        elif any(phrase in lowered for phrase in ("just me", "only me", "me only", "by myself")):
+            answers["adults_in_unit"] = "1"
+            answers["kids_in_unit"] = "0"
+        elif parse_int_from_text(normalized) == "1" and "me" in lowered:
+            answers["adults_in_unit"] = "1"
             answers["kids_in_unit"] = "0"
 
     elif batch_index == 2:
@@ -1545,53 +1617,17 @@ def maybe_handle_qualification(
 
     if session.get("active"):
         answers = session.setdefault("answers", {})
-        raw_answers = session.setdefault("raw_answers", {})
-        batch_index = int(session.get("batch", 0))
-        batch_index = min(batch_index, max(len(QUALIFICATION_BATCHES) - 1, 0))
-
-        if batch_index < len(QUALIFICATION_BATCHES):
-            raw_answers[f"turn_{len(raw_answers) + 1}"] = compact(query)
-            parsed_answers, follow_up_hint = extract_qualification_from_message(
-                batch_index,
-                query,
-                answers,
-                openai_api_key=openai_api_key,
-                openai_model=openai_model,
-                use_ai=use_ai,
-                last_prompt=compact(session.get("last_prompt")),
-                search_query=compact(session.get("search_query")),
-            )
-            merge_parsed_answers(
-                answers,
-                parsed_answers,
-                query,
-                allowed_keys=QUALIFICATION_BATCHES[batch_index]["keys"],
-            )
-
-            batch_index = first_incomplete_batch_index(answers)
-            session["batch"] = batch_index
-
-            if batch_index < len(QUALIFICATION_BATCHES):
-                batch_keys = QUALIFICATION_BATCHES[batch_index]["keys"]
-                missing_keys = [key for key in batch_keys if not compact(answers.get(key))]
-                if missing_keys:
-                    reply = follow_up_hint or build_missing_field_prompt(missing_keys, answers)
-                    session["last_prompt"] = reply
-                    save_lead_state(lead_state_path, state)
-                    return reply
-
-                next_prompt = QUALIFICATION_BATCHES[batch_index]["prompt"]
-                session["last_prompt"] = next_prompt
-                save_lead_state(lead_state_path, state)
-                return next_prompt
-
-            session["active"] = False
-            session["qualified"] = True
-            session["completed_at"] = int(time.time())
-            reply = build_post_qualification_reply(session, drafts, listing_doc_url)
-            session["last_prompt"] = reply
-            save_lead_state(lead_state_path, state)
-            return reply
+        reply = apply_qualification_turn(
+            session,
+            query,
+            drafts,
+            listing_doc_url,
+            openai_api_key=openai_api_key,
+            openai_model=openai_model,
+        )
+        session["last_prompt"] = reply
+        save_lead_state(lead_state_path, state)
+        return reply
 
     booking_reply = handle_post_qualification_booking(session, query, drafts, calendly_url)
     if booking_reply:
@@ -2192,6 +2228,33 @@ def handle_ai_conversation(
     session = get_lead_session(state, sender_id)
     reset_stale_opt_in_session(session, query)
     stage = conversation_stage(session)
+
+    if session.get("active") and not session.get("qualified"):
+        qual_reply = apply_qualification_turn(
+            session,
+            query,
+            drafts,
+            listing_doc_url,
+            openai_api_key,
+            openai_model,
+        )
+        return save_session_reply(lead_state_path, state, session, qual_reply)
+
+    if stage == "new" and looks_like_greeting(query) and not wants_listing_help(query):
+        greeting = local_conversational_fallback("new", query, agent_name, last_assistant_message=compact(session.get("last_prompt")))
+        if openai_api_key:
+            ai_greeting = ai_generate_conversational_reply(
+                openai_api_key,
+                openai_model,
+                query,
+                agent_name,
+                conversation_stage="new",
+                last_assistant_message=compact(session.get("last_prompt")),
+            )
+            if ai_greeting:
+                greeting = ai_greeting
+        return save_session_reply(lead_state_path, state, session, greeting)
+
     answers = session.setdefault("answers", {})
     batch_index = min(int(session.get("batch", 0)), max(len(QUALIFICATION_BATCHES) - 1, 0))
     batch_keys = (
@@ -2255,27 +2318,16 @@ def handle_ai_conversation(
         session.setdefault("raw_answers", {})[f"turn_{len(session.get('raw_answers', {})) + 1}"] = compact(query)
         allowed_keys = batch_keys or missing_fields
         merge_parsed_answers(answers, fields, query, allowed_keys=allowed_keys)
+        infer_household_defaults(answers, query)
         session["batch"] = first_incomplete_batch_index(answers)
         if all_qualification_fields_complete(answers):
             session["active"] = False
             session["qualified"] = True
             session["completed_at"] = int(time.time())
             post_reply = build_post_qualification_reply(session, drafts, listing_doc_url)
-            if reply and reply.lower() not in post_reply.lower():
-                return save_session_reply(lead_state_path, state, session, f"{reply}\n\n{post_reply}")
             return save_session_reply(lead_state_path, state, session, post_reply)
-        return finalize_conversation_reply(
-            reply,
-            session,
-            query,
-            lead_state_path,
-            state,
-            agent_name,
-            openai_api_key,
-            openai_model,
-            drafts,
-            listing_doc_url,
-        )
+        qual_reply = build_next_qualification_reply(session, answers, drafts, listing_doc_url)
+        return save_session_reply(lead_state_path, state, session, qual_reply)
 
     if action == "accept_opt_in" and stage == "awaiting_opt_in":
         session["awaiting_opt_in"] = False
@@ -2288,10 +2340,26 @@ def handle_ai_conversation(
         session["last_shared_listing_keys"] = []
         if isinstance(fields, dict) and fields:
             merge_parsed_answers(session["answers"], fields, query, allowed_keys=QUALIFICATION_FIELD_KEYS)
+            infer_household_defaults(session["answers"], query)
             session["batch"] = first_incomplete_batch_index(session["answers"])
-        if not reply:
-            reply = QUALIFICATION_BATCHES[0]["prompt"]
-        return save_session_reply(lead_state_path, state, session, reply)
+        first_prompt = build_next_qualification_reply(session, session["answers"], drafts, listing_doc_url)
+        return save_session_reply(lead_state_path, state, session, first_prompt)
+
+    if action == "accept_opt_in" and stage == "new" and (looks_like_affirmative(query) or wants_listing_help(query)):
+        session["awaiting_opt_in"] = False
+        session["active"] = True
+        session["step"] = 0
+        session["batch"] = 0
+        session["qualified"] = False
+        session["answers"] = {}
+        session["raw_answers"] = {}
+        session["search_query"] = updated_search or compact(query)
+        session["last_shared_listing_keys"] = []
+        first_prompt = build_next_qualification_reply(session, session["answers"], drafts, listing_doc_url)
+        return save_session_reply(lead_state_path, state, session, first_prompt)
+
+    if action == "accept_opt_in" and stage == "new" and looks_like_greeting(query):
+        action = "chat"
 
     if action == "offer_opt_in" and stage == "new":
         session["awaiting_opt_in"] = True
@@ -2304,6 +2372,7 @@ def handle_ai_conversation(
     if action == "qualify" and stage == "qualifying":
         if isinstance(fields, dict) and fields:
             merge_parsed_answers(answers, fields, query, allowed_keys=batch_keys or missing_fields)
+            infer_household_defaults(answers, query)
             session["batch"] = first_incomplete_batch_index(answers)
         if all_qualification_fields_complete(answers):
             session["active"] = False
@@ -2311,18 +2380,8 @@ def handle_ai_conversation(
             session["completed_at"] = int(time.time())
             post_reply = build_post_qualification_reply(session, drafts, listing_doc_url)
             return save_session_reply(lead_state_path, state, session, post_reply)
-        return finalize_conversation_reply(
-            reply,
-            session,
-            query,
-            lead_state_path,
-            state,
-            agent_name,
-            openai_api_key,
-            openai_model,
-            drafts,
-            listing_doc_url,
-        )
+        qual_reply = build_next_qualification_reply(session, answers, drafts, listing_doc_url)
+        return save_session_reply(lead_state_path, state, session, qual_reply)
 
     if action == "search_listings" and session.get("qualified"):
         if looks_like_listing_detail_request(query) or resolve_listing_reference(query, session, drafts):

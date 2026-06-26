@@ -272,6 +272,21 @@ class FlowTest:
         bot.validate_household_counts(answers)
         self.check("household_counts_fixed", answers.get("adults_in_unit") == "1")
 
+        reply_as("solo-user", "looking for a condo in toronto")
+        reply_as("solo-user", "yes")
+        r = reply_as("solo-user", "Mid August and it's just going to be me")
+        solo_state = json.loads(Path(self.state_path).read_text())["sessions"]["solo-user"]
+        solo_answers = solo_state["answers"]
+        self.check("solo_move_in", "august" in solo_answers.get("move_in_date", "").lower())
+        self.check("solo_people", solo_answers.get("people_on_lease") == "1")
+        self.check("solo_adults_inferred", solo_answers.get("adults_in_unit") == "1")
+        self.check("solo_skips_household_batch", solo_state.get("batch", 0) >= 2)
+        self.check("solo_no_reask_move_in", "when are you looking to move" not in r.lower())
+        r2 = reply_as("solo-user", "Just me")
+        solo_answers2 = json.loads(Path(self.state_path).read_text())["sessions"]["solo-user"]["answers"]
+        self.check("just_me_not_occupation", solo_answers2.get("occupation") != "Just me")
+        self.check("just_me_no_move_in_reask", "when are you looking to move" not in r2.lower())
+
         return self.failures
 
 
