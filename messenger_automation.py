@@ -108,19 +108,19 @@ QUALIFICATION_STEPS = [
 QUALIFICATION_BATCHES = [
     {
         "keys": ["move_in_date", "people_on_lease"],
-        "prompt": "Perfect. First, what’s your expected move-in date, and how many people will be on the lease?",
+        "prompt": "Perfect. What's your expected move-in date?",
     },
     {
         "keys": ["adults_in_unit", "kids_in_unit"],
-        "prompt": "Got it. How many adults will be living in the unit, and how many kids will be living there?",
+        "prompt": "Got it. How many adults will be living in the unit?",
     },
     {
         "keys": ["family_gross_income", "occupation"],
-        "prompt": "Thanks. What’s your total family gross income excluding cash income, and what do you do for work?",
+        "prompt": "Thanks. What's your total family gross income? Please do not include cash income.",
     },
     {
         "keys": ["resident_status", "working_with_agent"],
-        "prompt": "Almost done. What's your resident status in Canada, and are you currently working with an agent?",
+        "prompt": "Almost done. What is your resident status in Canada?",
     },
     {
         "keys": ["phone_number"],
@@ -172,7 +172,7 @@ Batch 5: phone_number
 - When discussing listings after qualification, use ONLY listing_data provided — do not invent
 - For first/second/third listing references, use list_position from last_shared_listings
 - Do not repeat last_assistant_message verbatim
-- If directive says ask multiple things, combine in one natural sentence
+- If directive says ask for one field, ask exactly one question — never combine multiple qualification questions in one message
 
 === WHEN fields should be empty ===
 Set fields to {} when stage is NEW, AWAITING_OPT_IN (unless user volunteered qual info with yes), or when reply-only turns."""
@@ -649,18 +649,14 @@ def build_next_qualification_reply(
     drafts: List[dict],
     listing_doc_url: str,
 ) -> str:
-    batch_index = first_incomplete_batch_index(answers)
-    session["batch"] = batch_index
-    if batch_index >= len(QUALIFICATION_BATCHES):
+    missing_key = first_missing_qualification_key(answers)
+    session["batch"] = first_incomplete_batch_index(answers)
+    if not missing_key:
         session["active"] = False
         session["qualified"] = True
         session["completed_at"] = int(time.time())
         return build_post_qualification_reply(session, drafts, listing_doc_url)
-    batch_keys = QUALIFICATION_BATCHES[batch_index]["keys"]
-    missing_keys = [key for key in batch_keys if not compact(answers.get(key))]
-    if missing_keys:
-        return build_missing_field_prompt(missing_keys, answers)
-    return QUALIFICATION_BATCHES[batch_index]["prompt"]
+    return build_missing_field_prompt([missing_key], answers)
 
 
 def apply_qualification_turn(
@@ -902,6 +898,8 @@ def extract_resident_status(text: str) -> str:
             return label
     if re.fullmatch(r"pr", lowered):
         return "Permanent Resident"
+    if re.fullmatch(r"residents?", lowered):
+        return "Permanent Resident"
     return ""
 
 
@@ -938,6 +936,7 @@ def extract_agent_answer(text: str) -> str:
         r"\bnope\b",
         r"\bjust you\b",
         r"\bonly you\b",
+        r"\bnot working with an?\s+\w*agent\w*\b",
     ]
     if any(re.search(pattern, lowered) for pattern in positive_patterns):
         return "Yes"
@@ -1085,6 +1084,18 @@ def extract_move_in_date(text: str) -> str:
     return ""
 
 
+def looks_like_date_only_answer(text: str) -> bool:
+    normalized = normalize_whitespace(text)
+    if not normalized or not extract_move_in_date(normalized):
+        return False
+    lowered = normalized.lower()
+    if re.search(r"\d+\s*(?:people|person|adult|adults|tenant|tenants|kid|kids|child|children|lease)\b", lowered):
+        return False
+    if re.search(r"\b(?:people|person|adult|adults|tenant|tenants|kid|kids|child|children|lease)\b", lowered):
+        return False
+    return True
+
+
 def parse_missing_fields(missing_keys: List[str], query: str) -> Dict[str, str]:
     if not missing_keys:
         return {}
@@ -1098,7 +1109,10 @@ def parse_missing_fields(missing_keys: List[str], query: str) -> Dict[str, str]:
     if len(missing_keys) == 1:
         key = missing_keys[0]
         if key in ("people_on_lease", "adults_in_unit"):
-            count = parse_people_count(query) if key == "people_on_lease" else parse_int_from_text(query)
+            if looks_like_date_only_answer(query):
+                count = ""
+            else:
+                count = parse_people_count(query) if key == "people_on_lease" else parse_int_from_text(query)
             if count != "":
                 answers[key] = count
         elif key == "kids_in_unit":
@@ -1156,40 +1170,35 @@ def parse_missing_fields(missing_keys: List[str], query: str) -> Dict[str, str]:
 
 def build_missing_field_prompt(keys: List[str], answers: Optional[dict] = None) -> str:
     answers = answers or {}
-    if len(keys) == 1:
-        key = keys[0]
-        adults = compact(answers.get("adults_in_unit"))
-        kids = compact(answers.get("kids_in_unit"))
-        if key == "move_in_date" and adults:
-            household = f"{adults} adult{'s' if adults != '1' else ''}"
-            if kids:
-                household += f" and {kids} kid{'s' if kids != '1' else ''}"
-            return f"Got it — {household}. What's your expected move-in date?"
-        if key == "people_on_lease" and compact(answers.get("move_in_date")):
-            return (
-                f"Got it on move-in ({compact(answers['move_in_date'])}). "
-                "How many people will be on the lease?"
-            )
-        if key == "kids_in_unit" and compact(answers.get("adults_in_unit")):
-            return "Thanks. How many kids will be living in the unit?"
-        if key == "adults_in_unit" and compact(answers.get("people_on_lease")) == "1":
-            return "Got it — just you. What's your total family gross income excluding cash income, and what do you do for work?"
-        if key == "occupation" and compact(answers.get("family_gross_income")):
-            return "Thanks. What do you do for work?"
-        if key == "phone_number":
-            return "Last one — what's the best phone number to reach you on?"
-        by_key = {step["key"]: step["prompt"] for step in QUALIFICATION_STEPS}
-        return by_key.get(key, "Could you share that detail?")
-
-    prompts = []
+    if not keys:
+        return "Could you share that detail?"
+    key = keys[0]
+    adults = compact(answers.get("adults_in_unit"))
+    kids = compact(answers.get("kids_in_unit"))
+    if key == "move_in_date" and adults:
+        household = f"{adults} adult{'s' if adults != '1' else ''}"
+        if kids:
+            household += f" and {kids} kid{'s' if kids != '1' else ''}"
+        return f"Got it — {household}. What's your expected move-in date?"
+    if key == "people_on_lease" and compact(answers.get("move_in_date")):
+        return (
+            f"Got it on move-in ({compact(answers['move_in_date'])}). "
+            "How many people will be on the lease?"
+        )
+    if key == "kids_in_unit" and compact(answers.get("adults_in_unit")):
+        return "Thanks. How many kids will be living in the unit?"
+    if key == "adults_in_unit" and compact(answers.get("people_on_lease")) == "1":
+        return "Got it — just you. How many adults will be living in the unit?"
+    if key == "family_gross_income" and compact(answers.get("adults_in_unit")):
+        return "Thanks. What's your total family gross income? Please do not include cash income."
+    if key == "occupation" and compact(answers.get("family_gross_income")):
+        return "Thanks. What do you do for work?"
+    if key == "working_with_agent" and compact(answers.get("resident_status")):
+        return "Thanks. Are you currently working with an agent?"
+    if key == "phone_number":
+        return "Last one — what's the best phone number to reach you on?"
     by_key = {step["key"]: step["prompt"] for step in QUALIFICATION_STEPS}
-    for key in keys:
-        prompt = by_key.get(key, "").rstrip("?")
-        if prompt:
-            prompts.append(f"- {prompt}")
-    if not prompts:
-        return "I still need one more detail from you."
-    return "I still need:\n" + "\n".join(prompts)
+    return by_key.get(key, "Could you share that detail?")
 
 
 def parse_batch_answers(batch_index: int, query: str) -> Dict[str, str]:
@@ -1224,9 +1233,10 @@ def parse_batch_answers(batch_index: int, query: str) -> Dict[str, str]:
         if people_match:
             answers["people_on_lease"] = people_match.group(1)
         elif not answers.get("people_on_lease"):
-            people_count = parse_people_count(normalized)
-            if people_count:
-                answers["people_on_lease"] = people_count
+            if not looks_like_date_only_answer(normalized):
+                people_count = parse_people_count(normalized)
+                if people_count:
+                    answers["people_on_lease"] = people_count
 
         answers.update(parse_household_from_text(normalized))
 
@@ -2006,6 +2016,13 @@ def first_incomplete_batch_index(answers: dict) -> int:
     return len(QUALIFICATION_BATCHES)
 
 
+def first_missing_qualification_key(answers: dict) -> str:
+    for key in QUALIFICATION_FIELD_KEYS:
+        if not compact(answers.get(key)):
+            return key
+    return ""
+
+
 def is_plausible_field_value(key: str, value: str, query: str, existing_answers: Optional[dict] = None) -> bool:
     value = compact(value)
     query = compact(query)
@@ -2423,6 +2440,7 @@ def compute_conversation_directive(
     answers = session.setdefault("answers", {})
     stage = conversation_stage(session)
     missing_all = [key for key in QUALIFICATION_FIELD_KEYS if not compact(answers.get(key))]
+    next_field = first_missing_qualification_key(answers) if session.get("active") else ""
     batch_index = first_incomplete_batch_index(answers) if session.get("active") else 0
     batch_keys = (
         QUALIFICATION_BATCHES[batch_index]["keys"]
@@ -2467,13 +2485,13 @@ def compute_conversation_directive(
 
     elif session.get("active"):
         ai_stage = "QUALIFYING"
-        allowed_field_keys = list(missing_batch) if missing_batch else list(missing_all)
+        allowed_field_keys = [next_field] if next_field else []
         if not missing_all:
             directive = "All qualification info collected. Brief positive acknowledgment only."
-        elif missing_batch:
-            prompts = [step_labels[key].rstrip("?") for key in missing_batch]
+        elif next_field:
+            prompt = step_labels[next_field].rstrip("?")
             directive = (
-                f"Acknowledge what they said. Ask ONLY for: {'; '.join(prompts)}. "
+                f"Acknowledge what they said. Ask ONLY this one question: {prompt}. "
                 f"Already collected (do NOT re-ask): {json.dumps(collected)}."
             )
         else:
@@ -2483,9 +2501,9 @@ def compute_conversation_directive(
         ai_stage = "AWAITING_OPT_IN"
         if looks_like_affirmative(query):
             directive = (
-                "They said yes. Brief thanks. Ask for move-in date AND how many people on the lease in one message."
+                "They said yes. Brief thanks. Ask ONLY for their expected move-in date."
             )
-            allowed_field_keys = ["move_in_date", "people_on_lease"]
+            allowed_field_keys = ["move_in_date"]
         elif wants_listing_help(query):
             directive = (
                 "Acknowledge their search preferences. Remind them to say yes when ready for a few quick questions."
@@ -2686,11 +2704,9 @@ def handle_unified_ai_turn(
     answers = session.get("answers", {})
 
     if reply and reply_reasks_collected_fields(reply, answers):
-        batch_index = first_incomplete_batch_index(answers)
-        if batch_index < len(QUALIFICATION_BATCHES):
-            missing = [k for k in QUALIFICATION_BATCHES[batch_index]["keys"] if not compact(answers.get(k))]
-            if missing:
-                reply = build_missing_field_prompt(missing, answers)
+        missing_key = first_missing_qualification_key(answers)
+        if missing_key:
+            reply = build_missing_field_prompt([missing_key], answers)
 
     if not reply:
         if session.get("active"):

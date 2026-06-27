@@ -345,6 +345,28 @@ class FlowTest:
         self.check("ahmed_still_has_people", ahmed_answers3.get("people_on_lease") == "4")
         self.check("ahmed_no_lease_loop", "people on the lease" not in r.lower())
 
+        # One question at a time + resident/agent parsing (screenshot regression)
+        reply_as("single-q-user", "looking for a condo in toronto")
+        reply_as("single-q-user", "yes")
+        reply_as("single-q-user", "June 1")
+        reply_as("single-q-user", "2 people")
+        reply_as("single-q-user", "2 adults")
+        reply_as("single-q-user", "0")
+        r = reply_as("single-q-user", "50K")
+        self.check("single_q_income_only", "work" in r.lower() or "occupation" in r.lower() or "what do you do" in r.lower())
+        self.check("single_q_not_both_res_income", "i still need:" not in r.lower())
+        reply_as("single-q-user", "engineer")
+        r = reply_as("single-q-user", "Resident")
+        sq_answers = json.loads(Path(self.state_path).read_text())["sessions"]["single-q-user"]["answers"]
+        self.check("resident_parsed", sq_answers.get("resident_status") == "Permanent Resident")
+        self.check("single_q_agent_only", "agent" in r.lower())
+        self.check("single_q_not_both_resident_agent", "resident status" not in r.lower())
+        r = reply_as("single-q-user", "Nope im not working with an agrny")
+        sq_answers2 = json.loads(Path(self.state_path).read_text())["sessions"]["single-q-user"]["answers"]
+        self.check("agent_no_parsed", sq_answers2.get("working_with_agent") == "No")
+        self.check("single_q_phone_next", "phone" in r.lower())
+        self.check("single_q_no_still_need_list", "i still need:" not in r.lower())
+
         return self.failures
 
 
