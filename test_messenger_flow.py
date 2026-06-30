@@ -474,6 +474,10 @@ class FlowTest:
         self.check("oshawa_city_price_filter", len(oshawa_matches) == 1 and oshawa_matches[0].get("ListingKey") == "O1")
         no_match = bot.rank_drafts("3 bedroom in Oshawa under 2000", location_drafts, limit=3)
         self.check("oshawa_no_match_when_over_budget", len(no_match) == 0)
+        self.check(
+            "single_digit_income_rejected",
+            not bot.is_plausible_field_value("family_gross_income", "1", "1", {}),
+        )
 
         qualified_session = {
             "qualified": True,

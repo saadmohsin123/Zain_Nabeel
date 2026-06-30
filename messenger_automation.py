@@ -2435,7 +2435,14 @@ def is_plausible_field_value(key: str, value: str, query: str, existing_answers:
     existing_answers = existing_answers or {}
 
     if key == "family_gross_income":
-        if value in {"1", "2", "3", "4", "5"} and any(token in lowered for token in ("adult", "kid", "people", "person", "lease")):
+        if value in {"1", "2", "3", "4", "5"} and any(
+            token in lowered for token in ("adult", "kid", "people", "person", "lease")
+        ):
+            return False
+        digits = re.sub(r"\D", "", value)
+        if "k" in lowered:
+            return bool(digits)
+        if digits.isdigit() and int(digits) < 1000:
             return False
         return bool(re.search(r"\d", value))
     if key == "occupation":
