@@ -895,6 +895,29 @@ def finalize_conversation_reply(
     )
     return save_session_reply(lead_state_path, state, session, fallback)
 
+def build_search_opt_in_reply(session: dict, query: str, agent_name: str) -> str:
+    session["search_query"] = compact(query)
+    session["awaiting_opt_in"] = True
+    session["active"] = False
+    return qualification_opt_in_prompt(agent_name, describe_search_preferences(query))
+
+
+def build_awaiting_opt_in_reply(session: dict, query: str, agent_name: str) -> str:
+    if wants_listing_help(query):
+        session["search_query"] = compact(query)
+        summary = describe_search_preferences(query)
+        if summary:
+            return f"Got it — {summary}. Just reply yes when you're ready and I'll ask a few quick questions."
+        return "Got it. Just reply yes when you're ready and I'll ask a few quick questions."
+    return local_conversational_fallback(
+        "awaiting_opt_in",
+        query,
+        agent_name,
+        last_assistant_message=compact(session.get("last_prompt")),
+        search_query=compact(session.get("search_query")),
+    )
+
+
 def qualification_opt_in_prompt(agent_name: str, search_summary: str = "") -> str:
     context = f"Got it — you're looking for {search_summary}.\n\n" if search_summary else ""
     return (
@@ -965,9 +988,9 @@ def format_lead_summary(answers: dict) -> str:
 def describe_search_preferences(query: str) -> str:
     normalized = query.lower().replace("torronto", "toronto")
     parts: List[str] = []
-    bed_match = re.search(r"\b(\d+)\s*bed(?:room)?s?\b", normalized)
+    bed_match = re.search(r"\b(\d+)\s*bed(?:room)?s?\b|\b(\d+)bed(?:room)?s?\b", normalized)
     if bed_match:
-        parts.append(f"{bed_match.group(1)} bedroom")
+        parts.append(f"{bed_match.group(1) or bed_match.group(2)} bedroom")
     unit_types = ["condo", "apartment", "house", "townhouse", "studio", "basement"]
     for unit_type in unit_types:
         if re.search(rf"\b{unit_type}\b", normalized):
@@ -975,6 +998,8 @@ def describe_search_preferences(query: str) -> str:
             break
     if "downtown" in normalized:
         parts.append("in downtown Toronto")
+    elif re.search(r"\bontario\b", normalized):
+        parts.append("in Ontario")
     elif re.search(r"\btoronto\b", normalized):
         parts.append("in Toronto")
     price_match = re.search(r"\$?\s*(\d{3,6})", normalized.replace(",", ""))
@@ -2715,8 +2740,8 @@ def compute_conversation_directive(
         summary = describe_search_preferences(query)
         directive = (
             f"User wants rentals{' for ' + summary if summary else ''}. "
-            f"Introduce yourself as {agent_name}'s assistant. Offer free listing help after a few quick questions. "
-            "Ask them to say yes to proceed."
+            "Acknowledge their preferences briefly. Ask them to say yes to proceed with a few quick questions. "
+            "Do NOT re-introduce yourself if last_assistant_message already mentioned the assistant."
         )
 
     elif looks_like_greeting(query):
@@ -2880,6 +2905,33 @@ def handle_unified_ai_turn(
 
     if session.get("active"):
         reply = build_next_qualification_reply(session, answers, drafts, listing_doc_url)
+        return save_session_reply(lead_state_path, state, session, reply)
+
+    if (
+        (wants_listing_help(query) or should_start_qualification(query, calendly_url))
+        and not session.get("qualified")
+        and not session.get("active")
+    ):
+        reply = build_search_opt_in_reply(session, query, agent_name)
+        return save_session_reply(lead_state_path, state, session, reply)
+
+    if session.get("awaiting_opt_in") and not looks_like_affirmative(query):
+        reply = build_awaiting_opt_in_reply(session, query, agent_name)
+        return save_session_reply(lead_state_path, state, session, reply)
+
+    if (
+        not session.get("qualified")
+        and not session.get("active")
+        and not session.get("awaiting_opt_in")
+        and looks_like_greeting(query)
+        and not wants_listing_help(query)
+    ):
+        reply = local_conversational_fallback(
+            "new",
+            query,
+            agent_name,
+            last_assistant_message=compact(session.get("last_prompt")),
+        )
         return save_session_reply(lead_state_path, state, session, reply)
 
     directive_ctx = compute_conversation_directive(session, query, agent_name, drafts, calendly_url)

@@ -465,6 +465,39 @@ class FlowTest:
         self.check("qualified_hi_no_listing_dump", "2,150" not in r.lower() and "sheppard" not in r.lower())
         self.check("qualified_hi_short", "still here" in r.lower() or "refine" in r.lower())
 
+        # Screenshot regression: hello then search should not double-intro (AI path)
+        def reply_ai(sender_id: str, message: str) -> str:
+            return bot.build_reply(
+                sender_id,
+                message,
+                SAMPLE_DRAFTS,
+                listing_doc_url="",
+                calendly_url=self.calendly,
+                agent_name="Nabeel",
+                lead_state_path=self.state_path,
+                openai_api_key="fake",
+                use_ai=True,
+            )
+
+        with patch.object(
+            bot,
+            "ai_compose_turn",
+            return_value={
+                "fields": {},
+                "reply": "Hi! I'm Nabeel's assistant at Durham New Homes—thanks for reaching out. What kind of place, area, or price range are you looking for?",
+            },
+        ):
+            r1 = reply_ai("sync-user", "hello")
+        r2 = reply_ai("sync-user", "Actually I am looking for 2bed Condo in Ontario")
+        sync_state = json.loads(Path(self.state_path).read_text())["sessions"]["sync-user"]
+        self.check("sync_awaiting_opt_in", sync_state.get("awaiting_opt_in") is True)
+        self.check("sync_search_saved", "condo" in sync_state.get("search_query", "").lower())
+        self.check("sync_acknowledges_search", "condo" in r2.lower() or "2 bedroom" in r2.lower() or "ontario" in r2.lower())
+        self.check("sync_no_second_hi_intro", not (r2.lower().startswith("hi,") or r2.lower().startswith("hi!")))
+        self.check("sync_has_yes_prompt", "yes" in r2.lower())
+        intro_count = sum(1 for t in [r1, r2] if "nabeel's assistant" in t.lower())
+        self.check("sync_single_assistant_intro", intro_count == 1)
+
         return self.failures
 
 
