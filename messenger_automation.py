@@ -1480,45 +1480,8 @@ def parse_missing_fields(missing_keys: List[str], query: str) -> Dict[str, str]:
 
     answers: Dict[str, str] = {}
     lowered = normalized.lower()
-    if len(missing_keys) == 1:
-        key = missing_keys[0]
-        if key in ("people_on_lease", "adults_in_unit"):
-            if looks_like_date_only_answer(query):
-                count = ""
-            else:
-                count = parse_people_count(query) if key == "people_on_lease" else parse_int_from_text(query)
-            if count != "":
-                answers[key] = count
-        elif key == "kids_in_unit":
-            kids_match = re.search(r"(\d+)\s+(?:kid|kids|child|children)\b", lowered)
-            if kids_match:
-                answers[key] = kids_match.group(1)
-            elif re.search(r"\bno kids\b|\bnone\b", lowered):
-                answers[key] = "0"
-            elif "adult" not in lowered:
-                count = parse_int_from_text(query)
-                if count != "":
-                    answers[key] = count
-        elif key == "move_in_date":
-            answers[key] = extract_move_in_date(query)
-        elif key == "family_gross_income":
-            value = extract_income_value(query)
-            if value:
-                answers[key] = value
-        elif key == "occupation":
-            if is_plausible_occupation(normalized):
-                answers[key] = normalized
-        elif key == "resident_status":
-            value = extract_resident_status(query)
-            if value:
-                answers[key] = value
-        elif key == "working_with_agent":
-            agent_answer = extract_agent_answer(query)
-            if agent_answer in ("Yes", "No"):
-                answers[key] = agent_answer
-        elif key == "phone_number":
-            answers[key] = extract_phone_number(query) or normalized
-        return {k: v for k, v in answers.items() if compact(v)}
+
+    if len(missing_keys) > 1 and "," in normalized:
         parts = [part.strip() for part in normalized.split(",") if part.strip()]
         parsers = {
             "move_in_date": extract_move_in_date,
@@ -1538,6 +1501,45 @@ def parse_missing_fields(missing_keys: List[str], query: str) -> Dict[str, str]:
             value = compact(parser(parts[index]))
             if value:
                 answers[key] = value
+        return {k: v for k, v in answers.items() if compact(v)}
+
+    key = missing_keys[0]
+    if key in ("people_on_lease", "adults_in_unit"):
+        if looks_like_date_only_answer(query):
+            count = ""
+        else:
+            count = parse_people_count(query) if key == "people_on_lease" else parse_int_from_text(query)
+        if count != "":
+            answers[key] = count
+    elif key == "kids_in_unit":
+        kids_match = re.search(r"(\d+)\s+(?:kid|kids|child|children)\b", lowered)
+        if kids_match:
+            answers[key] = kids_match.group(1)
+        elif re.search(r"\bno kids\b|\bnone\b", lowered):
+            answers[key] = "0"
+        elif "adult" not in lowered:
+            count = parse_int_from_text(query)
+            if count != "":
+                answers[key] = count
+    elif key == "move_in_date":
+        answers[key] = extract_move_in_date(query)
+    elif key == "family_gross_income":
+        value = extract_income_value(query)
+        if value:
+            answers[key] = value
+    elif key == "occupation":
+        if is_plausible_occupation(normalized):
+            answers[key] = normalized
+    elif key == "resident_status":
+        value = extract_resident_status(query)
+        if value:
+            answers[key] = value
+    elif key == "working_with_agent":
+        agent_answer = extract_agent_answer(query)
+        if agent_answer in ("Yes", "No"):
+            answers[key] = agent_answer
+    elif key == "phone_number":
+        answers[key] = extract_phone_number(query) or normalized
 
     return {k: v for k, v in answers.items() if compact(v)}
 
@@ -2019,7 +2021,13 @@ def handle_post_qualification_booking(
     if not calendly_url:
         return "I can help you move forward on that. Nabeel’s booking link is not configured yet, but I can still note your interest."
 
-    matches = rank_drafts(query, drafts, limit=3)
+    last_shared_keys = [key for key in session.get("last_shared_listing_keys", []) if key]
+    if last_shared_keys:
+        visible = {compact(draft.get("ListingKey")): draft for draft in customer_visible_drafts(drafts)}
+        matches = [visible[key] for key in last_shared_keys if key in visible]
+    else:
+        search_query = compact(session.get("search_query"))
+        matches = rank_drafts(search_query, drafts, limit=3) if search_query else []
     ready_matches = shortlist_for_booking(matches)
     if ready_matches:
         if len(ready_matches) == 1:
@@ -2806,13 +2814,14 @@ def extract_all_qualification_fields(
     def missing_keys() -> List[str]:
         return [key for key in QUALIFICATION_FIELD_KEYS if not compact(answers.get(key))]
 
+    missing_before = missing_keys()
     batch_index = min(first_incomplete_batch_index(answers), max(len(QUALIFICATION_BATCHES) - 1, 0))
 
     if batch_index < len(QUALIFICATION_BATCHES):
         parsed = parse_batch_answers(batch_index, query)
-        merge_parsed_answers(answers, parsed, query, allowed_keys=missing_keys())
+        merge_parsed_answers(answers, parsed, query, allowed_keys=missing_before)
 
-    merge_parsed_answers(answers, parse_household_from_text(query), query, allowed_keys=missing_keys())
+    merge_parsed_answers(answers, parse_household_from_text(query), query, allowed_keys=missing_before)
 
     move_in = extract_move_in_date(query)
     if move_in:
@@ -2820,9 +2829,12 @@ def extract_all_qualification_fields(
 
     missing = missing_keys()
     if missing:
-        for key, value in parse_missing_fields(missing, query).items():
-            if compact(value):
-                merge_parsed_answers(answers, {key: value}, query, allowed_keys=[key])
+        progressed = bool(missing_before) and missing[0] != missing_before[0]
+        if not progressed:
+            target_keys = missing if "," in normalize_whitespace(query) else [missing[0]]
+            for key, value in parse_missing_fields(target_keys, query).items():
+                if compact(value):
+                    merge_parsed_answers(answers, {key: value}, query, allowed_keys=[key])
 
     missing = missing_keys()
     if openai_api_key and missing:

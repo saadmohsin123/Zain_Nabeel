@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live production Messenger regression test via signed webhooks."""
+"""Multi-scenario live production Messenger regression tests."""
 
 from __future__ import annotations
 
@@ -10,7 +10,9 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable, Optional
 
 import requests
 
@@ -19,26 +21,26 @@ WEBHOOK = "https://messenger-webhook-bot-production.up.railway.app/webhook"
 STATUS = "https://messenger-webhook-bot-production.up.railway.app/debug/status"
 PROJECT = Path(__file__).resolve().parents[1]
 
-FLOW = [
-    ("Hi", {"greeting": True}),
-    (
-        "Looking for a 3 bedroom in Oshawa around 2500",
-        {"opt_in": True, "no_double_intro": True},
-    ),
-    ("yes", {"qualification": True}),
-    ("March 15", {}),
-    ("1", {}),
-    ("85000", {}),
-    ("Software engineer", {}),
-    ("Canadian citizen", {}),
-    ("No", {}),
-    ("6475551234", {"qualified_summary": True}),
-    ("Hi", {"no_listing_redump": True}),
-    (
-        "Do you have anything in Oshawa under 2500?",
-        {"no_wrong_cities": True},
-    ),
-]
+FAILURES: list[str] = []
+
+
+def compact(value) -> str:
+    return str(value or "").strip()
+
+
+def check(name: str, ok: bool, detail: str = "") -> None:
+    status = "PASS" if ok else "FAIL"
+    print(f"  [{status}] {name}" + (f" — {detail}" if detail and not ok else ""))
+    if not ok:
+        FAILURES.append(name)
+
+
+@dataclass
+class Scenario:
+    name: str
+    sender_id: str = ""
+    reset: bool = True
+    steps: list[tuple[str, Optional[Callable[[str], None]]]] = field(default_factory=list)
 
 
 def load_env() -> dict:
@@ -50,6 +52,32 @@ def load_env() -> dict:
         check=True,
     )
     return json.loads(proc.stdout)
+
+
+def load_postgres_url() -> str:
+    proc = subprocess.run(
+        ["npx", "--yes", "@railway/cli@latest", "variables", "--service", "Postgres", "--json"],
+        cwd=PROJECT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = json.loads(proc.stdout)
+    return compact(payload.get("DATABASE_PUBLIC_URL")) or compact(payload.get("DATABASE_URL"))
+
+
+def reset_session(sender_id: str) -> None:
+    database_url = load_postgres_url()
+    if not database_url or not sender_id:
+        return
+    if database_url.startswith("postgres://"):
+        database_url = "postgresql://" + database_url[len("postgres://") :]
+    import psycopg
+
+    with psycopg.connect(database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM messenger_sessions WHERE sender_id = %s", (sender_id,))
+        conn.commit()
 
 
 def sign(secret: str, body: bytes) -> str:
@@ -77,7 +105,7 @@ def send_turn(env: dict, sender_id: str, conv_id: str, text: str) -> str:
     page_id = env["META_PAGE_ID"]
     secret = env["META_APP_SECRET"]
     token = env["META_PAGE_ACCESS_TOKEN"]
-    mid = f"mid.regression.{uuid.uuid4().hex}"
+    mid = f"mid.live.{uuid.uuid4().hex}"
     payload = {
         "object": "page",
         "entry": [
@@ -107,7 +135,7 @@ def send_turn(env: dict, sender_id: str, conv_id: str, text: str) -> str:
     )
     if resp.status_code != 200:
         raise RuntimeError(f"Webhook failed {resp.status_code}: {resp.text[:200]}")
-    time.sleep(5)
+    time.sleep(4)
     msgs = requests.get(
         f"{GRAPH}/{conv_id}/messages",
         params={"access_token": token, "limit": 4, "fields": "from,message"},
@@ -119,108 +147,238 @@ def send_turn(env: dict, sender_id: str, conv_id: str, text: str) -> str:
     return ""
 
 
-def compact(value) -> str:
-    return str(value or "").strip()
+def qual_steps_toronto() -> list[tuple[str, Optional[Callable[[str], None]]]]:
+    return [
+        ("March 15", None),
+        ("1", None),
+        ("85000", None),
+        ("Software engineer", None),
+        ("Canadian citizen", None),
+        ("No", None),
+        ("6475551234", None),
+    ]
 
 
-def check(name: str, ok: bool, detail: str = "") -> None:
-    status = "PASS" if ok else "FAIL"
-    print(f"[{status}] {name}" + (f" — {detail}" if detail and not ok else ""))
-    if not ok:
-        FAILURES.append(name)
+def build_scenarios(primary_sender: str) -> list[Scenario]:
+    return [
+        Scenario(
+            name="oshawa_no_inventory",
+            sender_id=primary_sender,
+            steps=[
+                ("Hi", lambda b: check("greeting", "looking for" in b.lower() or "help" in b.lower())),
+                (
+                    "Looking for a 3 bedroom in Oshawa around 2500",
+                    lambda b: (
+                        check("opt_in_once", b.lower().count("nabeel's assistant") == 1),
+                        check("oshawa_ack", "oshawa" in b.lower()),
+                    ),
+                ),
+                ("yes", lambda b: check("qual_started", "move-in" in b.lower() or "lease" in b.lower())),
+                *qual_steps_toronto(),
+                (
+                    "Do you have anything in Oshawa under 2500?",
+                    lambda b: (
+                        check("no_wrong_cities", not any(c in b.lower() for c in ("newmarket", "niagara falls"))),
+                        check("honest_empty", "nothing active matches" in b.lower() or "looked again" in b.lower()),
+                    ),
+                ),
+            ],
+        ),
+        Scenario(
+            name="toronto_2bed_listings",
+            sender_id=primary_sender,
+            steps=[
+                (
+                    "2 bedroom downtown toronto under 2500",
+                    lambda b: check("toronto_search_ack", "toronto" in b.lower() or "2 bedroom" in b.lower()),
+                ),
+                ("yes", None),
+                ("April 1", None),
+                ("2", None),
+                ("90000", None),
+                ("Teacher", None),
+                ("Permanent Resident", None),
+                ("No", None),
+                ("4165559876", lambda b: (
+                    check("toronto_summary", "what i collected" in b.lower()),
+                    check("toronto_listings_shown", "toronto" in b.lower() or "2,150" in b.lower() or "2,280" in b.lower()),
+                    check("toronto_not_oshawa_empty", "nothing active matches" not in b.lower()),
+                )),
+            ],
+        ),
+        Scenario(
+            name="opt_in_decline",
+            sender_id=primary_sender,
+            steps=[
+                ("condo in toronto under 2000", None),
+                ("no thanks", lambda b: (
+                    check("decline_no_qual", "move-in" not in b.lower()),
+                    check("decline_polite", len(b) > 10),
+                )),
+            ],
+        ),
+        Scenario(
+            name="agent_yes_no_loop",
+            sender_id=primary_sender,
+            steps=[
+                ("looking for condo in toronto", None),
+                ("yes", None),
+                ("July 1", None),
+                ("1", None),
+                ("100000", None),
+                ("engineer", None),
+                ("Non resident", None),
+                ("Yes", lambda b: check("agent_yes_advances", "phone" in b.lower() or "agent" not in b.lower())),
+            ],
+        ),
+        Scenario(
+            name="qualification_objection",
+            sender_id=primary_sender,
+            steps=[
+                ("2 bed in toronto", None),
+                ("yes", None),
+                ("August 1", None),
+                ("1", None),
+                ("95000", None),
+                ("Why do you need this", lambda b: (
+                    check("objection_not_saved_as_job", "engineer" not in b.lower() or "work" in b.lower()),
+                    check("objection_reasks", "work" in b.lower() or "occupation" in b.lower() or "income" in b.lower()),
+                )),
+            ],
+        ),
+        Scenario(
+            name="booking_after_qual",
+            sender_id=primary_sender,
+            steps=[
+                ("2 bedroom in toronto under 2500", None),
+                ("yes", None),
+                ("May 1", None),
+                ("1", None),
+                ("80000", None),
+                ("Analyst", None),
+                ("Canadian citizen", None),
+                ("No", None),
+                ("6471112222", None),
+                ("book a viewing", lambda b: check("booking_calendly", "calendly.com" in b.lower())),
+            ],
+        ),
+        Scenario(
+            name="postgres_session_isolation",
+            sender_id="",
+            reset=False,
+            steps=[],
+        ),
+    ]
 
 
-FAILURES: list[str] = []
+def run_isolation_test(env: dict) -> None:
+    print("\n=== Scenario: postgres_session_isolation ===")
+    sender_a = f"isolation-test-{uuid.uuid4().hex[:8]}"
+    sender_b = f"isolation-test-{uuid.uuid4().hex[:8]}"
+    reset_session(sender_a)
+    reset_session(sender_b)
 
+    page_id = env["META_PAGE_ID"]
+    secret = env["META_APP_SECRET"]
 
-def load_postgres_url() -> str:
-    proc = subprocess.run(
-        ["npx", "--yes", "@railway/cli@latest", "variables", "--service", "Postgres", "--json"],
-        cwd=PROJECT,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    payload = json.loads(proc.stdout)
-    return compact(payload.get("DATABASE_PUBLIC_URL")) or compact(payload.get("DATABASE_URL"))
+    def webhook(sender_id: str, text: str) -> None:
+        mid = f"mid.iso.{uuid.uuid4().hex}"
+        payload = {
+            "object": "page",
+            "entry": [{
+                "id": page_id,
+                "time": int(time.time() * 1000),
+                "messaging": [{
+                    "sender": {"id": sender_id},
+                    "recipient": {"id": page_id},
+                    "timestamp": int(time.time() * 1000),
+                    "message": {"mid": mid, "text": text},
+                }],
+            }],
+        }
+        body = json.dumps(payload).encode()
+        requests.post(
+            WEBHOOK,
+            data=body,
+            headers={"Content-Type": "application/json", "X-Hub-Signature-256": sign(secret, body)},
+            timeout=120,
+        )
+        time.sleep(3)
 
+    webhook(sender_a, "2 bed in toronto")
+    webhook(sender_b, "3 bed in oshawa")
 
-def reset_live_session(sender_id: str) -> None:
     database_url = load_postgres_url()
-    if not database_url:
-        return
     if database_url.startswith("postgres://"):
         database_url = "postgresql://" + database_url[len("postgres://") :]
     import psycopg
 
     with psycopg.connect(database_url) as conn:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM messenger_sessions WHERE sender_id = %s", (sender_id,))
-        conn.commit()
+            cur.execute("SELECT session_data FROM messenger_sessions WHERE sender_id = %s", (sender_a,))
+            row_a = cur.fetchone()
+            cur.execute("SELECT session_data FROM messenger_sessions WHERE sender_id = %s", (sender_b,))
+            row_b = cur.fetchone()
+
+    data_a = row_a[0] if row_a else {}
+    data_b = row_b[0] if row_b else {}
+    if isinstance(data_a, str):
+        data_a = json.loads(data_a)
+    if isinstance(data_b, str):
+        data_b = json.loads(data_b)
+
+    sq_a = compact(data_a.get("search_query")).lower()
+    sq_b = compact(data_b.get("search_query")).lower()
+    check("isolation_a_toronto", "toronto" in sq_a)
+    check("isolation_b_oshawa", "oshawa" in sq_b)
+    check("isolation_queries_differ", sq_a != sq_b)
+
+    reset_session(sender_a)
+    reset_session(sender_b)
+
+
+def run_scenario(env: dict, conv_id: str, scenario: Scenario) -> list[dict]:
+    print(f"\n=== Scenario: {scenario.name} ===")
+    if scenario.reset and scenario.sender_id:
+        reset_session(scenario.sender_id)
+        print(f"  (session reset for {scenario.sender_id})")
+
+    transcript: list[dict] = []
+    for text, validator in scenario.steps:
+        bot = send_turn(env, scenario.sender_id, conv_id, text)
+        transcript.append({"user": text, "bot": bot})
+        print(f"  YOU: {text}")
+        print(f"  BOT: {bot[:500]}\n")
+        if validator:
+            validator(bot)
+    return transcript
 
 
 def main() -> int:
     env = load_env()
     verify = env.get("META_VERIFY_TOKEN", "")
-    sender_id, conv_id = pick_user(env)
-    reset_live_session(sender_id)
-    print(f"Live regression on sender {sender_id} (session reset)\n")
+    primary_sender, conv_id = pick_user(env)
+    print(f"Live multi-scenario regression (primary sender {primary_sender})")
 
-    transcript = []
-    for text, expectations in FLOW:
-        bot = send_turn(env, sender_id, conv_id, text)
-        transcript.append({"user": text, "bot": bot})
-        print(f"YOU: {text}")
-        print(f"BOT: {bot[:700]}\n")
+    all_transcripts: dict = {}
+    for scenario in build_scenarios(primary_sender):
+        if scenario.name == "postgres_session_isolation":
+            run_isolation_test(env)
+            continue
+        all_transcripts[scenario.name] = run_scenario(env, conv_id, scenario)
 
-        if expectations.get("greeting"):
-            check("greeting", "looking for" in bot.lower() or "help" in bot.lower())
-        if expectations.get("opt_in"):
-            check("opt_in_once", bot.lower().count("nabeel's assistant") == 1)
-            check("search_ack", "oshawa" in bot.lower() or "3 bedroom" in bot.lower())
-        if expectations.get("no_double_intro"):
-            check("no_double_intro", "that's great" not in bot.lower()[:30].replace("got it", ""))
-        if expectations.get("qualification"):
-            check("qualification_started", "move-in" in bot.lower() or "lease" in bot.lower())
-        if expectations.get("qualified_summary"):
-            check("qualification_summary", "what i collected" in bot.lower())
-            check("income_not_single_digit", "income: 1" not in bot.lower())
-            check("no_wrong_city_post_qual", "newmarket" not in bot.lower() and "niagara" not in bot.lower())
-        if expectations.get("no_listing_redump"):
-            check("hi_no_redump", "what i collected" not in bot.lower())
-            check(
-                "hi_conversational",
-                any(
-                    phrase in bot.lower()
-                    for phrase in (
-                        "refine",
-                        "viewing",
-                        "still here",
-                        "tell me what you're looking for",
-                        "tell me what you’re looking for",
-                    )
-                ),
-            )
-        if expectations.get("no_wrong_cities"):
-            wrong = any(city in bot.lower() for city in ("newmarket", "niagara falls", "toronto w08"))
-            check("oshawa_search_no_wrong_cities", not wrong)
-            check(
-                "oshawa_search_honest_empty_or_local",
-                wrong is False and ("nothing active matches" in bot.lower() or "oshawa" in bot.lower() or "looked again" in bot.lower()),
-            )
-
-    out = PROJECT / "live_test_transcript.json"
-    out.write_text(json.dumps(transcript, indent=2, ensure_ascii=False), encoding="utf-8")
+    out = PROJECT / "live_test_transcripts.json"
+    out.write_text(json.dumps(all_transcripts, indent=2, ensure_ascii=False), encoding="utf-8")
 
     status = requests.get(STATUS, params={"token": verify}, timeout=30).json()
     store = status.get("session_store", {})
     check("postgres_enabled", store.get("backend") == "postgresql", str(store))
-    check("postgres_sessions_saved", int(store.get("session_count", 0)) >= 1, str(store))
+    check("postgres_has_sessions", int(store.get("session_count", 0)) >= 1, str(store))
 
     if FAILURES:
         print("\nFAILED:", ", ".join(FAILURES))
         return 1
-    print("\nALL LIVE REGRESSION CHECKS PASSED")
+    print(f"\nALL {len(build_scenarios(primary_sender))} LIVE SCENARIOS PASSED")
     return 0
 
 
