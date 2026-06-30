@@ -184,6 +184,15 @@ class AspectTest:
         self.check("household_adults_saved", household.get("adults_in_unit") == "2")
         self.check("household_kids_saved", household.get("kids_in_unit") == "0")
 
+        self.reply("objection-user", "2 bed toronto")
+        self.reply("objection-user", "yes")
+        self.reply("objection-user", "July 1")
+        self.reply("objection-user", "1")
+        self.reply("objection-user", "90000")
+        r_obj = self.reply("objection-user", "Why do you need this")
+        self.check("objection_explained", "fair question" in r_obj.lower() or "match" in r_obj.lower())
+        self.check("objection_reasks", "work" in r_obj.lower() or "occupation" in r_obj.lower())
+
     def run_booking_tests(self) -> None:
         sender = "booking-user"
         self.reply(sender, "2 bedroom downtown toronto under 2500")

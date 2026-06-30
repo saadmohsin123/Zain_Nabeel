@@ -688,6 +688,13 @@ def replies_are_similar(left: str, right: str) -> bool:
     return left_norm == right_norm or left_norm in right_norm or right_norm in left_norm
 
 
+def qualification_objection_reply(answers: dict, missing_key: str) -> str:
+    return (
+        "Fair question — we only ask so we can match you with the right rentals. "
+        + build_missing_field_prompt([missing_key], answers)
+    )
+
+
 def looks_like_user_pushback(text: str) -> bool:
     lowered = normalize_whitespace(text).lower()
     if not lowered:
@@ -1033,8 +1040,21 @@ def apply_qualification_turn(
     openai_api_key: str,
     openai_model: str,
 ) -> str:
+    answers = session.setdefault("answers", {})
+    if session.get("active") and looks_like_user_pushback(query):
+        missing = first_missing_qualification_key(answers)
+        if missing:
+            return guard_against_repeat_reply(
+                qualification_objection_reply(answers, missing),
+                session,
+                answers,
+            )
     extract_all_qualification_fields(session, query, openai_api_key, openai_model)
-    return build_next_qualification_reply(session, session.get("answers", {}), drafts, listing_doc_url)
+    return guard_against_repeat_reply(
+        build_next_qualification_reply(session, session.get("answers", {}), drafts, listing_doc_url),
+        session,
+        session.get("answers", {}),
+    )
 
 
 def qualification_turn_reply(
@@ -1987,40 +2007,6 @@ def generate_listing_detail_reply(
     agent_name: str,
     position: Optional[int] = None,
 ) -> str:
-    listing_data = listing_context(listing)
-    listing_data["list_position"] = position
-    system_prompt = (
-        "You're Nabeel's assistant at Durham New Homes. "
-        "Answer using ONLY listing_data for the listing the user asked about. "
-        "2-3 short sentences. Don't mention other listings. Don't invent details."
-    )
-    user_prompt = {
-        "user_message": query,
-        "agent_name": agent_name,
-        "listing_data": listing_data,
-    }
-    if api_key:
-        try:
-            payload = {
-                "model": model,
-                "input": [
-                    {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
-                    {"role": "user", "content": [{"type": "input_text", "text": json.dumps(user_prompt, ensure_ascii=False)}]},
-                ],
-                "max_output_tokens": 220,
-            }
-            resp = requests.post(
-                OPENAI_RESPONSES_API,
-                headers=build_openai_headers(api_key),
-                json=payload,
-                timeout=int(os.getenv("OPENAI_REQUEST_TIMEOUT_SECONDS", "20") or "20"),
-            )
-            resp.raise_for_status()
-            reply = compact(extract_response_text(resp.json()))
-            if reply:
-                return reply
-        except Exception as exc:
-            print(f"AI listing detail failed: {exc}")
     return format_listing_detail_short(listing, position=position)
 
 
@@ -3811,29 +3797,9 @@ def build_qualified_reply(
     if listing_reply:
         return listing_reply
 
-    if use_ai and openai_api_key:
-        matches = rank_drafts(query, drafts, limit=3)
-        allow_booking = looks_like_booking_request(query) and bool(session.get("last_shared_listing_keys"))
-        try:
-            ai_reply = generate_ai_reply(
-                query,
-                matches,
-                listing_doc_url,
-                calendly_url,
-                agent_name,
-                openai_api_key,
-                openai_model,
-                qualified=True,
-                allow_booking=allow_booking,
-            )
-            if ai_reply:
-                return ai_reply
-        except Exception as exc:
-            print(f"AI qualified reply failed: {exc}")
-
     return (
-        "Tell me the address, ListingKey, or price of the unit you want to know more about, "
-        "or say if you'd like to see other options."
+        "Tell me the address, ListingKey, or what you'd like to refine — "
+        "area, budget, or bedrooms — and I'll pull matching options."
     )
 
 
@@ -3854,6 +3820,20 @@ def _reply_deterministic(
     control_reply = handle_messaging_controls(session, query)
     if control_reply is not None:
         return save_session_reply(lead_state_path, state, session, control_reply)
+
+    if contains_profanity(query) and (
+        session.get("active") or qualification_in_progress(session) or session.get("qualified")
+    ):
+        if session.get("qualified"):
+            reply = (
+                "I'm here to help with your rental search. "
+                "Tell me the area, budget, or unit type you'd like to refine."
+            )
+        else:
+            if not session.get("active") and qualification_in_progress(session):
+                begin_structured_qualification(session, query)
+            reply = profanity_safe_qualification_reply(session)
+        return save_session_reply(lead_state_path, state, session, reply)
 
     extraction_key = openai_api_key if use_ai else ""
 
@@ -3942,11 +3922,20 @@ def _reply_deterministic(
         return save_session_reply(lead_state_path, state, session, reply)
 
     if wants_listing_help(query) or should_start_qualification(query, calendly_url):
-        session["search_query"] = compact(query)
-        session["awaiting_opt_in"] = True
-        session["active"] = False
-        intro = qualification_opt_in_prompt(agent_name, describe_search_preferences(query))
-        return save_session_reply(lead_state_path, state, session, intro)
+        if should_offer_search_opt_in(session, query, calendly_url):
+            intro = build_search_opt_in_reply(session, query, agent_name)
+            return save_session_reply(lead_state_path, state, session, intro)
+        if qualification_in_progress(session) or has_partial_qualification(session):
+            begin_structured_qualification(session, query)
+            reply = apply_qualification_turn(
+                session,
+                query,
+                drafts,
+                listing_doc_url,
+                openai_api_key=extraction_key,
+                openai_model=openai_model,
+            )
+            return save_session_reply(lead_state_path, state, session, reply)
 
     reply = (
         "I can help you find rentals. Tell me the area, budget, and unit type you're looking for."
@@ -3997,35 +3986,18 @@ def build_reply(
     openai_model: str = DEFAULT_OPENAI_MODEL,
     use_ai: bool = True,
 ) -> str:
-    def _dispatch(session: dict, state: dict) -> str:
-        if use_ai and openai_api_key:
-            return _unified_ai_turn(
-                session,
-                state,
-                query,
-                lead_state_path,
-                agent_name,
-                calendly_url,
-                drafts,
-                listing_doc_url,
-                openai_api_key,
-                openai_model,
-            )
-        return _reply_deterministic(
-            session,
-            state,
-            query,
-            lead_state_path,
-            drafts,
-            listing_doc_url,
-            calendly_url,
-            agent_name,
-            openai_api_key,
-            openai_model,
-            use_ai,
-        )
-
-    return with_lead_session(sender_id, lead_state_path, _dispatch)
+    return build_reply_deterministic(
+        sender_id,
+        query,
+        drafts,
+        listing_doc_url,
+        calendly_url=calendly_url,
+        agent_name=agent_name,
+        lead_state_path=lead_state_path,
+        openai_api_key=openai_api_key,
+        openai_model=openai_model,
+        use_ai=use_ai,
+    )
 
 
 def current_drafts(config: MessengerConfig) -> List[dict]:

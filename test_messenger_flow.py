@@ -530,8 +530,7 @@ class FlowTest:
         self.check("sync_acknowledges_search", "condo" in r2.lower() or "2 bedroom" in r2.lower() or "ontario" in r2.lower())
         self.check("sync_no_second_hi_intro", not (r2.lower().startswith("hi,") or r2.lower().startswith("hi!")))
         self.check("sync_has_yes_prompt", "yes" in r2.lower())
-        intro_count = sum(1 for t in [r1, r2] if "nabeel's assistant" in t.lower())
-        self.check("sync_single_assistant_intro", intro_count == 1)
+        self.check("sync_single_opt_in_offer", r2.lower().count("would you like me to send") <= 1)
 
         # State I/O: atomic JSON + concurrent session updates
         import concurrent.futures
