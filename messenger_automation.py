@@ -601,6 +601,9 @@ OUTBOUND_PROFANITY_MARKERS = (
     "chut",
     "asshole",
     "bastard",
+    "tameez",
+    "bsdk",
+    "bkl",
 )
 
 
@@ -616,6 +619,27 @@ def sanitize_bot_reply(reply: str) -> str:
     if not cleaned or not contains_profanity(cleaned):
         return cleaned
     return "I'm here to help with rentals. Tell me the area, budget, or unit type you're looking for."
+
+
+def has_partial_qualification(session: dict) -> bool:
+    answers = session.get("answers", {}) if isinstance(session.get("answers"), dict) else {}
+    return any(compact(answers.get(key)) for key in QUALIFICATION_FIELD_KEYS)
+
+
+def should_offer_search_opt_in(session: dict, query: str, calendly_url: str = "") -> bool:
+    if session.get("qualified") or session.get("active") or session.get("messaging_paused"):
+        return False
+    if has_partial_qualification(session) or qualification_in_progress(session):
+        return False
+    return wants_listing_help(query) or should_start_qualification(query, calendly_url)
+
+
+def profanity_safe_qualification_reply(session: dict) -> str:
+    answers = session.setdefault("answers", {})
+    missing = first_missing_qualification_key(answers)
+    if missing:
+        return build_missing_field_prompt([missing], answers)
+    return "I'm here to help with your rental search."
 
 
 def looks_like_messaging_opt_out(query: str) -> bool:
@@ -1090,6 +1114,17 @@ def finalize_conversation_reply(
     return save_session_reply(lead_state_path, state, session, fallback)
 
 def build_search_opt_in_reply(session: dict, query: str, agent_name: str) -> str:
+    if not should_offer_search_opt_in(session, query):
+        if qualification_in_progress(session) or has_partial_qualification(session):
+            begin_structured_qualification(session, query)
+            return profanity_safe_qualification_reply(session)
+        return local_conversational_fallback(
+            "new",
+            query,
+            agent_name,
+            last_assistant_message=compact(session.get("last_prompt")),
+            search_query=compact(session.get("search_query")),
+        )
     session["search_query"] = compact(query)
     session["awaiting_opt_in"] = True
     session["active"] = False
@@ -2162,7 +2197,8 @@ def handle_qualified_listing_search(
     use_ai: bool = True,
 ) -> Optional[str]:
     search_query = compact(query)
-    should_search = False
+    refinement = looks_like_search_refinement(query)
+    should_search = refinement or wants_listing_refresh(query)
     if looks_like_listing_detail_request(query) or resolve_listing_reference(query, session, drafts):
         return None
     if use_ai and openai_api_key:
@@ -2178,14 +2214,19 @@ def handle_qualified_listing_search(
             should_search = True
             search_query = compact(interpretation.get("search_query")) or search_query
         elif intent in ("booking", "general_question", "other"):
-            return None
-        else:
-            should_search = wants_listing_refresh(query) or looks_like_search_refinement(query)
-    else:
-        should_search = wants_listing_refresh(query) or looks_like_search_refinement(query)
+            if not refinement:
+                return None
+            should_search = True
+        elif not should_search:
+            should_search = wants_listing_refresh(query) or refinement
+    elif not should_search:
+        should_search = wants_listing_refresh(query) or refinement
 
     if not should_search:
         return None
+
+    if refinement:
+        search_query = merge_search_queries(session, search_query)
 
     listing_reply = build_qualified_listing_reply(session, search_query, drafts)
     return listing_reply
@@ -2308,9 +2349,10 @@ def _maybe_handle_qualification_locked(
                 session["step"] = 0
                 session["batch"] = 0
                 session["qualified"] = False
-                session["answers"] = {}
-                session["raw_answers"] = {}
-                session["last_shared_listing_keys"] = []
+                if not has_partial_qualification(session):
+                    session["answers"] = {}
+                    session["raw_answers"] = {}
+                    session["last_shared_listing_keys"] = []
                 updated_search = compact(interpretation.get("updated_search_query"))
                 if updated_search:
                     session["search_query"] = updated_search
@@ -3045,7 +3087,23 @@ def compute_conversation_directive(
                 "Respond naturally. Mention you're Nabeel's assistant and invite them to say yes when ready for listing help."
             )
 
-    elif wants_listing_help(query) or should_start_qualification(query, calendly_url):
+    elif qualification_in_progress(session) and not session.get("qualified"):
+        ai_stage = "QUALIFYING"
+        if not session.get("active"):
+            session["active"] = True
+            session["awaiting_opt_in"] = False
+        next_field = first_missing_qualification_key(answers)
+        allowed_field_keys = [next_field] if next_field else []
+        if next_field:
+            prompt = step_labels[next_field].rstrip("?")
+            directive = (
+                f"Acknowledge briefly. Ask ONLY: {prompt}. "
+                f"Already collected (do NOT re-ask): {json.dumps(collected)}."
+            )
+        else:
+            directive = f"Brief transition. Already collected: {json.dumps(collected)}."
+
+    elif should_offer_search_opt_in(session, query, calendly_url):
         ai_stage = "AWAITING_OPT_IN"
         session["search_query"] = compact(query)
         session["awaiting_opt_in"] = True
@@ -3161,6 +3219,20 @@ def _unified_ai_turn(
     if control_reply is not None:
         return save_session_reply(lead_state_path, state, session, control_reply)
 
+    if contains_profanity(query) and (
+        session.get("active") or qualification_in_progress(session) or session.get("qualified")
+    ):
+        if session.get("qualified"):
+            reply = (
+                "I'm here to help with your rental search. "
+                "Tell me the area, budget, or unit type you'd like to refine."
+            )
+        else:
+            if not session.get("active") and qualification_in_progress(session):
+                begin_structured_qualification(session, query)
+            reply = profanity_safe_qualification_reply(session)
+        return save_session_reply(lead_state_path, state, session, reply)
+
     if session.get("awaiting_opt_in") and looks_like_affirmative(query):
         begin_structured_qualification(session, query)
         extract_qualification_only(session, query, openai_api_key, openai_model)
@@ -3222,11 +3294,7 @@ def _unified_ai_turn(
         reply = build_next_qualification_reply(session, answers, drafts, listing_doc_url)
         return save_session_reply(lead_state_path, state, session, reply)
 
-    if (
-        (wants_listing_help(query) or should_start_qualification(query, calendly_url))
-        and not session.get("qualified")
-        and not session.get("active")
-    ):
+    if should_offer_search_opt_in(session, query, calendly_url):
         reply = build_search_opt_in_reply(session, query, agent_name)
         return save_session_reply(lead_state_path, state, session, reply)
 
@@ -3253,6 +3321,15 @@ def _unified_ai_turn(
         reply = (
             "No problem — I only ask so I can match you with the right rentals. "
             "What would you like to share next?"
+        )
+        return save_session_reply(lead_state_path, state, session, reply)
+
+    if qualification_in_progress(session) and not session.get("qualified"):
+        if not session.get("active"):
+            begin_structured_qualification(session, query)
+        extract_qualification_only(session, query, openai_api_key, openai_model)
+        reply = build_next_qualification_reply(
+            session, session.get("answers", {}), drafts, listing_doc_url
         )
         return save_session_reply(lead_state_path, state, session, reply)
 
@@ -4238,11 +4315,17 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                 message_id = compact(message.get("mid"))
                 if not sender_id or not text:
                     continue
-                with _POLL_STATE_LOCK:
-                    seen = load_seen_message_ids(self.config.poll_state_path)
+
+                def _claim_message(seen: set[str]) -> bool:
                     if message_id and message_id in seen:
                         print(f"Skipping duplicate webhook message {message_id}")
-                        continue
+                        return False
+                    if message_id:
+                        seen.add(message_id)
+                    return True
+
+                if not with_poll_state(self.config.poll_state_path, _claim_message):
+                    continue
 
                 try:
                     send_sender_action(self.config.page_access_token, sender_id, "typing_on")
@@ -4262,19 +4345,9 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                     use_ai=True,
                 )
                 if not compact(reply):
-                    if message_id:
-                        with _POLL_STATE_LOCK:
-                            seen = load_seen_message_ids(self.config.poll_state_path)
-                            seen.add(message_id)
-                            save_seen_message_ids(self.config.poll_state_path, seen)
                     continue
                 try:
                     send_message(self.config.page_access_token, sender_id, reply)
-                    if message_id:
-                        with _POLL_STATE_LOCK:
-                            seen = load_seen_message_ids(self.config.poll_state_path)
-                            seen.add(message_id)
-                            save_seen_message_ids(self.config.poll_state_path, seen)
                     print(f"Replied to {sender_id}: {text[:80]}")
                 except Exception as exc:
                     print(f"Failed sending to {sender_id}: {exc}")

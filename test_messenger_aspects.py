@@ -246,6 +246,46 @@ class AspectTest:
             bot.sanitize_bot_reply("Bhen ke laude") == "I'm here to help with rentals. Tell me the area, budget, or unit type you're looking for.",
         )
 
+    def run_qual_resume_tests(self) -> None:
+        sender = "mid-qual-user"
+        self.reply(sender, "2 bed toronto")
+        self.reply(sender, "yes")
+        self.reply(sender, "July 1")
+        payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+        payload["sessions"][sender]["active"] = False
+        self.state_path.write_text(json.dumps(payload), encoding="utf-8")
+        r = self.reply(sender, "2 bedroom downtown toronto")
+        state = self.session(sender)
+        self.check("mid_qual_no_opt_in_restart", "just say yes" not in r.lower())
+        self.check("mid_qual_resumes_active", state.get("active") is True)
+        self.check(
+            "mid_qual_asks_next_field",
+            "people" in r.lower() or "lease" in r.lower() or "move" not in r.lower(),
+        )
+
+        profanity_sender = "profanity-qual-user"
+        self.reply(profanity_sender, "2 bed toronto")
+        self.reply(profanity_sender, "yes")
+        self.reply(profanity_sender, "July 1")
+        r_profanity = self.reply(profanity_sender, "laude tumhari tameez")
+        self.check("profanity_not_mirrored", not bot.contains_profanity(r_profanity))
+        self.check("profanity_stays_on_qual", "people" in r_profanity.lower() or "lease" in r_profanity.lower())
+
+    def run_qualified_refinement_tests(self) -> None:
+        sender = "refine-user"
+        self.reply(sender, "2 bedroom downtown toronto under 2500")
+        self.reply(sender, "yes")
+        self.reply(sender, "June 1")
+        self.reply(sender, "1")
+        self.reply(sender, "120000")
+        self.reply(sender, "engineer")
+        self.reply(sender, "PR")
+        self.reply(sender, "No")
+        self.reply(sender, "4165551234")
+        r = self.reply(sender, "I wanted 3 bedrooms")
+        self.check("refinement_returns_listings", "here are" in r.lower() or "nothing active" in r.lower())
+        self.check("refinement_no_commercial", "commercial" not in r.lower())
+
     def run_poll_state_tests(self) -> None:
         poll_path = Path(self.tmp.name) / "poll.json"
 
@@ -272,6 +312,8 @@ class AspectTest:
         self.run_security_tests()
         self.run_opt_out_tests()
         self.run_ai_path_tests()
+        self.run_qual_resume_tests()
+        self.run_qualified_refinement_tests()
         self.run_poll_state_tests()
         return self.failures
 
@@ -288,6 +330,7 @@ def main() -> int:
     print("PASSED: opt-in decline and edge cases")
     print("PASSED: booking and security checks")
     print("PASSED: AI path and poll state")
+    print("PASSED: qual resume, profanity, and post-qual refinement")
     return 0
 
 
