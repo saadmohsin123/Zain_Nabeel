@@ -2130,6 +2130,11 @@ def handle_post_qualification_booking(
                 f"Perfect. For {listing}, you can book a time with Nabeel here: {calendly_url} "
                 "When you book, please add the property address or ListingKey in the notes so we can prepare properly."
             )
+        if last_shared_keys:
+            return (
+                f"Perfect — pick a time here: {calendly_url}\n"
+                "Please add the address or ListingKey for the unit you want in the booking notes."
+            )
         options = "; ".join(summarize_shared_listing(match) for match in ready_matches[:3])
         return (
             "I can help with that. I found a few matching listings tied to your message: "
