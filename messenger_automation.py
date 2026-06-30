@@ -30,6 +30,8 @@ Optional env vars:
 - AGENT_NAME                  # default: Nabeel
 - POLL_CONVERSATIONS_SECONDS  # optional fallback when Meta does not deliver webhooks
 - POLL_STATE_FILE             # default: messenger_poll_state.json
+- DATABASE_URL                # optional Railway PostgreSQL for per-sender session storage
+- LEAD_STATE_FILE             # default: lead_intake_state.json (local dev fallback)
 - MESSENGER_PORT              # default: 8000
 """
 
@@ -54,6 +56,8 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import requests
+
+import session_store
 
 
 GRAPH_BASE = "https://graph.facebook.com/v20.0"
@@ -744,7 +748,7 @@ def save_session_reply(lead_state_path: Path, state: dict, session: dict, reply:
     if session.get("active"):
         reply = guard_against_repeat_reply(reply, session, session.get("answers", {}))
     session["last_prompt"] = reply
-    save_lead_state(lead_state_path, state)
+    persist_lead_state(lead_state_path, state)
     return reply
 
 
@@ -954,6 +958,18 @@ def atomic_write_json(path: Path, payload: dict | list) -> None:
 
 
 def with_lead_session(sender_id: str, lead_state_path: Path, fn):
+    if session_store.use_postgres_sessions():
+        session_store.ensure_schema()
+        with _LEAD_STATE_LOCK:
+            def _run() -> object:
+                session = session_store.load_session(sender_id)
+                state = {"sessions": {sender_id: session}}
+                result = fn(session, state)
+                session_store.save_session(sender_id, session)
+                return result
+
+            return session_store.with_sender_context(sender_id, _run)
+
     with _LEAD_STATE_LOCK:
         state = load_lead_state(lead_state_path)
         session = get_lead_session(state, sender_id)
@@ -961,6 +977,13 @@ def with_lead_session(sender_id: str, lead_state_path: Path, fn):
 
 
 def with_poll_state(poll_state_path: Path, fn):
+    if session_store.use_postgres_sessions():
+        with _POLL_STATE_LOCK:
+            seen = session_store.load_seen_message_ids()
+            result = fn(seen)
+            session_store.save_seen_message_ids(seen)
+            return result
+
     with _POLL_STATE_LOCK:
         seen = load_seen_message_ids(poll_state_path)
         result = fn(seen)
@@ -980,6 +1003,16 @@ def load_lead_state(path: Path) -> dict:
 
 def save_lead_state(path: Path, payload: dict):
     atomic_write_json(path, payload)
+
+
+def persist_lead_state(path: Path, state: dict, sender_id: str = "") -> None:
+    sid = sender_id or session_store.current_sender_id()
+    if session_store.use_postgres_sessions() and sid:
+        session = state.get("sessions", {}).get(sid)
+        if session is not None:
+            session_store.save_session(sid, session)
+        return
+    save_lead_state(path, state)
 
 
 def get_lead_session(state: dict, sender_id: str) -> dict:
@@ -2021,7 +2054,7 @@ def _maybe_handle_qualification_locked(
             openai_model=openai_model,
         )
         session["last_prompt"] = reply
-        save_lead_state(lead_state_path, state)
+        persist_lead_state(lead_state_path, state)
         return reply
 
     if session.get("active"):
@@ -2035,12 +2068,12 @@ def _maybe_handle_qualification_locked(
             openai_model=openai_model,
         )
         session["last_prompt"] = reply
-        save_lead_state(lead_state_path, state)
+        persist_lead_state(lead_state_path, state)
         return reply
 
     booking_reply = handle_post_qualification_booking(session, query, drafts, calendly_url)
     if booking_reply:
-        save_lead_state(lead_state_path, state)
+        persist_lead_state(lead_state_path, state)
         return booking_reply
 
     if session.get("qualified"):
@@ -2053,7 +2086,7 @@ def _maybe_handle_qualification_locked(
             use_ai=use_ai,
         )
         if listing_reply:
-            save_lead_state(lead_state_path, state)
+            persist_lead_state(lead_state_path, state)
             return listing_reply
 
     if session.get("awaiting_opt_in"):
@@ -2080,7 +2113,7 @@ def _maybe_handle_qualification_locked(
                 if updated_search:
                     session["search_query"] = updated_search
                 session["last_prompt"] = QUALIFICATION_BATCHES[0]["prompt"]
-                save_lead_state(lead_state_path, state)
+                persist_lead_state(lead_state_path, state)
                 return QUALIFICATION_BATCHES[0]["prompt"]
 
             updated_search = compact(interpretation.get("updated_search_query"))
@@ -2090,7 +2123,7 @@ def _maybe_handle_qualification_locked(
             ai_reply = compact(interpretation.get("reply"))
             if ai_reply:
                 session["last_prompt"] = ai_reply
-                save_lead_state(lead_state_path, state)
+                persist_lead_state(lead_state_path, state)
                 return ai_reply
 
         if looks_like_affirmative(query):
@@ -2103,12 +2136,12 @@ def _maybe_handle_qualification_locked(
             session["raw_answers"] = {}
             session["last_shared_listing_keys"] = []
             session["last_prompt"] = QUALIFICATION_BATCHES[0]["prompt"]
-            save_lead_state(lead_state_path, state)
+            persist_lead_state(lead_state_path, state)
             return QUALIFICATION_BATCHES[0]["prompt"]
 
         if wants_listing_help(query):
             session["search_query"] = compact(query)
-            save_lead_state(lead_state_path, state)
+            persist_lead_state(lead_state_path, state)
             summary = describe_search_preferences(query)
             if summary:
                 return (
@@ -2117,7 +2150,7 @@ def _maybe_handle_qualification_locked(
                 )
             return "Got it. Just reply yes when you're ready and I'll ask a few quick questions."
 
-        save_lead_state(lead_state_path, state)
+        persist_lead_state(lead_state_path, state)
         return local_conversational_fallback(
             "awaiting_opt_in",
             query,
@@ -2138,7 +2171,7 @@ def _maybe_handle_qualification_locked(
         session["last_shared_listing_keys"] = []
         intro = qualification_opt_in_prompt(agent_name, describe_search_preferences(query))
         session["last_prompt"] = intro
-        save_lead_state(lead_state_path, state)
+        persist_lead_state(lead_state_path, state)
         return intro
 
     if (
@@ -2162,7 +2195,7 @@ def _maybe_handle_qualification_locked(
             session["last_shared_listing_keys"] = []
             intro = qualification_opt_in_prompt(agent_name, describe_search_preferences(search_query))
             session["last_prompt"] = intro
-            save_lead_state(lead_state_path, state)
+            persist_lead_state(lead_state_path, state)
             return intro
 
     return None
@@ -3865,8 +3898,11 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
             if token != self.config.verify_token:
                 self.send_error(403, "Forbidden")
                 return
-            with _POLL_STATE_LOCK:
-                seen = load_seen_message_ids(self.config.poll_state_path)
+            if session_store.use_postgres_sessions():
+                seen_count = len(session_store.load_seen_message_ids())
+            else:
+                with _POLL_STATE_LOCK:
+                    seen_count = len(load_seen_message_ids(self.config.poll_state_path))
             self._send_json(
                 200,
                 {
@@ -3884,7 +3920,8 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                     "page_id": self.config.page_id,
                     "poll_interval_seconds": getattr(self.server, "poll_interval_seconds", 0),
                     "poll_state_file": str(self.config.poll_state_path),
-                    "seen_message_count": len(seen),
+                    "seen_message_count": seen_count,
+                    "session_store": session_store.session_store_status(),
                 },
             )
             return
@@ -3899,8 +3936,11 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                 self.send_error(403, "Forbidden")
                 return
             try:
-                if reset_seen and self.config.poll_state_path.exists():
-                    self.config.poll_state_path.unlink()
+                if reset_seen:
+                    if session_store.use_postgres_sessions():
+                        session_store.clear_seen_message_ids()
+                    elif self.config.poll_state_path.exists():
+                        self.config.poll_state_path.unlink()
                 result = poll_conversations_once(
                     self.config,
                     initialize_only=initialize_only,
@@ -4195,6 +4235,12 @@ def main():
     args = parser.parse_args()
 
     config = make_config()
+
+    if session_store.use_postgres_sessions():
+        session_store.ensure_schema()
+        migrated = session_store.migrate_json_lead_state(config.lead_state_path)
+        if migrated:
+            print(f"Migrated {migrated} Messenger sessions from JSON to PostgreSQL")
 
     if args.command == "conversations":
         page_id = must_env("META_PAGE_ID")

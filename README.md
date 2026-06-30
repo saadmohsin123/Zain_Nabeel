@@ -40,6 +40,20 @@ POLL_STATE_FILE=messenger_poll_state.json
 
 Use the polling fallback only until the Meta app is Live/approved and normal webhook delivery is confirmed.
 
+### PostgreSQL session storage (recommended on Railway)
+
+Add a **PostgreSQL** plugin to the Railway project. Railway injects `DATABASE_URL` automatically. On startup the bot:
+
+- Creates `messenger_sessions` and `messenger_seen_messages` tables if missing
+- Stores each Messenger sender's qualification state as a JSON row (no whole-file races across replicas)
+- Migrates any existing `lead_intake_state.json` sessions once
+
+Local dev works without Postgres — sessions fall back to `LEAD_STATE_FILE` (default `lead_intake_state.json`).
+
+Check production storage at `GET /debug/status?token=YOUR_VERIFY_TOKEN` — look for `"session_store": {"backend": "postgresql", ...}`.
+
+Manual schema (optional): `sql/001_messenger_sessions.sql`
+
 ## Local run
 
 ```bash
