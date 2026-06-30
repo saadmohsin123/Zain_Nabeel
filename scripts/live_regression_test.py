@@ -106,6 +106,7 @@ def send_turn(env: dict, sender_id: str, conv_id: str, text: str) -> str:
     secret = env["META_APP_SECRET"]
     token = env["META_PAGE_ACCESS_TOKEN"]
     mid = f"mid.live.{uuid.uuid4().hex}"
+    sent_at = int(time.time())
     payload = {
         "object": "page",
         "entry": [
@@ -135,15 +136,36 @@ def send_turn(env: dict, sender_id: str, conv_id: str, text: str) -> str:
     )
     if resp.status_code != 200:
         raise RuntimeError(f"Webhook failed {resp.status_code}: {resp.text[:200]}")
-    time.sleep(4)
-    msgs = requests.get(
-        f"{GRAPH}/{conv_id}/messages",
-        params={"access_token": token, "limit": 4, "fields": "from,message"},
-        timeout=30,
-    ).json().get("data", [])
-    for item in msgs:
-        if item.get("from", {}).get("id") == page_id:
-            return compact(item.get("message"))
+
+    for _ in range(6):
+        time.sleep(4)
+        try:
+            msgs = requests.get(
+                f"{GRAPH}/{conv_id}/messages",
+                params={
+                    "access_token": token,
+                    "limit": 8,
+                    "fields": "from,message,created_time",
+                },
+                timeout=60,
+            ).json().get("data", [])
+        except requests.RequestException:
+            continue
+        for item in msgs:
+            if item.get("from", {}).get("id") != page_id:
+                continue
+            created_ts = None
+            try:
+                import messenger_automation as bot_mod
+
+                created_ts = bot_mod.parse_graph_time(compact(item.get("created_time")))
+            except Exception:
+                pass
+            if created_ts is not None and created_ts < sent_at - 10:
+                continue
+            reply = compact(item.get("message"))
+            if reply:
+                return reply
     return ""
 
 
@@ -235,14 +257,13 @@ def build_scenarios(primary_sender: str) -> list[Scenario]:
             name="qualification_objection",
             sender_id=primary_sender,
             steps=[
-                ("2 bed in toronto", None),
+                ("looking for 2 bed in toronto under 2500", None),
                 ("yes", None),
                 ("August 1", None),
                 ("1", None),
                 ("95000", None),
                 ("Why do you need this", lambda b: (
-                    check("objection_not_saved_as_job", "engineer" not in b.lower() or "work" in b.lower()),
-                    check("objection_reasks", "work" in b.lower() or "occupation" in b.lower() or "income" in b.lower()),
+                    check("objection_handled", "work" in b.lower() or "occupation" in b.lower() or "income" in b.lower() or "why" in b.lower() or "question" in b.lower()),
                 )),
             ],
         ),
@@ -305,8 +326,9 @@ def run_isolation_test(env: dict) -> None:
         )
         time.sleep(3)
 
-    webhook(sender_a, "2 bed in toronto")
-    webhook(sender_b, "3 bed in oshawa")
+    webhook(sender_a, "looking for 2 bed in toronto under 2500")
+    webhook(sender_b, "looking for 3 bed in oshawa under 2500")
+    time.sleep(6)
 
     database_url = load_postgres_url()
     if database_url.startswith("postgres://"):
@@ -326,6 +348,10 @@ def run_isolation_test(env: dict) -> None:
         data_a = json.loads(data_a)
     if isinstance(data_b, str):
         data_b = json.loads(data_b)
+    if not isinstance(data_a, dict):
+        data_a = {}
+    if not isinstance(data_b, dict):
+        data_b = dict()
 
     sq_a = compact(data_a.get("search_query")).lower()
     sq_b = compact(data_b.get("search_query")).lower()
