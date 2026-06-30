@@ -140,7 +140,7 @@ class FlowTest:
 
         r = reply_as("parse-user", "I want you to show me listings in Ontario")
         self.check("qualified_no_restart", "nabeel's assistant" not in r.lower())
-        self.check("qualified_search_reply", "looked again" in r.lower() or "active options" in r.lower())
+        self.check("qualified_search_reply", "looked again" in r.lower() or "active options" in r.lower() or "here are a few" in r.lower())
 
         # AI must not map income-batch replies into wrong fields
         from unittest.mock import patch
@@ -443,6 +443,37 @@ class FlowTest:
         ]
         matches = bot.rank_drafts("I wanted 3 bedrooms", three_bed_drafts, limit=3)
         self.check("three_bed_filter", len(matches) == 1 and matches[0].get("ListingKey") == "B3")
+
+        location_drafts = three_bed_drafts + [
+            {
+                "ListingKey": "O1",
+                "MarketplaceStatus": "Posted",
+                "ListingLifecycleStatus": "Active",
+                "TransactionType": "For Lease",
+                "MarketplaceTitle": "3 Bed | 2 Bath | Freehold | For Rent",
+                "Address": "100 King Street, Oshawa, ON",
+                "City": "Oshawa",
+                "BedroomsTotal": "3",
+                "MarketplacePrice": 2400,
+                "MarketplacePriceDisplay": "$2,400/month",
+            },
+            {
+                "ListingKey": "T1",
+                "MarketplaceStatus": "Posted",
+                "ListingLifecycleStatus": "Active",
+                "TransactionType": "For Lease",
+                "MarketplaceTitle": "3 Bed | 1 Bath | Freehold | For Rent",
+                "Address": "50 Bloor Street, Toronto, ON",
+                "City": "Toronto",
+                "BedroomsTotal": "3",
+                "MarketplacePrice": 1995,
+                "MarketplacePriceDisplay": "$1,995/month",
+            },
+        ]
+        oshawa_matches = bot.rank_drafts("3 bedroom in Oshawa under 2500", location_drafts, limit=3)
+        self.check("oshawa_city_price_filter", len(oshawa_matches) == 1 and oshawa_matches[0].get("ListingKey") == "O1")
+        no_match = bot.rank_drafts("3 bedroom in Oshawa under 2000", location_drafts, limit=3)
+        self.check("oshawa_no_match_when_over_budget", len(no_match) == 0)
 
         qualified_session = {
             "qualified": True,

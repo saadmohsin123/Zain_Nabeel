@@ -98,6 +98,26 @@ QUERY_STOPWORDS = {
     "what",
     "you",
 }
+SEARCH_CITIES = [
+    "niagara falls",
+    "richmond hill",
+    "north york",
+    "east york",
+    "scarborough",
+    "mississauga",
+    "newmarket",
+    "whitby",
+    "pickering",
+    "oakville",
+    "burlington",
+    "hamilton",
+    "brampton",
+    "markham",
+    "vaughan",
+    "oshawa",
+    "ajax",
+    "toronto",
+]
 QUALIFICATION_STEPS = [
     {"key": "move_in_date", "prompt": "What’s your expected move-in date?"},
     {"key": "people_on_lease", "prompt": "How many people will be on the lease?"},
@@ -367,6 +387,14 @@ def rank_drafts(query: str, drafts: List[dict], limit: int = 3) -> List[dict]:
             draft_beds = draft_bedroom_count(draft)
             if draft_beds == bed_target:
                 score += 20
+        city_target = constraints.get("city")
+        if city_target and draft_matches_city(draft, city_target):
+            score += 25
+        max_price = constraints.get("max_price")
+        if max_price is not None:
+            price = draft_listing_price(draft)
+            if price is not None and price <= max_price:
+                score += 10
         if score:
             scored.append((score, draft))
 
@@ -634,7 +662,86 @@ def extract_search_constraints(query: str) -> dict:
         constraints["pool"] = True
     if re.search(r"\bcommercial\b", normalized):
         constraints["exclude_commercial"] = True
+
+    for city in sorted(SEARCH_CITIES, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(city)}\b", normalized):
+            constraints["city"] = city
+            break
+
+    max_price = extract_max_price_from_query(normalized)
+    if max_price is not None:
+        constraints["max_price"] = max_price
+
     return constraints
+
+
+def extract_max_price_from_query(normalized: str) -> Optional[int]:
+    flexible = re.search(r"(?:around|about)\s*\$?\s*([\d,]{3,7})", normalized)
+    if flexible:
+        return int(int(flexible.group(1).replace(",", "")) * 1.15)
+
+    strict = re.search(
+        r"(?:under|below|less than|max(?:imum)?|up to)\s*\$?\s*([\d,]{3,7})",
+        normalized,
+    )
+    if strict:
+        return int(strict.group(1).replace(",", ""))
+
+    money = re.search(r"\$\s*([\d,]{3,7})", normalized)
+    if money:
+        return int(money.group(1).replace(",", ""))
+
+    bare = re.search(r"\b([\d,]{4,7})\b", normalized.replace(",", ""))
+    if bare and not re.search(r"\b\d\s*bed", normalized):
+        value = int(bare.group(1))
+        if value >= 800:
+            return value
+    return None
+
+
+def draft_listing_price(draft: dict) -> Optional[int]:
+    price = draft.get("MarketplacePrice")
+    if isinstance(price, (int, float)) and price > 0:
+        return int(price)
+    display = compact(draft.get("MarketplacePriceDisplay"))
+    match = re.search(r"([\d,]+)", display.replace(",", ""))
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def draft_matches_city(draft: dict, city: str) -> bool:
+    city = compact(city).lower()
+    if not city:
+        return True
+    haystack = " ".join(
+        [
+            compact(draft.get("City")),
+            compact(draft.get("Address")),
+            compact(draft.get("MarketplaceTitle")),
+        ]
+    ).lower()
+    return city in haystack
+
+
+def merge_search_queries(session: dict, query: str) -> str:
+    base = compact(session.get("search_query"))
+    current = compact(query)
+    if not base:
+        return current
+    if not current:
+        return base
+
+    base_constraints = extract_search_constraints(base)
+    current_constraints = extract_search_constraints(current)
+    parts = [current]
+    if base_constraints.get("city") and not current_constraints.get("city"):
+        parts.append(base_constraints["city"])
+    if base_constraints.get("bedrooms") and not current_constraints.get("bedrooms"):
+        parts.append(f"{base_constraints['bedrooms']} bedroom")
+    if base_constraints.get("max_price") and not current_constraints.get("max_price"):
+        parts.append(f"under {base_constraints['max_price']}")
+    return " ".join(parts)
 
 
 def draft_bedroom_count(draft: dict) -> Optional[int]:
@@ -666,6 +773,14 @@ def draft_matches_constraints(draft: dict, constraints: dict) -> bool:
             return False
     if constraints.get("pool"):
         if not re.search(r"\bpool\b", draft_text(draft)):
+            return False
+    city = constraints.get("city")
+    if city and not draft_matches_city(draft, city):
+        return False
+    max_price = constraints.get("max_price")
+    if max_price is not None:
+        price = draft_listing_price(draft)
+        if price is None or price > max_price:
             return False
     return True
 
@@ -1070,13 +1185,19 @@ def describe_search_preferences(query: str) -> str:
             break
     if "downtown" in normalized:
         parts.append("in downtown Toronto")
-    elif re.search(r"\bontario\b", normalized):
-        parts.append("in Ontario")
-    elif re.search(r"\btoronto\b", normalized):
-        parts.append("in Toronto")
-    price_match = re.search(r"\$?\s*(\d{3,6})", normalized.replace(",", ""))
-    if price_match:
-        parts.append(f"up to ${int(price_match.group(1)):,}")
+    else:
+        for city in sorted(SEARCH_CITIES, key=len, reverse=True):
+            if re.search(rf"\b{re.escape(city)}\b", normalized):
+                parts.append(f"in {city.title()}")
+                break
+        else:
+            if re.search(r"\bontario\b", normalized):
+                parts.append("in Ontario")
+            elif re.search(r"\btoronto\b", normalized):
+                parts.append("in Toronto")
+    max_price = extract_max_price_from_query(normalized)
+    if max_price is not None:
+        parts.append(f"up to ${max_price:,}")
     return " ".join(parts).strip()
 
 
@@ -2644,7 +2765,7 @@ def all_qualification_fields_complete(answers: dict) -> bool:
 
 
 def build_qualified_listing_reply(session: dict, search_query: str, drafts: List[dict]) -> str:
-    search_query = compact(search_query) or compact(session.get("search_query"))
+    search_query = merge_search_queries(session, compact(search_query) or compact(session.get("search_query")))
     session["search_query"] = search_query
     matches = rank_drafts(search_query, drafts, limit=3)
     session["last_shared_listing_keys"] = [
