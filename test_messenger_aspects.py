@@ -232,6 +232,20 @@ class AspectTest:
         self.check("ai_path_search_saved", "toronto" in state.get("search_query", "").lower())
         self.check("ai_path_no_double_hi", r.lower().count("nabeel's assistant") <= 1)
 
+    def run_opt_out_tests(self) -> None:
+        self.reply("pause-user", "looking for condo in toronto")
+        r = self.reply("pause-user", "Stop messaging me")
+        state = self.session("pause-user")
+        self.check("opt_out_pauses", state.get("messaging_paused") is True)
+        self.check("opt_out_ack", "stop" in r.lower())
+        r2 = self.reply("pause-user", "random follow up")
+        self.check("opt_out_suppresses", r2 == "")
+
+        self.check(
+            "profanity_sanitized",
+            bot.sanitize_bot_reply("Bhen ke laude") == "I'm here to help with rentals. Tell me the area, budget, or unit type you're looking for.",
+        )
+
     def run_poll_state_tests(self) -> None:
         poll_path = Path(self.tmp.name) / "poll.json"
 
@@ -256,6 +270,7 @@ class AspectTest:
         self.run_qual_edge_tests()
         self.run_booking_tests()
         self.run_security_tests()
+        self.run_opt_out_tests()
         self.run_ai_path_tests()
         self.run_poll_state_tests()
         return self.failures

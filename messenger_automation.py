@@ -161,6 +161,7 @@ DEFAULT_OPENAI_MODEL = "gpt-4.1"
 AI_MASTER_SYSTEM_PROMPT = """You are the Durham New Homes Messenger assistant for Nabeel's rental leads.
 
 ROLE: Sound human — warm, brief, natural. Usually 1-2 short sentences. Never robotic.
+TONE: Stay calm and professional even if the user is rude. Never use profanity, insults, or aggressive language.
 
 OUTPUT: Return JSON only (no markdown):
 {
@@ -587,6 +588,72 @@ def looks_like_small_talk(query: str) -> bool:
 
 
 STATIC_OPT_IN_NUDGE = "Whenever you're ready, just reply yes and I'll ask a few quick questions."
+OUTBOUND_PROFANITY_MARKERS = (
+    "fuck",
+    "shit",
+    "bitch",
+    "laude",
+    "lund",
+    "bhen",
+    "behen",
+    "madarchod",
+    "bhosd",
+    "chut",
+    "asshole",
+    "bastard",
+)
+
+
+def contains_profanity(text: str) -> bool:
+    lowered = normalize_whitespace(text).lower()
+    if not lowered:
+        return False
+    return any(marker in lowered for marker in OUTBOUND_PROFANITY_MARKERS)
+
+
+def sanitize_bot_reply(reply: str) -> str:
+    cleaned = compact(reply)
+    if not cleaned or not contains_profanity(cleaned):
+        return cleaned
+    return "I'm here to help with rentals. Tell me the area, budget, or unit type you're looking for."
+
+
+def looks_like_messaging_opt_out(query: str) -> bool:
+    lowered = normalize_whitespace(query).lower()
+    if not lowered:
+        return False
+    phrases = (
+        "stop messaging",
+        "stop message",
+        "stop texting",
+        "stop contacting",
+        "leave me alone",
+        "unsubscribe",
+        "don't message",
+        "dont message",
+        "do not message",
+        "no more messages",
+        "stop sending",
+    )
+    if any(phrase in lowered for phrase in phrases):
+        return True
+    return lowered in {"stop", "shut up", "shutup"}
+
+
+def handle_messaging_controls(session: dict, query: str) -> Optional[str]:
+    if looks_like_messaging_opt_out(query):
+        session["messaging_paused"] = True
+        session["active"] = False
+        session["awaiting_opt_in"] = False
+        return "Got it — I'll stop messaging. Reply anytime if you want help finding a rental."
+
+    if session.get("messaging_paused"):
+        if wants_listing_help(query) or looks_like_greeting(query):
+            session["messaging_paused"] = False
+            return None
+        return ""
+
+    return None
 
 
 def replies_are_similar(left: str, right: str) -> bool:
@@ -609,6 +676,10 @@ def looks_like_user_pushback(text: str) -> bool:
         "not telling you",
         "don't want to share",
         "dont want to share",
+        "shut up",
+        "shutup",
+        "stop messaging",
+        "leave me alone",
         "fuck",
         "wtf",
         "piss off",
@@ -862,6 +933,7 @@ def local_conversational_fallback(
 def save_session_reply(lead_state_path: Path, state: dict, session: dict, reply: str) -> str:
     if session.get("active"):
         reply = guard_against_repeat_reply(reply, session, session.get("answers", {}))
+    reply = sanitize_bot_reply(reply)
     session["last_prompt"] = reply
     persist_lead_state(lead_state_path, state)
     return reply
@@ -1147,6 +1219,7 @@ def get_lead_session(state: dict, sender_id: str) -> dict:
             "selected_listing_key": "",
             "pending_booking_offer": False,
             "last_prompt": "",
+            "messaging_paused": False,
         },
     )
 
@@ -3084,6 +3157,9 @@ def _unified_ai_turn(
     openai_model: str,
 ) -> str:
     reset_stale_opt_in_session(session, query)
+    control_reply = handle_messaging_controls(session, query)
+    if control_reply is not None:
+        return save_session_reply(lead_state_path, state, session, control_reply)
 
     if session.get("awaiting_opt_in") and looks_like_affirmative(query):
         begin_structured_qualification(session, query)
@@ -3170,6 +3246,13 @@ def _unified_ai_turn(
             query,
             agent_name,
             last_assistant_message=compact(session.get("last_prompt")),
+        )
+        return save_session_reply(lead_state_path, state, session, reply)
+
+    if looks_like_user_pushback(query):
+        reply = (
+            "No problem — I only ask so I can match you with the right rentals. "
+            "What would you like to share next?"
         )
         return save_session_reply(lead_state_path, state, session, reply)
 
@@ -3590,7 +3673,7 @@ def generate_ai_reply(
     )
     resp.raise_for_status()
     output_text = extract_response_text(resp.json())
-    return output_text or None
+    return sanitize_bot_reply(output_text) or None
 
 
 def build_qualified_reply(
@@ -3691,6 +3774,10 @@ def _reply_deterministic(
     use_ai: bool,
 ) -> str:
     reset_stale_opt_in_session(session, query)
+    control_reply = handle_messaging_controls(session, query)
+    if control_reply is not None:
+        return save_session_reply(lead_state_path, state, session, control_reply)
+
     extraction_key = openai_api_key if use_ai else ""
 
     if session.get("qualified"):
@@ -4174,6 +4261,13 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                     openai_model=self.config.openai_model,
                     use_ai=True,
                 )
+                if not compact(reply):
+                    if message_id:
+                        with _POLL_STATE_LOCK:
+                            seen = load_seen_message_ids(self.config.poll_state_path)
+                            seen.add(message_id)
+                            save_seen_message_ids(self.config.poll_state_path, seen)
+                    continue
                 try:
                     send_message(self.config.page_access_token, sender_id, reply)
                     if message_id:
@@ -4323,6 +4417,9 @@ def poll_conversations_once(
                 openai_model=config.openai_model,
                 use_ai=use_ai,
             )
+            if not compact(reply):
+                seen.add(message_id)
+                continue
             try:
                 send_message(config.page_access_token, sender_id, reply)
                 seen.add(message_id)

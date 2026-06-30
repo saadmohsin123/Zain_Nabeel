@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Multi-scenario live production Messenger regression tests."""
+"""Multi-scenario live production Messenger regression tests.
+
+Uses a synthetic sender ID so automated runs never message real users.
+Validates bot state via PostgreSQL session storage.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import hmac
 import json
+import os
 import subprocess
 import sys
 import time
@@ -20,6 +25,7 @@ GRAPH = "https://graph.facebook.com/v20.0"
 WEBHOOK = "https://messenger-webhook-bot-production.up.railway.app/webhook"
 STATUS = "https://messenger-webhook-bot-production.up.railway.app/debug/status"
 PROJECT = Path(__file__).resolve().parents[1]
+SYNTHETIC_SENDER = os.getenv("LIVE_TEST_SENDER_ID", "live-regression-synthetic-v1")
 
 FAILURES: list[str] = []
 
@@ -101,12 +107,28 @@ def pick_user(env: dict) -> tuple[str, str]:
     raise RuntimeError("No user conversation found")
 
 
-def send_turn(env: dict, sender_id: str, conv_id: str, text: str) -> str:
+def read_session(sender_id: str) -> dict:
+    database_url = load_postgres_url()
+    if database_url.startswith("postgres://"):
+        database_url = "postgresql://" + database_url[len("postgres://") :]
+    import psycopg
+
+    with psycopg.connect(database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT session_data FROM messenger_sessions WHERE sender_id = %s", (sender_id,))
+            row = cur.fetchone()
+    if not row:
+        return {}
+    data = row[0]
+    if isinstance(data, str):
+        return json.loads(data)
+    return data if isinstance(data, dict) else {}
+
+
+def send_turn(env: dict, sender_id: str, text: str) -> str:
     page_id = env["META_PAGE_ID"]
     secret = env["META_APP_SECRET"]
-    token = env["META_PAGE_ACCESS_TOKEN"]
     mid = f"mid.live.{uuid.uuid4().hex}"
-    sent_at = int(time.time())
     payload = {
         "object": "page",
         "entry": [
@@ -138,34 +160,11 @@ def send_turn(env: dict, sender_id: str, conv_id: str, text: str) -> str:
         raise RuntimeError(f"Webhook failed {resp.status_code}: {resp.text[:200]}")
 
     for _ in range(6):
-        time.sleep(4)
-        try:
-            msgs = requests.get(
-                f"{GRAPH}/{conv_id}/messages",
-                params={
-                    "access_token": token,
-                    "limit": 8,
-                    "fields": "from,message,created_time",
-                },
-                timeout=60,
-            ).json().get("data", [])
-        except requests.RequestException:
-            continue
-        for item in msgs:
-            if item.get("from", {}).get("id") != page_id:
-                continue
-            created_ts = None
-            try:
-                import messenger_automation as bot_mod
-
-                created_ts = bot_mod.parse_graph_time(compact(item.get("created_time")))
-            except Exception:
-                pass
-            if created_ts is not None and created_ts < sent_at - 10:
-                continue
-            reply = compact(item.get("message"))
-            if reply:
-                return reply
+        time.sleep(3)
+        session = read_session(sender_id)
+        reply = compact(session.get("last_prompt"))
+        if reply:
+            return reply
     return ""
 
 
@@ -181,11 +180,12 @@ def qual_steps_toronto() -> list[tuple[str, Optional[Callable[[str], None]]]]:
     ]
 
 
-def build_scenarios(primary_sender: str) -> list[Scenario]:
+def build_scenarios() -> list[Scenario]:
+    sender = SYNTHETIC_SENDER
     return [
         Scenario(
             name="oshawa_no_inventory",
-            sender_id=primary_sender,
+            sender_id=sender,
             steps=[
                 ("Hi", lambda b: check("greeting", "looking for" in b.lower() or "help" in b.lower())),
                 (
@@ -208,7 +208,7 @@ def build_scenarios(primary_sender: str) -> list[Scenario]:
         ),
         Scenario(
             name="toronto_2bed_listings",
-            sender_id=primary_sender,
+            sender_id=sender,
             steps=[
                 (
                     "2 bedroom downtown toronto under 2500",
@@ -230,7 +230,7 @@ def build_scenarios(primary_sender: str) -> list[Scenario]:
         ),
         Scenario(
             name="opt_in_decline",
-            sender_id=primary_sender,
+            sender_id=sender,
             steps=[
                 ("condo in toronto under 2000", None),
                 ("no thanks", lambda b: (
@@ -241,7 +241,7 @@ def build_scenarios(primary_sender: str) -> list[Scenario]:
         ),
         Scenario(
             name="agent_yes_no_loop",
-            sender_id=primary_sender,
+            sender_id=sender,
             steps=[
                 ("looking for condo in toronto", None),
                 ("yes", None),
@@ -255,7 +255,7 @@ def build_scenarios(primary_sender: str) -> list[Scenario]:
         ),
         Scenario(
             name="qualification_objection",
-            sender_id=primary_sender,
+            sender_id=sender,
             steps=[
                 ("looking for 2 bed in toronto under 2500", None),
                 ("yes", None),
@@ -269,7 +269,7 @@ def build_scenarios(primary_sender: str) -> list[Scenario]:
         ),
         Scenario(
             name="booking_after_qual",
-            sender_id=primary_sender,
+            sender_id=sender,
             steps=[
                 ("2 bedroom in toronto under 2500", None),
                 ("yes", None),
@@ -363,7 +363,7 @@ def run_isolation_test(env: dict) -> None:
     reset_session(sender_b)
 
 
-def run_scenario(env: dict, conv_id: str, scenario: Scenario) -> list[dict]:
+def run_scenario(env: dict, scenario: Scenario) -> list[dict]:
     print(f"\n=== Scenario: {scenario.name} ===")
     if scenario.reset and scenario.sender_id:
         reset_session(scenario.sender_id)
@@ -371,7 +371,7 @@ def run_scenario(env: dict, conv_id: str, scenario: Scenario) -> list[dict]:
 
     transcript: list[dict] = []
     for text, validator in scenario.steps:
-        bot = send_turn(env, scenario.sender_id, conv_id, text)
+        bot = send_turn(env, scenario.sender_id, text)
         transcript.append({"user": text, "bot": bot})
         print(f"  YOU: {text}")
         print(f"  BOT: {bot[:500]}\n")
@@ -383,15 +383,14 @@ def run_scenario(env: dict, conv_id: str, scenario: Scenario) -> list[dict]:
 def main() -> int:
     env = load_env()
     verify = env.get("META_VERIFY_TOKEN", "")
-    primary_sender, conv_id = pick_user(env)
-    print(f"Live multi-scenario regression (primary sender {primary_sender})")
+    print(f"Live multi-scenario regression (synthetic sender {SYNTHETIC_SENDER})")
 
     all_transcripts: dict = {}
-    for scenario in build_scenarios(primary_sender):
+    for scenario in build_scenarios():
         if scenario.name == "postgres_session_isolation":
             run_isolation_test(env)
             continue
-        all_transcripts[scenario.name] = run_scenario(env, conv_id, scenario)
+        all_transcripts[scenario.name] = run_scenario(env, scenario)
 
     out = PROJECT / "live_test_transcripts.json"
     out.write_text(json.dumps(all_transcripts, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -404,7 +403,7 @@ def main() -> int:
     if FAILURES:
         print("\nFAILED:", ", ".join(FAILURES))
         return 1
-    print(f"\nALL {len(build_scenarios(primary_sender))} LIVE SCENARIOS PASSED")
+    print(f"\nALL {len(build_scenarios())} LIVE SCENARIOS PASSED")
     return 0
 
 

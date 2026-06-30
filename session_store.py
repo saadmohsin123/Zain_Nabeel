@@ -27,6 +27,7 @@ DEFAULT_SESSION = {
     "selected_listing_key": "",
     "pending_booking_offer": False,
     "last_prompt": "",
+    "messaging_paused": False,
 }
 
 SCHEMA_SQL = """
