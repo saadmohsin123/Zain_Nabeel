@@ -498,6 +498,38 @@ class FlowTest:
         intro_count = sum(1 for t in [r1, r2] if "nabeel's assistant" in t.lower())
         self.check("sync_single_assistant_intro", intro_count == 1)
 
+        # State I/O: atomic JSON + concurrent session updates
+        import concurrent.futures
+
+        race_path = Path(self.tmp.name) / "race_state.json"
+        race_drafts = SAMPLE_DRAFTS
+
+        def race_turn(index: int) -> str:
+            return bot.build_reply(
+                "race-user",
+                f"hello from thread {index}",
+                race_drafts,
+                listing_doc_url="",
+                calendly_url=self.calendly,
+                agent_name="Nabeel",
+                lead_state_path=race_path,
+                openai_api_key="",
+                use_ai=False,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+            list(pool.map(race_turn, range(24)))
+
+        race_payload = json.loads(race_path.read_text(encoding="utf-8"))
+        self.check("race_state_valid_json", isinstance(race_payload.get("sessions"), dict))
+        self.check("race_user_persisted", "race-user" in race_payload["sessions"])
+        self.check("race_last_prompt_saved", bool(race_payload["sessions"]["race-user"].get("last_prompt")))
+
+        poll_path = Path(self.tmp.name) / "poll_state.json"
+        bot.with_poll_state(poll_path, lambda seen: seen.update({"m1", "m2"}))
+        poll_payload = json.loads(poll_path.read_text(encoding="utf-8"))
+        self.check("poll_state_atomic", "m1" in poll_payload.get("seen_message_ids", []))
+
         return self.failures
 
 

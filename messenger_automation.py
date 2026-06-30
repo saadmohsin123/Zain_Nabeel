@@ -44,6 +44,7 @@ import io
 import json
 import os
 import re
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -58,7 +59,9 @@ import requests
 GRAPH_BASE = "https://graph.facebook.com/v20.0"
 OPENAI_RESPONSES_API = "https://api.openai.com/v1/responses"
 DEFAULT_SHEET_GID = "0"
-_DRAFT_CACHE: dict = {"source": "", "fetched_at": 0.0, "drafts": []}
+_DRAFT_CACHE: dict = {"source": "", "fetched_at": 0.0, "drafts": [], "degraded": False}
+_LEAD_STATE_LOCK = threading.Lock()
+_POLL_STATE_LOCK = threading.Lock()
 QUERY_STOPWORDS = {
     "a",
     "an",
@@ -929,6 +932,42 @@ def qualification_opt_in_prompt(agent_name: str, search_summary: str = "") -> st
     )
 
 
+def atomic_write_json(path: Path, payload: dict | list) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = ""
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except Exception:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise
+
+
+def with_lead_session(sender_id: str, lead_state_path: Path, fn):
+    with _LEAD_STATE_LOCK:
+        state = load_lead_state(lead_state_path)
+        session = get_lead_session(state, sender_id)
+        return fn(session, state)
+
+
+def with_poll_state(poll_state_path: Path, fn):
+    with _POLL_STATE_LOCK:
+        seen = load_seen_message_ids(poll_state_path)
+        result = fn(seen)
+        save_seen_message_ids(poll_state_path, seen)
+        return result
+
+
 def load_lead_state(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -940,7 +979,7 @@ def load_lead_state(path: Path) -> dict:
 
 
 def save_lead_state(path: Path, payload: dict):
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_json(path, payload)
 
 
 def get_lead_session(state: dict, sender_id: str) -> dict:
@@ -1940,9 +1979,37 @@ def maybe_handle_qualification(
     openai_model: str = DEFAULT_OPENAI_MODEL,
     use_ai: bool = True,
 ) -> Optional[str]:
-    state = load_lead_state(lead_state_path)
-    session = get_lead_session(state, sender_id)
+    def _handle(session: dict, state: dict) -> Optional[str]:
+        return _maybe_handle_qualification_locked(
+            session,
+            state,
+            query,
+            lead_state_path,
+            agent_name,
+            calendly_url,
+            drafts,
+            listing_doc_url,
+            openai_api_key,
+            openai_model,
+            use_ai,
+        )
 
+    return with_lead_session(sender_id, lead_state_path, _handle)
+
+
+def _maybe_handle_qualification_locked(
+    session: dict,
+    state: dict,
+    query: str,
+    lead_state_path: Path,
+    agent_name: str,
+    calendly_url: str,
+    drafts: List[dict],
+    listing_doc_url: str,
+    openai_api_key: str,
+    openai_model: str,
+    use_ai: bool,
+) -> Optional[str]:
     if qualification_in_progress(session) and not session.get("qualified"):
         begin_structured_qualification(session, query)
         reply = apply_qualification_turn(
@@ -2831,8 +2898,9 @@ def reply_reasks_collected_fields(reply: str, answers: dict) -> bool:
     return False
 
 
-def handle_unified_ai_turn(
-    sender_id: str,
+def _unified_ai_turn(
+    session: dict,
+    state: dict,
     query: str,
     lead_state_path: Path,
     agent_name: str,
@@ -2842,8 +2910,6 @@ def handle_unified_ai_turn(
     openai_api_key: str,
     openai_model: str,
 ) -> str:
-    state = load_lead_state(lead_state_path)
-    session = get_lead_session(state, sender_id)
     reset_stale_opt_in_session(session, query)
 
     if session.get("awaiting_opt_in") and looks_like_affirmative(query):
@@ -2977,6 +3043,35 @@ def handle_unified_ai_turn(
             )
 
     return save_session_reply(lead_state_path, state, session, reply)
+
+
+def handle_unified_ai_turn(
+    sender_id: str,
+    query: str,
+    lead_state_path: Path,
+    agent_name: str,
+    calendly_url: str,
+    drafts: List[dict],
+    listing_doc_url: str,
+    openai_api_key: str,
+    openai_model: str,
+) -> str:
+    return with_lead_session(
+        sender_id,
+        lead_state_path,
+        lambda session, state: _unified_ai_turn(
+            session,
+            state,
+            query,
+            lead_state_path,
+            agent_name,
+            calendly_url,
+            drafts,
+            listing_doc_url,
+            openai_api_key,
+            openai_model,
+        ),
+    )
 
 
 def ai_route_conversation_turn(
@@ -3409,20 +3504,19 @@ def build_qualified_reply(
     )
 
 
-def build_reply_deterministic(
-    sender_id: str,
+def _reply_deterministic(
+    session: dict,
+    state: dict,
     query: str,
+    lead_state_path: Path,
     drafts: List[dict],
     listing_doc_url: str,
-    calendly_url: str = "",
-    agent_name: str = "Nabeel",
-    lead_state_path: Path = Path("lead_intake_state.json"),
-    openai_api_key: str = "",
-    openai_model: str = DEFAULT_OPENAI_MODEL,
-    use_ai: bool = True,
+    calendly_url: str,
+    agent_name: str,
+    openai_api_key: str,
+    openai_model: str,
+    use_ai: bool,
 ) -> str:
-    state = load_lead_state(lead_state_path)
-    session = get_lead_session(state, sender_id)
     reset_stale_opt_in_session(session, query)
     extraction_key = openai_api_key if use_ai else ""
 
@@ -3523,6 +3617,37 @@ def build_reply_deterministic(
     return save_session_reply(lead_state_path, state, session, reply)
 
 
+def build_reply_deterministic(
+    sender_id: str,
+    query: str,
+    drafts: List[dict],
+    listing_doc_url: str,
+    calendly_url: str = "",
+    agent_name: str = "Nabeel",
+    lead_state_path: Path = Path("lead_intake_state.json"),
+    openai_api_key: str = "",
+    openai_model: str = DEFAULT_OPENAI_MODEL,
+    use_ai: bool = True,
+) -> str:
+    return with_lead_session(
+        sender_id,
+        lead_state_path,
+        lambda session, state: _reply_deterministic(
+            session,
+            state,
+            query,
+            lead_state_path,
+            drafts,
+            listing_doc_url,
+            calendly_url,
+            agent_name,
+            openai_api_key,
+            openai_model,
+            use_ai,
+        ),
+    )
+
+
 def build_reply(
     sender_id: str,
     query: str,
@@ -3535,30 +3660,35 @@ def build_reply(
     openai_model: str = DEFAULT_OPENAI_MODEL,
     use_ai: bool = True,
 ) -> str:
-    if use_ai and openai_api_key:
-        return handle_unified_ai_turn(
-            sender_id,
+    def _dispatch(session: dict, state: dict) -> str:
+        if use_ai and openai_api_key:
+            return _unified_ai_turn(
+                session,
+                state,
+                query,
+                lead_state_path,
+                agent_name,
+                calendly_url,
+                drafts,
+                listing_doc_url,
+                openai_api_key,
+                openai_model,
+            )
+        return _reply_deterministic(
+            session,
+            state,
             query,
             lead_state_path,
-            agent_name,
-            calendly_url,
             drafts,
             listing_doc_url,
+            calendly_url,
+            agent_name,
             openai_api_key,
             openai_model,
+            use_ai,
         )
-    return build_reply_deterministic(
-        sender_id,
-        query,
-        drafts,
-        listing_doc_url,
-        calendly_url,
-        agent_name,
-        lead_state_path,
-        openai_api_key,
-        openai_model,
-        use_ai,
-    )
+
+    return with_lead_session(sender_id, lead_state_path, _dispatch)
 
 
 def current_drafts(config: MessengerConfig) -> List[dict]:
@@ -3567,24 +3697,37 @@ def current_drafts(config: MessengerConfig) -> List[dict]:
     cached_source = compact(_DRAFT_CACHE.get("source"))
     cached_at = float(_DRAFT_CACHE.get("fetched_at") or 0.0)
     cached_drafts = _DRAFT_CACHE.get("drafts") or []
-    if cached_source == source and now - cached_at < max(config.drafts_cache_seconds, 1):
+    cache_fresh = cached_source == source and now - cached_at < max(config.drafts_cache_seconds, 1)
+    if cache_fresh and cached_drafts:
         return list(cached_drafts)
 
-    drafts: List[dict] = []
     if config.drafts_sheet_csv_url:
         try:
             drafts = fetch_sheet_drafts(config.drafts_sheet_csv_url)
             print(f"Loaded {len(drafts)} drafts from sheet CSV")
+            _DRAFT_CACHE["source"] = source
+            _DRAFT_CACHE["fetched_at"] = now
+            _DRAFT_CACHE["drafts"] = list(drafts)
+            _DRAFT_CACHE["degraded"] = False
+            return drafts
         except Exception as exc:
             print(f"Failed loading sheet drafts: {exc}")
+            if cached_drafts and cached_source == source:
+                print("Serving last good sheet cache after fetch failure")
+                return list(cached_drafts)
 
-    if not drafts:
-        drafts = load_drafts(config.drafts_path)
-        print(f"Loaded {len(drafts)} drafts from local JSON fallback")
-
-    _DRAFT_CACHE["source"] = source
-    _DRAFT_CACHE["fetched_at"] = now
-    _DRAFT_CACHE["drafts"] = list(drafts)
+    drafts = load_drafts(config.drafts_path)
+    print(f"Loaded {len(drafts)} drafts from local JSON fallback")
+    if config.drafts_sheet_csv_url:
+        _DRAFT_CACHE["source"] = f"fallback:{config.drafts_path}"
+        _DRAFT_CACHE["fetched_at"] = now
+        _DRAFT_CACHE["drafts"] = list(drafts)
+        _DRAFT_CACHE["degraded"] = True
+    else:
+        _DRAFT_CACHE["source"] = source
+        _DRAFT_CACHE["fetched_at"] = now
+        _DRAFT_CACHE["drafts"] = list(drafts)
+        _DRAFT_CACHE["degraded"] = False
     return drafts
 
 
@@ -3722,13 +3865,16 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
             if token != self.config.verify_token:
                 self.send_error(403, "Forbidden")
                 return
-            seen = load_seen_message_ids(self.config.poll_state_path)
+            with _POLL_STATE_LOCK:
+                seen = load_seen_message_ids(self.config.poll_state_path)
             self._send_json(
                 200,
                 {
                     "ok": True,
                     "draft_count": len(current_drafts(self.config)),
                     "draft_source": self.config.drafts_sheet_csv_url or str(self.config.drafts_path),
+                    "draft_cache_degraded": bool(_DRAFT_CACHE.get("degraded")),
+                    "draft_cache_source": compact(_DRAFT_CACHE.get("source")),
                     "has_page_access_token": bool(self.config.page_access_token),
                     "token_source": self.config.token_source,
                     "has_app_secret": bool(self.config.app_secret),
@@ -3815,7 +3961,6 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
 
     def process_webhook(self, payload: dict):
         drafts = current_drafts(self.config)
-        seen = load_seen_message_ids(self.config.poll_state_path)
         entry_list = payload.get("entry", [])
         for entry in entry_list:
             messaging = entry.get("messaging", [])
@@ -3826,9 +3971,11 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                 message_id = compact(message.get("mid"))
                 if not sender_id or not text:
                     continue
-                if message_id and message_id in seen:
-                    print(f"Skipping duplicate webhook message {message_id}")
-                    continue
+                with _POLL_STATE_LOCK:
+                    seen = load_seen_message_ids(self.config.poll_state_path)
+                    if message_id and message_id in seen:
+                        print(f"Skipping duplicate webhook message {message_id}")
+                        continue
 
                 try:
                     send_sender_action(self.config.page_access_token, sender_id, "typing_on")
@@ -3850,8 +3997,10 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                 try:
                     send_message(self.config.page_access_token, sender_id, reply)
                     if message_id:
-                        seen.add(message_id)
-                        save_seen_message_ids(self.config.poll_state_path, seen)
+                        with _POLL_STATE_LOCK:
+                            seen = load_seen_message_ids(self.config.poll_state_path)
+                            seen.add(message_id)
+                            save_seen_message_ids(self.config.poll_state_path, seen)
                     print(f"Replied to {sender_id}: {text[:80]}")
                 except Exception as exc:
                     print(f"Failed sending to {sender_id}: {exc}")
@@ -3893,9 +4042,8 @@ def load_seen_message_ids(path: Path) -> set[str]:
 
 
 def save_seen_message_ids(path: Path, seen: set[str]):
-    # Keep state bounded; old message IDs are only needed to avoid duplicate replies.
     recent = sorted(seen)[-2000:]
-    path.write_text(json.dumps({"seen_message_ids": recent}, indent=2), encoding="utf-8")
+    atomic_write_json(path, {"seen_message_ids": recent})
 
 
 def list_recent_messages(
@@ -3934,85 +4082,86 @@ def poll_conversations_once(
     if not config.page_id:
         raise RuntimeError("META_PAGE_ID is required when polling is enabled")
 
-    seen = load_seen_message_ids(config.poll_state_path)
     drafts = current_drafts(config)
-    result = {
-        "reply_count": 0,
-        "initialize_only": initialize_only,
-        "processed_count": 0,
-        "seen_before_count": 0,
-        "skipped_page_or_empty_count": 0,
-        "initialized_seen_count": 0,
-        "errors": [],
-    }
-    now_ts = int(time.time())
-    bootstrap_cutoff_ts = now_ts - max(config.bootstrap_reply_lookback_seconds, 0)
 
-    for message in list_recent_messages(
-        config.page_id,
-        config.page_access_token,
-        conversation_limit=conversation_limit,
-        per_conversation_limit=per_conversation_limit,
-    ):
-        message_id = compact(message.get("id"))
-        if not message_id or message_id in seen:
-            result["seen_before_count"] += 1
-            continue
+    def _poll_locked(seen: set[str]) -> dict:
+        result = {
+            "reply_count": 0,
+            "initialize_only": initialize_only,
+            "processed_count": 0,
+            "seen_before_count": 0,
+            "skipped_page_or_empty_count": 0,
+            "initialized_seen_count": 0,
+            "errors": [],
+        }
+        now_ts = int(time.time())
+        bootstrap_cutoff_ts = now_ts - max(config.bootstrap_reply_lookback_seconds, 0)
 
-        result["processed_count"] += 1
-        sender = message.get("from", {}) or {}
-        sender_id = compact(sender.get("id"))
-        text = compact(message.get("message"))
-        created_ts = parse_graph_time(compact(message.get("created_time")))
+        for message in list_recent_messages(
+            config.page_id,
+            config.page_access_token,
+            conversation_limit=conversation_limit,
+            per_conversation_limit=per_conversation_limit,
+        ):
+            message_id = compact(message.get("id"))
+            if not message_id or message_id in seen:
+                result["seen_before_count"] += 1
+                continue
 
-        if initialize_only:
-            # On cold start, keep recent inbound messages unseen so the next poll can answer them.
-            is_old = created_ts is not None and created_ts < bootstrap_cutoff_ts
-            if not sender_id or sender_id == config.page_id or not text or is_old:
+            result["processed_count"] += 1
+            sender = message.get("from", {}) or {}
+            sender_id = compact(sender.get("id"))
+            text = compact(message.get("message"))
+            created_ts = parse_graph_time(compact(message.get("created_time")))
+
+            if initialize_only:
+                is_old = created_ts is not None and created_ts < bootstrap_cutoff_ts
+                if not sender_id or sender_id == config.page_id or not text or is_old:
+                    seen.add(message_id)
+                    result["initialized_seen_count"] += 1
+                continue
+
+            if not sender_id or sender_id == config.page_id or not text:
                 seen.add(message_id)
-                result["initialized_seen_count"] += 1
-            continue
+                result["skipped_page_or_empty_count"] += 1
+                continue
 
-        if not sender_id or sender_id == config.page_id or not text:
-            seen.add(message_id)
-            result["skipped_page_or_empty_count"] += 1
-            continue
+            try:
+                send_sender_action(config.page_access_token, sender_id, "typing_on")
+            except Exception as exc:
+                print(f"Poll failed sending typing indicator to {sender_id}: {exc}")
 
-        try:
-            send_sender_action(config.page_access_token, sender_id, "typing_on")
-        except Exception as exc:
-            print(f"Poll failed sending typing indicator to {sender_id}: {exc}")
-
-        reply = build_reply(
-            sender_id,
-            text,
-            drafts,
-            config.listing_doc_url,
-            calendly_url=config.calendly_url,
-            agent_name=config.agent_name,
-            lead_state_path=config.lead_state_path,
-            openai_api_key=config.openai_api_key,
-            openai_model=config.openai_model,
-            use_ai=use_ai,
-        )
-        try:
-            send_message(config.page_access_token, sender_id, reply)
-            seen.add(message_id)
-            result["reply_count"] += 1
-            print(f"Poll replied to {sender_id}: {text[:80]}")
-        except Exception as exc:
-            print(f"Poll failed sending to {sender_id}: {exc}")
-            result["errors"].append(
-                {
-                    "message_id": message_id,
-                    "sender_id": sender_id,
-                    "text_preview": text[:120],
-                    "error": str(exc),
-                }
+            reply = build_reply(
+                sender_id,
+                text,
+                drafts,
+                config.listing_doc_url,
+                calendly_url=config.calendly_url,
+                agent_name=config.agent_name,
+                lead_state_path=config.lead_state_path,
+                openai_api_key=config.openai_api_key,
+                openai_model=config.openai_model,
+                use_ai=use_ai,
             )
+            try:
+                send_message(config.page_access_token, sender_id, reply)
+                seen.add(message_id)
+                result["reply_count"] += 1
+                print(f"Poll replied to {sender_id}: {text[:80]}")
+            except Exception as exc:
+                print(f"Poll failed sending to {sender_id}: {exc}")
+                result["errors"].append(
+                    {
+                        "message_id": message_id,
+                        "sender_id": sender_id,
+                        "text_preview": text[:120],
+                        "error": str(exc),
+                    }
+                )
 
-    save_seen_message_ids(config.poll_state_path, seen)
-    return result
+        return result
+
+    return with_poll_state(config.poll_state_path, _poll_locked)
 
 
 def start_conversation_poller(config: MessengerConfig, interval_seconds: int):
