@@ -329,12 +329,20 @@ def customer_visible_drafts(drafts: List[dict]) -> List[dict]:
 
 def rank_drafts(query: str, drafts: List[dict], limit: int = 3) -> List[dict]:
     q_tokens = tokenize(query)
-    if not q_tokens:
-        return []
+    constraints = extract_search_constraints(query)
 
     candidate_drafts = customer_visible_drafts(drafts)
     if not candidate_drafts:
         return []
+
+    if constraints:
+        filtered = [draft for draft in candidate_drafts if draft_matches_constraints(draft, constraints)]
+        if not filtered:
+            return []
+        candidate_drafts = filtered
+
+    if not q_tokens:
+        return candidate_drafts[:limit]
 
     scored: List[Tuple[int, dict]] = []
     for draft in candidate_drafts:
@@ -347,8 +355,16 @@ def rank_drafts(query: str, drafts: List[dict], limit: int = 3) -> List[dict]:
                 score += 5
             if token in compact(draft.get("Address")).lower():
                 score += 4
+        bed_target = constraints.get("bedrooms")
+        if bed_target is not None:
+            draft_beds = draft_bedroom_count(draft)
+            if draft_beds == bed_target:
+                score += 20
         if score:
             scored.append((score, draft))
+
+    if not scored:
+        return candidate_drafts[:limit] if constraints else []
 
     scored.sort(key=lambda item: (-item[0], compact(item[1].get("MarketplacePriceDisplay"))))
     return [draft for _, draft in scored[:limit]]
@@ -546,6 +562,136 @@ def replies_are_similar(left: str, right: str) -> bool:
     return left_norm == right_norm or left_norm in right_norm or right_norm in left_norm
 
 
+def looks_like_user_pushback(text: str) -> bool:
+    lowered = normalize_whitespace(text).lower()
+    if not lowered:
+        return False
+    phrases = (
+        "why do you need",
+        "why do u need",
+        "why do i need",
+        "none of your business",
+        "not telling you",
+        "don't want to share",
+        "dont want to share",
+        "fuck",
+        "wtf",
+        "piss off",
+    )
+    return any(phrase in lowered for phrase in phrases)
+
+
+def looks_like_qualification_objection(text: str) -> bool:
+    if looks_like_user_pushback(text):
+        return True
+    cleaned = normalize_whitespace(text)
+    if cleaned.endswith("?"):
+        return True
+    return False
+
+
+def looks_like_correction(text: str) -> bool:
+    lowered = normalize_whitespace(text).lower()
+    return any(
+        phrase in lowered
+        for phrase in ("actually", "i meant", "correction", "sorry", "wait", "not a ", "not the ")
+    )
+
+
+def looks_like_search_refinement(query: str) -> bool:
+    q = query.lower()
+    patterns = (
+        r"\d+\s*bed",
+        r"\bpool\b",
+        r"\bpets?\b",
+        r"\bparking\b",
+        r"\bunder\s*\$",
+        r"\bbudget\b",
+        r"\bi wanted\b",
+        r"\bi need\b",
+        r"\blooking for\b",
+        r"\bdo you have\b",
+    )
+    return any(re.search(pattern, q) for pattern in patterns)
+
+
+def extract_search_constraints(query: str) -> dict:
+    normalized = normalize_whitespace(query).lower()
+    constraints: dict = {}
+    bed_match = re.search(r"\b(\d+)\s*bed(?:room)?s?\b", normalized)
+    if bed_match:
+        constraints["bedrooms"] = int(bed_match.group(1))
+        constraints["exclude_commercial"] = True
+        constraints["residential_only"] = True
+    if re.search(r"\bpool\b", normalized):
+        constraints["pool"] = True
+    if re.search(r"\bcommercial\b", normalized):
+        constraints["exclude_commercial"] = True
+    return constraints
+
+
+def draft_bedroom_count(draft: dict) -> Optional[int]:
+    total = compact(draft.get("BedroomsTotal"))
+    if total.isdigit():
+        return int(total)
+    title = compact(draft.get("MarketplaceTitle")).lower()
+    match = re.search(r"(\d+)\s*bed", title)
+    return int(match.group(1)) if match else None
+
+
+def draft_is_commercial(draft: dict) -> bool:
+    haystack = draft_text(draft)
+    property_type = normalize_status(compact(draft.get("PropertyType")))
+    return "commercial" in haystack or property_type == "commercial"
+
+
+def draft_matches_constraints(draft: dict, constraints: dict) -> bool:
+    if not constraints:
+        return True
+    if constraints.get("exclude_commercial") and draft_is_commercial(draft):
+        return False
+    if constraints.get("residential_only") and draft_is_commercial(draft):
+        return False
+    bed_target = constraints.get("bedrooms")
+    if bed_target is not None:
+        draft_beds = draft_bedroom_count(draft)
+        if draft_beds is None or draft_beds != bed_target:
+            return False
+    if constraints.get("pool"):
+        if not re.search(r"\bpool\b", draft_text(draft)):
+            return False
+    return True
+
+
+def qualified_conversational_reply(session: dict, agent_name: str, query: str) -> str:
+    if looks_like_greeting(query):
+        if compact(session.get("selected_listing_key")):
+            return (
+                f"Hi! I'm still here if you have questions about that unit or want to book a viewing."
+            )
+        if session.get("last_shared_listing_keys"):
+            return (
+                "Hi! Want to ask about one of the listings I shared, refine your search, or book a viewing?"
+            )
+        return f"Hi! I'm {agent_name}'s assistant — tell me what you're looking for and I'll help."
+    if "how are you" in query.lower():
+        return "Doing well, thanks! What can I help you with on your rental search?"
+    return "Happy to help — want to refine your search or ask about a specific listing?"
+
+
+def guard_against_repeat_reply(reply: str, session: dict, answers: Optional[dict] = None) -> str:
+    last = compact(session.get("last_prompt"))
+    if not reply or not replies_are_similar(reply, last):
+        return reply
+    answers = answers or session.get("answers", {})
+    missing = first_missing_qualification_key(answers)
+    if missing:
+        alt = build_missing_field_prompt([missing], answers)
+        if not replies_are_similar(alt, last):
+            return alt
+    return reply
+
+
 def reset_stale_opt_in_session(session: dict, query: str) -> bool:
     if not session.get("awaiting_opt_in") or session.get("active") or session.get("qualified"):
         return False
@@ -592,6 +738,8 @@ def local_conversational_fallback(
 
 
 def save_session_reply(lead_state_path: Path, state: dict, session: dict, reply: str) -> str:
+    if session.get("active"):
+        reply = guard_against_repeat_reply(reply, session, session.get("answers", {}))
     session["last_prompt"] = reply
     save_lead_state(lead_state_path, state)
     return reply
@@ -882,6 +1030,8 @@ def extract_resident_status(text: str) -> str:
     lowered = normalize_whitespace(text).lower()
     if not lowered:
         return ""
+    if re.search(r"\bnon[- ]?residents?\b", lowered):
+        return "Non-Resident"
     patterns = [
         ("permanent resident", "Permanent Resident"),
         ("permanent", "Permanent Resident"),
@@ -899,6 +1049,10 @@ def extract_resident_status(text: str) -> str:
     if re.fullmatch(r"pr", lowered):
         return "Permanent Resident"
     if re.fullmatch(r"residents?", lowered):
+        return "Permanent Resident"
+    if re.search(r"\b(?:i'?m|i am)\s+(?:a\s+)?resident\b", lowered):
+        return "Permanent Resident"
+    if re.search(r"\bresident\b", lowered):
         return "Permanent Resident"
     return ""
 
@@ -1048,6 +1202,8 @@ def is_plausible_occupation(text: str) -> bool:
     if not cleaned:
         return False
     if len(cleaned) < 2:
+        return False
+    if looks_like_qualification_objection(cleaned):
         return False
     lowered = cleaned.lower()
     if lowered in {"just me", "only me", "me only", "me", "just", "only"}:
@@ -1397,12 +1553,6 @@ def resolve_listing_reference(query: str, session: dict, drafts: List[dict]) -> 
     if len(city_matches) == 1:
         return city_matches[0]
 
-    selected_key = compact(session.get("selected_listing_key"))
-    if selected_key:
-        selected = draft_by_listing_key(drafts, selected_key)
-        if selected and selected in shared:
-            return selected
-
     return None
 
 
@@ -1566,7 +1716,13 @@ def handle_qualified_listing_interest(
     shared = listings_from_session(session, drafts)
     listing = resolve_listing_reference(query, session, drafts)
     if not listing and compact(session.get("selected_listing_key")):
-        listing = draft_by_listing_key(drafts, compact(session.get("selected_listing_key")))
+        if (
+            looks_like_listing_detail_request(query)
+            or looks_like_booking_request(query)
+            or looks_like_booking_confirmation(query, session)
+            or user_asking_booking_options(query, session)
+        ):
+            listing = draft_by_listing_key(drafts, compact(session.get("selected_listing_key")))
 
     if listing or (shared and looks_like_listing_detail_request(query)):
         target = listing
@@ -1725,9 +1881,9 @@ def handle_qualified_listing_search(
         elif intent in ("booking", "general_question", "other"):
             return None
         else:
-            should_search = wants_listing_refresh(query)
+            should_search = wants_listing_refresh(query) or looks_like_search_refinement(query)
     else:
-        should_search = wants_listing_refresh(query)
+        should_search = wants_listing_refresh(query) or looks_like_search_refinement(query)
 
     if not should_search:
         return None
@@ -2047,10 +2203,16 @@ def is_plausible_field_value(key: str, value: str, query: str, existing_answers:
     if key == "phone_number":
         if value.lower() in {"yes", "no", "yup", "sure", "ok", "okay"}:
             return False
-        return bool(extract_phone_number(value) or re.search(r"\d{3}", value))
-    if key == "working_with_agent":
-        if looks_like_affirmative(query) and "agent" not in lowered and "working" not in lowered:
+        if re.search(r"[a-zA-Z]", re.sub(r"[\s\-\(\)\+]", "", value)):
             return False
+        digits = re.sub(r"\D", "", value)
+        return len(digits) >= 10
+    if key == "working_with_agent":
+        if value in ("Yes", "No"):
+            return True
+        agent_answer = extract_agent_answer(query)
+        if agent_answer in ("Yes", "No"):
+            return True
     if key == "adults_in_unit" and compact(existing_answers.get("adults_in_unit")):
         return False
     if key == "kids_in_unit" and compact(existing_answers.get("kids_in_unit")):
@@ -2070,6 +2232,9 @@ def is_plausible_field_value(key: str, value: str, query: str, existing_answers:
     return True
 
 
+OVERWRITABLE_QUALIFICATION_FIELDS = {"resident_status", "working_with_agent"}
+
+
 def merge_parsed_answers(
     answers: dict,
     parsed_answers: Dict[str, str],
@@ -2083,7 +2248,10 @@ def merge_parsed_answers(
         normalized = normalize_qualification_value(key, compact(value))
         if not normalized or not is_plausible_field_value(key, normalized, query, answers):
             continue
-        if not compact(answers.get(key)):
+        can_write = not compact(answers.get(key)) or key in OVERWRITABLE_QUALIFICATION_FIELDS
+        if looks_like_correction(query) and key in {"resident_status", "working_with_agent", "occupation"}:
+            can_write = True
+        if can_write:
             answers[key] = normalized
     validate_household_counts(answers)
 
@@ -2418,6 +2586,32 @@ def extract_all_qualification_fields(
         merge_parsed_answers(answers, ai_fields, query, allowed_keys=missing)
 
     infer_household_defaults(answers, query)
+
+    if compact(answers.get("working_with_agent")) and not compact(answers.get("resident_status")):
+        answers.pop("working_with_agent", None)
+
+    resident = extract_resident_status(query)
+    if resident:
+        merge_parsed_answers(answers, {"resident_status": resident}, query, allowed_keys=["resident_status"])
+
+    agent_answer = extract_agent_answer(query)
+    if agent_answer in ("Yes", "No"):
+        last_prompt = compact(session.get("last_prompt")).lower()
+        asking_agent = (
+            first_missing_qualification_key(answers) == "working_with_agent"
+            or "agent" in last_prompt
+            or "working with" in last_prompt
+            or re.search(r"\bagent\b", query.lower())
+            or re.search(r"\bworking\b", query.lower())
+        )
+        if asking_agent:
+            merge_parsed_answers(
+                answers,
+                {"working_with_agent": agent_answer},
+                query,
+                allowed_keys=["working_with_agent"],
+            )
+
     session["batch"] = first_incomplete_batch_index(answers)
 
 
@@ -2660,6 +2854,16 @@ def handle_unified_ai_turn(
         return save_session_reply(lead_state_path, state, session, post_reply)
 
     if session.get("qualified"):
+        if (
+            (looks_like_greeting(query) or looks_like_small_talk(query))
+            and not wants_listing_help(query)
+            and not looks_like_search_refinement(query)
+            and not resolve_listing_reference(query, session, drafts)
+            and not looks_like_booking_request(query)
+        ):
+            reply = qualified_conversational_reply(session, agent_name, query)
+            return save_session_reply(lead_state_path, state, session, reply)
+
         interest = handle_qualified_listing_interest(
             session, query, drafts, calendly_url, openai_api_key, openai_model, agent_name
         )
@@ -3094,6 +3298,15 @@ def build_qualified_reply(
     booking_reply = handle_post_qualification_booking(session, query, drafts, calendly_url)
     if booking_reply:
         return booking_reply
+
+    if (
+        (looks_like_greeting(query) or looks_like_small_talk(query))
+        and not wants_listing_help(query)
+        and not looks_like_search_refinement(query)
+        and not resolve_listing_reference(query, session, drafts)
+        and not looks_like_booking_request(query)
+    ):
+        return qualified_conversational_reply(session, agent_name, query)
 
     interest_reply = handle_qualified_listing_interest(
         session,

@@ -367,6 +367,104 @@ class FlowTest:
         self.check("single_q_phone_next", "phone" in r.lower())
         self.check("single_q_no_still_need_list", "i still need:" not in r.lower())
 
+        # Anti-bleed regressions from live Messenger tests
+        reply_as("agent-loop-user", "looking for a condo in toronto")
+        reply_as("agent-loop-user", "yes")
+        reply_as("agent-loop-user", "July 1")
+        reply_as("agent-loop-user", "1")
+        reply_as("agent-loop-user", "1")
+        reply_as("agent-loop-user", "0")
+        reply_as("agent-loop-user", "100000")
+        reply_as("agent-loop-user", "engineer")
+        reply_as("agent-loop-user", "Non resident")
+        r = reply_as("agent-loop-user", "Yes")
+        agent_state = json.loads(Path(self.state_path).read_text())["sessions"]["agent-loop-user"]
+        self.check("agent_yes_saved", agent_state["answers"].get("working_with_agent") == "Yes")
+        self.check("agent_no_repeat_loop", "working with an agent" not in r.lower() or "phone" in r.lower())
+
+        reply_as("resident-fix-user", "looking for a condo in toronto")
+        reply_as("resident-fix-user", "yes")
+        reply_as("resident-fix-user", "July 1")
+        reply_as("resident-fix-user", "1 person")
+        reply_as("resident-fix-user", "100000")
+        reply_as("resident-fix-user", "engineer")
+        reply_as("resident-fix-user", "Non resident")
+        reply_as("resident-fix-user", "Actually I'm a resident")
+        resident_state = json.loads(Path(self.state_path).read_text())["sessions"]["resident-fix-user"]["answers"]
+        self.check("resident_correction_saved", resident_state.get("resident_status") == "Permanent Resident")
+
+        reply_as("objection-user", "looking for a condo in toronto")
+        reply_as("objection-user", "yes")
+        reply_as("objection-user", "July 1")
+        reply_as("objection-user", "1")
+        reply_as("objection-user", "1")
+        reply_as("objection-user", "0")
+        reply_as("objection-user", "100000")
+        r = reply_as("objection-user", "Why do u need this")
+        objection_answers = json.loads(Path(self.state_path).read_text())["sessions"]["objection-user"]["answers"]
+        self.check("objection_not_occupation", objection_answers.get("occupation") != "Why do u need this")
+        self.check("objection_reasks_work", "work" in r.lower())
+
+        reply_as("phone-user", "looking for a condo in toronto")
+        reply_as("phone-user", "yes")
+        reply_as("phone-user", "July 1")
+        reply_as("phone-user", "1")
+        reply_as("phone-user", "1")
+        reply_as("phone-user", "0")
+        reply_as("phone-user", "100000")
+        reply_as("phone-user", "engineer")
+        reply_as("phone-user", "PR")
+        reply_as("phone-user", "No")
+        r = reply_as("phone-user", "+1fuckoff")
+        phone_answers = json.loads(Path(self.state_path).read_text())["sessions"]["phone-user"]["answers"]
+        self.check("invalid_phone_rejected", not phone_answers.get("phone_number"))
+        self.check("invalid_phone_reask", "phone" in r.lower())
+
+        three_bed_drafts = SAMPLE_DRAFTS + [
+            {
+                "ListingKey": "B3",
+                "MarketplaceStatus": "Posted",
+                "ListingLifecycleStatus": "Active",
+                "TransactionType": "For Lease",
+                "MarketplaceTitle": "3 Bed | 2 Bath | Condo | For Rent",
+                "City": "Toronto",
+                "BedroomsTotal": "3",
+                "MarketplacePriceDisplay": "$3,200/month",
+            },
+            {
+                "ListingKey": "C1",
+                "MarketplaceStatus": "Posted",
+                "ListingLifecycleStatus": "Active",
+                "TransactionType": "For Lease",
+                "MarketplaceTitle": "Commercial | For Rent | Unit LL-D",
+                "City": "Markham",
+                "MarketplacePriceDisplay": "$1,400/month",
+            },
+        ]
+        matches = bot.rank_drafts("I wanted 3 bedrooms", three_bed_drafts, limit=3)
+        self.check("three_bed_filter", len(matches) == 1 and matches[0].get("ListingKey") == "B3")
+
+        qualified_session = {
+            "qualified": True,
+            "selected_listing_key": "W123",
+            "last_shared_listing_keys": ["W123"],
+            "answers": {},
+            "last_prompt": "Perfect — pick a time here: https://calendly.com/example/nabeel",
+        }
+        r = bot.build_qualified_reply(
+            qualified_session,
+            "Hi",
+            three_bed_drafts,
+            "",
+            self.calendly,
+            "Nabeel",
+            "",
+            "gpt-4.1",
+            use_ai=False,
+        )
+        self.check("qualified_hi_no_listing_dump", "2,150" not in r.lower() and "sheppard" not in r.lower())
+        self.check("qualified_hi_short", "still here" in r.lower() or "refine" in r.lower())
+
         return self.failures
 
 
