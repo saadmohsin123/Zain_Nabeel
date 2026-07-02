@@ -214,6 +214,21 @@ class AspectTest:
         self.check("search_change_clears_stale_answers", not state.get("answers", {}).get("move_in_date"))
         self.check("search_change_asks_move_in", "move-in" in r.lower() or "move in" in r.lower())
 
+    def run_special_search_tests(self) -> None:
+        query = (
+            "cheapest condo in Ontario where pets are allowed and "
+            "it's a gated community with security"
+        )
+        c = bot.extract_search_constraints(query)
+        self.check("special_condo", c.get("property_type") == "condo")
+        self.check("special_pets", c.get("pets_allowed") is True)
+        self.check("special_security", c.get("gated_or_security") is True)
+        self.check("special_cheapest", c.get("sort_cheapest") is True)
+        matches, note = bot.rank_drafts_with_note(query, SAMPLE_DRAFTS, limit=3)
+        self.check("special_no_commercial", all(d.get("ListingKey") != "C1" for d in matches))
+        if note:
+            self.check("special_honest_note", "gated" in note.lower() or "security" in note.lower())
+
     def run_booking_tests(self) -> None:
         sender = "booking-user"
         self.reply(sender, "2 bedroom downtown toronto under 2500")
@@ -345,6 +360,7 @@ class AspectTest:
         self.run_qual_resume_tests()
         self.run_qualified_refinement_tests()
         self.run_search_change_tests()
+        self.run_special_search_tests()
         self.run_poll_state_tests()
         return self.failures
 

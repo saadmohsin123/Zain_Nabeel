@@ -306,6 +306,8 @@ def draft_text(draft: dict) -> str:
         compact(draft.get("Address")),
         compact(draft.get("MarketplaceDescription")),
         compact(draft.get("Amenities")),
+        compact(draft.get("PetsAllowed")),
+        compact(draft.get("PropertyType")),
         compact(draft.get("HeatingDetails")),
         compact(draft.get("CoolingDetails")),
         compact(draft.get("GarageDetails")),
@@ -356,21 +358,51 @@ def customer_visible_drafts(drafts: List[dict]) -> List[dict]:
 
 
 def rank_drafts(query: str, drafts: List[dict], limit: int = 3) -> List[dict]:
+    matches, _ = rank_drafts_with_note(query, drafts, limit=limit)
+    return matches
+
+
+def rank_drafts_with_note(query: str, drafts: List[dict], limit: int = 3) -> Tuple[List[dict], str]:
     q_tokens = tokenize(query)
     constraints = extract_search_constraints(query)
+    note = ""
 
     candidate_drafts = customer_visible_drafts(drafts)
     if not candidate_drafts:
-        return []
+        return [], note
+
+    def filter_candidates(active_constraints: dict) -> List[dict]:
+        if not active_constraints:
+            return list(candidate_drafts)
+        filtered = [draft for draft in candidate_drafts if draft_matches_constraints(draft, active_constraints)]
+        return filtered
+
+    filtered = filter_candidates(constraints)
+    if not filtered and constraints.get("gated_or_security"):
+        relaxed = dict(constraints)
+        relaxed.pop("gated_or_security", None)
+        filtered = filter_candidates(relaxed)
+        if filtered:
+            note = (
+                "I couldn't find an active pet-friendly condo with gated/security details in the sheet, "
+                "so here are the closest pet-friendly condos in Ontario sorted by price."
+            )
+
+    if not filtered and constraints:
+        return [], note
 
     if constraints:
-        filtered = [draft for draft in candidate_drafts if draft_matches_constraints(draft, constraints)]
-        if not filtered:
-            return []
         candidate_drafts = filtered
 
+    if constraints.get("sort_cheapest") or re.search(r"\bcheapest\b", query.lower()):
+        priced = sorted(
+            candidate_drafts,
+            key=lambda draft: draft_listing_price(draft) if draft_listing_price(draft) is not None else 10**9,
+        )
+        return priced[:limit], note
+
     if not q_tokens:
-        return candidate_drafts[:limit]
+        return candidate_drafts[:limit], note
 
     scored: List[Tuple[int, dict]] = []
     for draft in candidate_drafts:
@@ -396,14 +428,20 @@ def rank_drafts(query: str, drafts: List[dict], limit: int = 3) -> List[dict]:
             price = draft_listing_price(draft)
             if price is not None and price <= max_price:
                 score += 10
+        if constraints.get("property_type") == "condo" and draft_is_condo(draft):
+            score += 15
+        if constraints.get("pets_allowed") and draft_allows_pets(draft):
+            score += 15
+        if constraints.get("gated_or_security") and draft_has_gated_security(draft):
+            score += 15
         if score:
             scored.append((score, draft))
 
     if not scored:
-        return candidate_drafts[:limit] if constraints else []
+        return candidate_drafts[:limit], note if note else ""
 
-    scored.sort(key=lambda item: (-item[0], compact(item[1].get("MarketplacePriceDisplay"))))
-    return [draft for _, draft in scored[:limit]]
+    scored.sort(key=lambda item: (-item[0], draft_listing_price(item[1]) or 10**9))
+    return [draft for _, draft in scored[:limit]], note
 
 
 def summarize_draft(draft: dict) -> str:
@@ -842,6 +880,11 @@ def looks_like_search_refinement(query: str) -> bool:
         r"\bi need\b",
         r"\blooking for\b",
         r"\bdo you have\b",
+        r"\bcondo\b",
+        r"\bcheapest\b",
+        r"\bgated\b",
+        r"\bsecurity\b",
+        r"\bontario\b",
     )
     return any(re.search(pattern, q) for pattern in patterns)
 
@@ -867,6 +910,18 @@ def extract_search_constraints(query: str) -> dict:
     max_price = extract_max_price_from_query(normalized)
     if max_price is not None:
         constraints["max_price"] = max_price
+
+    if re.search(r"\bcondo\b", normalized):
+        constraints["property_type"] = "condo"
+        constraints["exclude_commercial"] = True
+    if re.search(r"\b(?:pet|pets)\b|pet[\s-]?friendly", normalized):
+        constraints["pets_allowed"] = True
+    if re.search(r"\bgated\b|\bsecurity\b|concierge|controlled access", normalized):
+        constraints["gated_or_security"] = True
+    if re.search(r"\bcheapest\b|lowest price|best price", normalized):
+        constraints["sort_cheapest"] = True
+    if re.search(r"\bontario\b", normalized) and not constraints.get("city"):
+        constraints["province"] = "ontario"
 
     return constraints
 
@@ -955,12 +1010,49 @@ def draft_is_commercial(draft: dict) -> bool:
     return "commercial" in haystack or property_type == "commercial"
 
 
+def draft_is_condo(draft: dict) -> bool:
+    property_type = normalize_status(compact(draft.get("PropertyType")))
+    title = compact(draft.get("MarketplaceTitle")).lower()
+    if "condo" in property_type:
+        return True
+    return "condo" in title
+
+
+def draft_allows_pets(draft: dict) -> bool:
+    pets = str(draft.get("PetsAllowed") or "").lower()
+    if not pets or pets in {"[]", "no", '["no"]'}:
+        return False
+    return "yes" in pets
+
+
+def draft_has_gated_security(draft: dict) -> bool:
+    hay = f"{draft_text(draft)} {compact(draft.get('Amenities')).lower()}"
+    markers = (
+        "gated",
+        "security",
+        "concierge",
+        "controlled access",
+        "24 hour",
+        "24-hour",
+        "fob",
+        "secure entry",
+        "building security",
+    )
+    return any(marker in hay for marker in markers)
+
+
 def draft_matches_constraints(draft: dict, constraints: dict) -> bool:
     if not constraints:
         return True
     if constraints.get("exclude_commercial") and draft_is_commercial(draft):
         return False
     if constraints.get("residential_only") and draft_is_commercial(draft):
+        return False
+    if constraints.get("property_type") == "condo" and not draft_is_condo(draft):
+        return False
+    if constraints.get("pets_allowed") and not draft_allows_pets(draft):
+        return False
+    if constraints.get("gated_or_security") and not draft_has_gated_security(draft):
         return False
     bed_target = constraints.get("bedrooms")
     if bed_target is not None:
@@ -1503,6 +1595,12 @@ def describe_search_preferences(query: str) -> str:
     max_price = extract_max_price_from_query(normalized)
     if max_price is not None:
         parts.append(f"up to ${max_price:,}")
+    if re.search(r"\b(?:pet|pets)\b|pet[\s-]?friendly", normalized):
+        parts.append("pet-friendly")
+    if re.search(r"\bgated\b|\bsecurity\b|concierge", normalized):
+        parts.append("gated/security")
+    if re.search(r"\bcheapest\b|lowest price", normalized):
+        parts.append("lowest price first")
     return " ".join(parts).strip()
 
 
@@ -2257,7 +2355,7 @@ def build_post_qualification_reply(
     validate_household_counts(session.setdefault("answers", {}))
     summary = format_lead_summary(session.get("answers", {}))
     search_query = compact(session.get("search_query"))
-    matches = rank_drafts(search_query, drafts, limit=3) if search_query else []
+    matches, note = rank_drafts_with_note(search_query, drafts, limit=3) if search_query else ([], "")
     session["last_shared_listing_keys"] = [compact(match.get("ListingKey")) for match in matches if compact(match.get("ListingKey"))]
 
     intro = "Perfect, I’ve got everything I need and I’ll use this to narrow down the best active listings for you."
@@ -2271,7 +2369,11 @@ def build_post_qualification_reply(
             "If you want, I can help refine the area, budget, or unit type and keep an eye out for new options as they come up."
         )
 
-    lines = [intro, "", "Here are a few active options that look relevant:"]
+    lines = [intro, ""]
+    if note:
+        lines.append(note)
+    else:
+        lines.append("Here are a few active options that look relevant:")
     for match in matches:
         lines.append(f"- {summarize_shared_listing(match)}")
     lines.append("")
@@ -3067,7 +3169,7 @@ def all_qualification_fields_complete(answers: dict) -> bool:
 def build_qualified_listing_reply(session: dict, search_query: str, drafts: List[dict]) -> str:
     search_query = merge_search_queries(session, compact(search_query) or compact(session.get("search_query")))
     session["search_query"] = search_query
-    matches = rank_drafts(search_query, drafts, limit=3)
+    matches, note = rank_drafts_with_note(search_query, drafts, limit=3)
     session["last_shared_listing_keys"] = [
         compact(match.get("ListingKey")) for match in matches if compact(match.get("ListingKey"))
     ]
@@ -3076,7 +3178,11 @@ def build_qualified_listing_reply(session: dict, search_query: str, drafts: List
             "I looked again but nothing active matches that right now. "
             "Tell me the city, budget, or unit type and I'll narrow it down."
         )
-    lines = ["Here are a few that fit:"]
+    lines = []
+    if note:
+        lines.append(note)
+    else:
+        lines.append("Here are a few that fit:")
     for match in matches:
         lines.append(f"- {summarize_shared_listing(match)}")
     lines.append("")
