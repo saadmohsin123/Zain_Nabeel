@@ -204,7 +204,26 @@ def migrate_json_lead_state(lead_state_path: Path) -> int:
     return migrated
 
 
-def clear_seen_message_ids() -> None:
+def try_claim_message(message_id: str) -> bool:
+    """Return True only the first time this inbound message id is claimed."""
+    message_id = compact(message_id)
+    if not message_id:
+        return True
+    ensure_schema()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO messenger_seen_messages (message_id, seen_at)
+                VALUES (%s, NOW())
+                ON CONFLICT (message_id) DO NOTHING
+                RETURNING message_id
+                """,
+                (message_id,),
+            )
+            claimed = cur.fetchone() is not None
+        conn.commit()
+    return claimed
     ensure_schema()
     with get_connection() as conn:
         with conn.cursor() as cur:

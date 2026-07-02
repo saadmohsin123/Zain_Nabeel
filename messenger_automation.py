@@ -554,6 +554,91 @@ def wants_listing_help(query: str) -> bool:
     ]
     return any(phrase in q for phrase in phrases)
 
+def search_preferences_changed(old_query: str, new_query: str) -> bool:
+    old_query = compact(old_query)
+    new_query = compact(new_query)
+    if not new_query or not wants_listing_help(new_query):
+        return False
+    if not old_query:
+        return True
+    old_summary = describe_search_preferences(old_query).lower()
+    new_summary = describe_search_preferences(new_query).lower()
+    if old_summary != new_summary:
+        return True
+    old_c = extract_search_constraints(old_query)
+    new_c = extract_search_constraints(new_query)
+    for key in ("city", "bedrooms", "max_price"):
+        if key in new_c and new_c.get(key) != old_c.get(key):
+            return True
+    return False
+
+
+def restart_qualification_for_search(session: dict, query: str, agent_name: str) -> str:
+    summary = describe_search_preferences(query)
+    session["search_query"] = compact(query)
+    session["answers"] = {}
+    session["raw_answers"] = {}
+    session["active"] = True
+    session["awaiting_opt_in"] = False
+    session["qualified"] = False
+    session["step"] = 0
+    session["batch"] = 0
+    session["last_shared_listing_keys"] = []
+    session["selected_listing_key"] = ""
+    session["messaging_paused"] = False
+    intro = f"Got it — {summary}." if summary else "Got it."
+    first = QUALIFICATION_STEPS[0]["prompt"]
+    return f"{intro} I'll ask a few quick questions first.\n\n{first}"
+
+
+def handle_active_search_update(session: dict, query: str, agent_name: str) -> Optional[str]:
+    if not session.get("active") or session.get("qualified"):
+        return None
+    if not wants_listing_help(query):
+        return None
+    if not search_preferences_changed(compact(session.get("search_query")), query):
+        return None
+    return restart_qualification_for_search(session, query, agent_name)
+
+
+def should_skip_duplicate_outbound(session: dict, reply: str) -> bool:
+    last_sent = compact(session.get("last_sent_reply"))
+    if not last_sent or not replies_are_similar(reply, last_sent):
+        return False
+    last_at = int(session.get("last_sent_at") or 0)
+    return last_at and int(time.time()) - last_at < 180
+
+
+def record_outbound_send(session: dict, reply: str) -> None:
+    session["last_sent_reply"] = compact(reply)
+    session["last_sent_at"] = int(time.time())
+
+
+def deliver_reply(
+    config,
+    sender_id: str,
+    reply: str,
+    session: Optional[dict] = None,
+) -> bool:
+    reply = compact(reply)
+    if not reply:
+        return False
+    if session and should_skip_duplicate_outbound(session, reply):
+        print(f"Skipping duplicate outbound to {sender_id}")
+        return False
+    try:
+        send_message(config.page_access_token, sender_id, reply)
+        if session is not None:
+            record_outbound_send(session, reply)
+            sid = compact(sender_id)
+            if sid and session_store.use_postgres_sessions():
+                session_store.save_session(sid, session)
+        return True
+    except Exception as exc:
+        print(f"Failed sending to {sender_id}: {exc}")
+        return False
+
+
 def looks_like_greeting(query: str) -> bool:
     q = query.lower().strip()
     greetings = {
@@ -1303,6 +1388,28 @@ def with_poll_state(poll_state_path: Path, fn):
         return result
 
 
+def claim_inbound_message(message_id: str, poll_state_path: Path) -> bool:
+    message_id = compact(message_id)
+    if not message_id:
+        return True
+    if session_store.use_postgres_sessions():
+        return session_store.try_claim_message(message_id)
+
+    claimed = False
+
+    def _claim(seen: set[str]) -> bool:
+        nonlocal claimed
+        if message_id in seen:
+            claimed = False
+            return False
+        seen.add(message_id)
+        claimed = True
+        return True
+
+    with_poll_state(poll_state_path, _claim)
+    return claimed
+
+
 def load_lead_state(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -1627,6 +1734,8 @@ def is_plausible_occupation(text: str) -> bool:
     if re.fullmatch(r"[kK]", cleaned):
         return False
     if re.fullmatch(r"\$?\d+[kK]?", cleaned):
+        return False
+    if wants_listing_help(cleaned):
         return False
     return True
 
@@ -3914,6 +4023,19 @@ def _reply_deterministic(
 
     extraction_key = openai_api_key if use_ai else ""
 
+    if (
+        wants_listing_help(query)
+        and search_preferences_changed(compact(session.get("search_query")), query)
+        and not session.get("qualified")
+    ):
+        if session.get("awaiting_opt_in"):
+            session["search_query"] = compact(query)
+            intro = qualification_opt_in_prompt(agent_name, describe_search_preferences(query))
+            return save_session_reply(lead_state_path, state, session, intro)
+        if has_partial_qualification(session) or session.get("active"):
+            reply = restart_qualification_for_search(session, query, agent_name)
+            return save_session_reply(lead_state_path, state, session, reply)
+
     if session.get("qualified"):
         reply = build_qualified_reply(
             session,
@@ -3948,6 +4070,11 @@ def _reply_deterministic(
         return save_session_reply(lead_state_path, state, session, reply)
 
     if session.get("active"):
+        if wants_listing_help(query) and search_preferences_changed(
+            compact(session.get("search_query")), query
+        ):
+            reply = restart_qualification_for_search(session, query, agent_name)
+            return save_session_reply(lead_state_path, state, session, reply)
         reply = apply_qualification_turn(
             session,
             query,
@@ -4365,13 +4492,8 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                 if not sender_id or not text:
                     continue
 
-                def _claim_message(seen: set[str]) -> bool:
-                    if message_id and message_id in seen:
-                        print(f"Skipping duplicate webhook message {message_id}")
-                        return False
-                    return True
-
-                if not with_poll_state(self.config.poll_state_path, _claim_message):
+                if not claim_inbound_message(message_id, self.config.poll_state_path):
+                    print(f"Skipping duplicate webhook message {message_id}")
                     continue
 
                 try:
@@ -4394,17 +4516,13 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                 if not compact(reply):
                     print(f"Empty reply for {sender_id}: {text[:80]}")
                     continue
-                try:
-                    send_message(self.config.page_access_token, sender_id, reply)
-
-                    def _mark_seen(seen: set[str]) -> None:
-                        if message_id:
-                            seen.add(message_id)
-
-                    with_poll_state(self.config.poll_state_path, _mark_seen)
+                session = (
+                    session_store.load_session(sender_id)
+                    if session_store.use_postgres_sessions()
+                    else {}
+                )
+                if deliver_reply(self.config, sender_id, reply, session):
                     print(f"Replied to {sender_id}: {text[:80]}")
-                except Exception as exc:
-                    print(f"Failed sending to {sender_id}: {exc}")
 
 
 def run_server(config: MessengerConfig, port: int):
@@ -4505,7 +4623,12 @@ def poll_conversations_once(
             per_conversation_limit=per_conversation_limit,
         ):
             message_id = compact(message.get("id"))
-            if not message_id or message_id in seen:
+            if not message_id:
+                continue
+            if message_id in seen:
+                result["seen_before_count"] += 1
+                continue
+            if not claim_inbound_message(message_id, config.poll_state_path):
                 result["seen_before_count"] += 1
                 continue
 
@@ -4550,13 +4673,17 @@ def poll_conversations_once(
                 use_ai=use_ai,
             )
             if not compact(reply):
-                seen.add(message_id)
                 continue
+            session = (
+                session_store.load_session(sender_id)
+                if session_store.use_postgres_sessions()
+                else {}
+            )
             try:
-                send_message(config.page_access_token, sender_id, reply)
-                seen.add(message_id)
-                result["reply_count"] += 1
-                print(f"Poll replied to {sender_id}: {text[:80]}")
+                if deliver_reply(config, sender_id, reply, session):
+                    seen.add(message_id)
+                    result["reply_count"] += 1
+                    print(f"Poll replied to {sender_id}: {text[:80]}")
             except Exception as exc:
                 print(f"Poll failed sending to {sender_id}: {exc}")
                 result["errors"].append(

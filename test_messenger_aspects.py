@@ -201,6 +201,19 @@ class AspectTest:
         r_hi = self.reply("greeting-qual-user", "Hello")
         self.check("greeting_during_qual", "still here" in r_hi.lower() or "work" in r_hi.lower())
 
+    def run_search_change_tests(self) -> None:
+        sender = "search-change-user"
+        self.reply(sender, "2 bedroom in Toronto under 2500")
+        self.reply(sender, "yes")
+        self.reply(sender, "May 1")
+        self.reply(sender, "1")
+        r = self.reply(sender, "I'm looking for a 2 bedroom in Markham")
+        state = self.session(sender)
+        self.check("search_change_restarts_qual", state.get("active") is True)
+        self.check("search_change_markham_saved", "markham" in state.get("search_query", "").lower())
+        self.check("search_change_clears_stale_answers", not state.get("answers", {}).get("move_in_date"))
+        self.check("search_change_asks_move_in", "move-in" in r.lower() or "move in" in r.lower())
+
     def run_booking_tests(self) -> None:
         sender = "booking-user"
         self.reply(sender, "2 bedroom downtown toronto under 2500")
@@ -271,13 +284,13 @@ class AspectTest:
         payload = json.loads(self.state_path.read_text(encoding="utf-8"))
         payload["sessions"][sender]["active"] = False
         self.state_path.write_text(json.dumps(payload), encoding="utf-8")
-        r = self.reply(sender, "2 bedroom downtown toronto")
+        r = self.reply(sender, "Hello")
         state = self.session(sender)
         self.check("mid_qual_no_opt_in_restart", "just say yes" not in r.lower())
         self.check("mid_qual_resumes_active", state.get("active") is True)
         self.check(
             "mid_qual_asks_next_field",
-            "people" in r.lower() or "lease" in r.lower() or "move" not in r.lower(),
+            "people" in r.lower() or "lease" in r.lower() or "still here" in r.lower(),
         )
 
         profanity_sender = "profanity-qual-user"
@@ -331,6 +344,7 @@ class AspectTest:
         self.run_ai_path_tests()
         self.run_qual_resume_tests()
         self.run_qualified_refinement_tests()
+        self.run_search_change_tests()
         self.run_poll_state_tests()
         return self.failures
 
