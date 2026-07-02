@@ -672,10 +672,19 @@ def handle_messaging_controls(session: dict, query: str) -> Optional[str]:
         return "Got it — I'll stop messaging. Reply anytime if you want help finding a rental."
 
     if session.get("messaging_paused"):
-        if wants_listing_help(query) or looks_like_greeting(query):
+        if wants_listing_help(query) or looks_like_greeting(query) or looks_like_small_talk(query):
             session["messaging_paused"] = False
+            if qualification_in_progress(session) or has_partial_qualification(session):
+                session["active"] = True
+                session["awaiting_opt_in"] = False
+                missing = first_missing_qualification_key(session.setdefault("answers", {}))
+                if missing:
+                    return (
+                        "Welcome back — happy to help. "
+                        + build_missing_field_prompt([missing], session.get("answers", {}))
+                    )
             return None
-        return ""
+        return None
 
     return None
 
@@ -961,10 +970,24 @@ def local_conversational_fallback(
     return "I can help with rentals. What area or unit type are you looking for?"
 
 
-def save_session_reply(lead_state_path: Path, state: dict, session: dict, reply: str) -> str:
+def save_session_reply(
+    lead_state_path: Path,
+    state: dict,
+    session: dict,
+    reply: str,
+    *,
+    query: str = "",
+    agent_name: str = "Nabeel",
+) -> str:
     if session.get("active"):
         reply = guard_against_repeat_reply(reply, session, session.get("answers", {}))
     reply = sanitize_bot_reply(reply)
+    reply = ensure_outbound_reply(
+        reply,
+        session,
+        query or compact(session.get("last_user_message")),
+        compact(session.get("_agent_name")) or agent_name,
+    )
     session["last_prompt"] = reply
     persist_lead_state(lead_state_path, state)
     return reply
@@ -1032,6 +1055,50 @@ def build_next_qualification_reply(
     return build_missing_field_prompt([missing_key], answers)
 
 
+def qualification_greeting_nudge(session: dict, query: str) -> Optional[str]:
+    if not session.get("active") or session.get("qualified"):
+        return None
+    if not (looks_like_greeting(query) or looks_like_small_talk(query)):
+        return None
+    answers = session.setdefault("answers", {})
+    missing = first_missing_qualification_key(answers)
+    if not missing:
+        return None
+    prompt = build_missing_field_prompt([missing], answers)
+    if looks_like_greeting(query):
+        return f"Hey! Still here — {prompt[0].lower() + prompt[1:] if prompt else prompt}"
+    return prompt
+
+
+def ensure_outbound_reply(
+    reply: str,
+    session: dict,
+    query: str,
+    agent_name: str,
+) -> str:
+    cleaned = compact(reply)
+    if cleaned:
+        return cleaned
+    if session.get("active") and not session.get("qualified"):
+        missing = first_missing_qualification_key(session.setdefault("answers", {}))
+        if missing:
+            return build_missing_field_prompt([missing], session.get("answers", {}))
+    if session.get("awaiting_opt_in"):
+        return local_conversational_fallback(
+            "awaiting_opt_in",
+            query,
+            agent_name,
+            last_assistant_message=compact(session.get("last_prompt")),
+            search_query=compact(session.get("search_query")),
+        )
+    if session.get("qualified"):
+        return "Happy to help — want to refine your search, ask about a listing, or book a viewing?"
+    return (
+        f"Hi! I'm {agent_name}'s assistant at Durham New Homes. "
+        "Tell me the area, budget, or type of place you're looking for."
+    )
+
+
 def apply_qualification_turn(
     session: dict,
     query: str,
@@ -1041,6 +1108,9 @@ def apply_qualification_turn(
     openai_model: str,
 ) -> str:
     answers = session.setdefault("answers", {})
+    nudge = qualification_greeting_nudge(session, query)
+    if nudge:
+        return guard_against_repeat_reply(nudge, session, answers)
     if session.get("active") and looks_like_user_pushback(query):
         missing = first_missing_qualification_key(answers)
         if missing:
@@ -3821,6 +3891,8 @@ def _reply_deterministic(
     openai_model: str,
     use_ai: bool,
 ) -> str:
+    session["last_user_message"] = compact(query)
+    session["_agent_name"] = agent_name
     reset_stale_opt_in_session(session, query)
     control_reply = handle_messaging_controls(session, query)
     if control_reply is not None:
@@ -4297,8 +4369,6 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                     if message_id and message_id in seen:
                         print(f"Skipping duplicate webhook message {message_id}")
                         return False
-                    if message_id:
-                        seen.add(message_id)
                     return True
 
                 if not with_poll_state(self.config.poll_state_path, _claim_message):
@@ -4322,9 +4392,16 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                     use_ai=True,
                 )
                 if not compact(reply):
+                    print(f"Empty reply for {sender_id}: {text[:80]}")
                     continue
                 try:
                     send_message(self.config.page_access_token, sender_id, reply)
+
+                    def _mark_seen(seen: set[str]) -> None:
+                        if message_id:
+                            seen.add(message_id)
+
+                    with_poll_state(self.config.poll_state_path, _mark_seen)
                     print(f"Replied to {sender_id}: {text[:80]}")
                 except Exception as exc:
                     print(f"Failed sending to {sender_id}: {exc}")
@@ -4446,6 +4523,11 @@ def poll_conversations_once(
                 continue
 
             if not sender_id or sender_id == config.page_id or not text:
+                seen.add(message_id)
+                result["skipped_page_or_empty_count"] += 1
+                continue
+
+            if created_ts is not None and created_ts < bootstrap_cutoff_ts:
                 seen.add(message_id)
                 result["skipped_page_or_empty_count"] += 1
                 continue
