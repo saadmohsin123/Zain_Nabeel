@@ -20,6 +20,7 @@ def main() -> int:
     suites = [
         (["python3", "test_messenger_flow.py"], "Core flow tests"),
         (["python3", "test_messenger_aspects.py"], "Aspect tests"),
+        (["python3", "scripts/test_50_cases.py"], "50-case regression"),
     ]
     for cmd, label in suites:
         code = run(cmd, label)

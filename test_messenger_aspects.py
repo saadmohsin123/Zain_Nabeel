@@ -348,6 +348,109 @@ class AspectTest:
         payload2 = json.loads(poll_path.read_text(encoding="utf-8"))
         self.check("poll_idempotent_add", payload2.get("seen_message_ids", []).count("alpha") == 1)
 
+    def run_zain_regression_tests(self) -> None:
+        toronto_drafts = [
+            {
+                "ListingKey": "T715",
+                "MarketplaceStatus": "Posted",
+                "ListingLifecycleStatus": "Active",
+                "TransactionType": "For Lease",
+                "MarketplaceTitle": "2 Bed | 2 Bath | Condo | For Rent | Unit 715",
+                "Address": "100 Front St, Toronto",
+                "City": "Toronto",
+                "BedroomsTotal": "2",
+                "MarketplacePrice": 2150,
+                "MarketplacePriceDisplay": "$2,150/month",
+            },
+            {
+                "ListingKey": "T501",
+                "MarketplaceStatus": "Posted",
+                "ListingLifecycleStatus": "Active",
+                "TransactionType": "For Lease",
+                "MarketplaceTitle": "2 Bed | 1 Bath | Condo | For Rent | Unit 501",
+                "Address": "200 King St E, Toronto",
+                "City": "Toronto",
+                "BedroomsTotal": "2",
+                "MarketplacePrice": 2300,
+                "MarketplacePriceDisplay": "$2,300/month",
+            },
+            {
+                "ListingKey": "T902",
+                "MarketplaceStatus": "Posted",
+                "ListingLifecycleStatus": "Active",
+                "TransactionType": "For Lease",
+                "MarketplaceTitle": "2 Bed | 1 Bath | Condo | For Rent | Unit 902",
+                "Address": "300 Queen St W, Toronto",
+                "City": "Toronto",
+                "BedroomsTotal": "2",
+                "MarketplacePrice": 2450,
+                "MarketplacePriceDisplay": "$2,450/month",
+            },
+            {
+                "ListingKey": "T2612",
+                "MarketplaceStatus": "Posted",
+                "ListingLifecycleStatus": "Active",
+                "TransactionType": "For Lease",
+                "MarketplaceTitle": "2 Bed | 2 Bath | Condo | For Rent | Unit 2612",
+                "Address": "400 Bay St, Toronto",
+                "City": "Toronto",
+                "BedroomsTotal": "2",
+                "MarketplacePrice": 2550,
+                "MarketplacePriceDisplay": "$2,550/month",
+            },
+        ]
+        sender = "zain-regression-user"
+        for step in (
+            "2 bed toronto",
+            "yes",
+            "June 1",
+            "1",
+            "120000",
+            "engineer",
+            "PR",
+            "No",
+            "4165551234",
+        ):
+            self.reply(sender, step, drafts=toronto_drafts)
+
+        r_toronto = self.reply(sender, "I'm looking specifically in Toronto", drafts=toronto_drafts)
+        self.check(
+            "zain_toronto_not_calendly",
+            "calendly.com" not in r_toronto.lower(),
+            r_toronto[:120],
+        )
+        self.check(
+            "zain_toronto_shows_listings",
+            "here are" in r_toronto.lower() or r_toronto.count("- ") >= 1,
+            r_toronto[:120],
+        )
+
+        r_list = self.reply(sender, "Send me listings of 2 bedrooms from toronto", drafts=toronto_drafts)
+        lines1 = [line for line in r_list.splitlines() if line.strip().startswith("-")]
+        self.check("zain_three_listings", len(lines1) >= 3, f"got {len(lines1)}")
+
+        r_more = self.reply(sender, "Send other options", drafts=toronto_drafts)
+        lines2 = [line for line in r_more.splitlines() if line.strip().startswith("-")]
+        overlap = set(lines1).intersection(lines2)
+        self.check(
+            "zain_more_options_new",
+            len(lines2) >= 1 and (not overlap or "all the active" in r_more.lower()),
+            f"overlap={len(overlap)}",
+        )
+
+        r_q = self.reply(sender, "??", drafts=toronto_drafts)
+        self.check(
+            "zain_question_marks_helpful",
+            len([line for line in r_q.splitlines() if line.strip().startswith("-")]) >= 1
+            or "all the active" in r_q.lower()
+            or "refine" in r_q.lower(),
+            r_q[:120],
+        )
+        self.check(
+            "specifically_not_booking",
+            not bot.looks_like_booking_request("I'm looking specifically in Toronto"),
+        )
+
     def run(self) -> list[str]:
         self.run_search_tests()
         self.run_session_tests()
@@ -361,6 +464,7 @@ class AspectTest:
         self.run_qualified_refinement_tests()
         self.run_search_change_tests()
         self.run_special_search_tests()
+        self.run_zain_regression_tests()
         self.run_poll_state_tests()
         return self.failures
 
@@ -378,6 +482,7 @@ def main() -> int:
     print("PASSED: booking and security checks")
     print("PASSED: AI path and poll state")
     print("PASSED: qual resume, profanity, and post-qual refinement")
+    print("PASSED: Zain Toronto refine and more-options flow")
     return 0
 
 

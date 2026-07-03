@@ -118,6 +118,19 @@ SEARCH_CITIES = [
     "ajax",
     "toronto",
 ]
+OUT_OF_AREA_CITIES = (
+    "vancouver",
+    "montreal",
+    "calgary",
+    "edmonton",
+    "winnipeg",
+    "halifax",
+    "victoria",
+    "saskatoon",
+    "regina",
+    "quebec city",
+    "quebec",
+)
 QUALIFICATION_STEPS = [
     {"key": "move_in_date", "prompt": "What’s your expected move-in date?"},
     {"key": "people_on_lease", "prompt": "How many people will be on the lease?"},
@@ -362,12 +375,22 @@ def rank_drafts(query: str, drafts: List[dict], limit: int = 3) -> List[dict]:
     return matches
 
 
-def rank_drafts_with_note(query: str, drafts: List[dict], limit: int = 3) -> Tuple[List[dict], str]:
+def rank_drafts_with_note(
+    query: str,
+    drafts: List[dict],
+    limit: int = 3,
+    exclude_keys: Optional[Iterable[str]] = None,
+) -> Tuple[List[dict], str]:
     q_tokens = tokenize(query)
     constraints = extract_search_constraints(query)
     note = ""
+    excluded = {compact(key) for key in (exclude_keys or []) if compact(key)}
 
     candidate_drafts = customer_visible_drafts(drafts)
+    if excluded:
+        candidate_drafts = [
+            draft for draft in candidate_drafts if compact(draft.get("ListingKey")) not in excluded
+        ]
     if not candidate_drafts:
         return [], note
 
@@ -389,6 +412,11 @@ def rank_drafts_with_note(query: str, drafts: List[dict], limit: int = 3) -> Tup
             )
 
     if not filtered and constraints:
+        if constraints.get("out_of_area"):
+            note = (
+                f"I don't have active listings in {constraints['out_of_area'].title()} right now — "
+                "I can help across the Greater Toronto and Durham areas."
+            )
         return [], note
 
     if constraints:
@@ -438,7 +466,16 @@ def rank_drafts_with_note(query: str, drafts: List[dict], limit: int = 3) -> Tup
             scored.append((score, draft))
 
     if not scored:
-        return candidate_drafts[:limit], note if note else ""
+        for token in q_tokens:
+            if len(token) < 4:
+                continue
+            if any(token in draft_text(draft) for draft in candidate_drafts):
+                continue
+            if re.search(rf"\b{re.escape(token)}\b", query.lower()):
+                if constraints.get("out_of_area") == token:
+                    return [], note
+                return [], note
+        return candidate_drafts[:limit], note
 
     scored.sort(key=lambda item: (-item[0], draft_listing_price(item[1]) or 10**9))
     return [draft for _, draft in scored[:limit]], note
@@ -487,19 +524,48 @@ def listing_context(draft: dict) -> dict:
 
 
 def looks_like_booking_request(query: str) -> bool:
-    q = query.lower()
-    phrases = [
-        "book",
-        "booking",
-        "schedule",
-        "meeting",
-        "viewing",
-        "showing",
-        "call",
-        "available tomorrow",
-        "available today",
-        "availability",
-    ]
+    if wants_listing_help(query) or looks_like_search_refinement(query):
+        return False
+    q = normalize_whitespace(query).lower()
+    if not q:
+        return False
+    phrase_patterns = (
+        r"\bbook(?:ing)?\b",
+        r"\bschedule\b",
+        r"\bmeeting\b",
+        r"\bviewing\b",
+        r"\bshowing\b",
+        r"\bcall\b",
+        r"\bavailable tomorrow\b",
+        r"\bavailable today\b",
+        r"\bavailability\b",
+    )
+    return any(re.search(pattern, q) for pattern in phrase_patterns)
+
+
+def looks_like_more_listings_request(query: str) -> bool:
+    q = normalize_whitespace(query).lower()
+    if q in {"??", "?", "..."}:
+        return True
+    phrases = (
+        "any others",
+        "any other",
+        "other options",
+        "more options",
+        "send other",
+        "show other",
+        "show more",
+        "more listings",
+        "anything else",
+        "what else",
+        "different options",
+        "other listings",
+        "see more",
+        "next options",
+        "got anything else",
+        "do you have others",
+        "do you have any other",
+    )
     return any(phrase in q for phrase in phrases)
 
 
@@ -577,6 +643,12 @@ def parse_household_from_text(text: str) -> Dict[str, str]:
 
 def wants_listing_help(query: str) -> bool:
     q = query.lower()
+    if re.search(r"\d+\s*bed(?:room)?s?\b", q):
+        return True
+    if re.search(r"\bunder\s*\$?\s*[\d,]+", q) and re.search(
+        r"\b(?:in|from|near|around)\s+[a-z]", q
+    ):
+        return True
     phrases = [
         "looking for",
         "show me",
@@ -869,6 +941,16 @@ def looks_like_correction(text: str) -> bool:
 
 def looks_like_search_refinement(query: str) -> bool:
     q = query.lower()
+    if any(
+        re.search(pattern, q)
+        for pattern in (
+            r"\bbook(?:ing)?\b",
+            r"\bschedule\b",
+            r"\bviewing\b",
+            r"\bshowing\b",
+        )
+    ):
+        return False
     patterns = (
         r"\d+\s*bed",
         r"\bpool\b",
@@ -879,14 +961,20 @@ def looks_like_search_refinement(query: str) -> bool:
         r"\bi wanted\b",
         r"\bi need\b",
         r"\blooking for\b",
+        r"\blooking\b",
+        r"\bspecifically\b",
         r"\bdo you have\b",
         r"\bcondo\b",
         r"\bcheapest\b",
         r"\bgated\b",
         r"\bsecurity\b",
         r"\bontario\b",
+        r"\bcheaper\b",
+        r"\blower price\b",
     )
-    return any(re.search(pattern, q) for pattern in patterns)
+    if any(re.search(pattern, q) for pattern in patterns):
+        return True
+    return any(re.search(rf"\b{re.escape(city)}\b", q) for city in SEARCH_CITIES)
 
 
 def extract_search_constraints(query: str) -> dict:
@@ -905,6 +993,11 @@ def extract_search_constraints(query: str) -> dict:
     for city in sorted(SEARCH_CITIES, key=len, reverse=True):
         if re.search(rf"\b{re.escape(city)}\b", normalized):
             constraints["city"] = city
+            break
+
+    for city in OUT_OF_AREA_CITIES:
+        if re.search(rf"\b{re.escape(city)}\b", normalized):
+            constraints["out_of_area"] = city
             break
 
     max_price = extract_max_price_from_query(normalized)
@@ -1042,6 +1135,8 @@ def draft_has_gated_security(draft: dict) -> bool:
 
 
 def draft_matches_constraints(draft: dict, constraints: dict) -> bool:
+    if constraints.get("out_of_area"):
+        return False
     if not constraints:
         return True
     if constraints.get("exclude_commercial") and draft_is_commercial(draft):
@@ -1104,6 +1199,8 @@ def guard_against_repeat_reply(reply: str, session: dict, answers: Optional[dict
 
 def reset_stale_opt_in_session(session: dict, query: str) -> bool:
     if not session.get("awaiting_opt_in") or session.get("active") or session.get("qualified"):
+        return False
+    if compact(session.get("search_query")):
         return False
     if not looks_like_greeting(query):
         return False
@@ -2141,10 +2238,32 @@ def draft_by_listing_key(drafts: List[dict], listing_key: str) -> Optional[dict]
 
 def resolve_listing_reference(query: str, session: dict, drafts: List[dict]) -> Optional[dict]:
     shared = listings_from_session(session, drafts)
+    visible = customer_visible_drafts(drafts)
+    q = query.lower()
+
+    unit_match = re.search(r"\bunit\s*#?\s*(\d+\w*)\b", q, re.I)
+    if unit_match:
+        unit_num = unit_match.group(1).lower()
+        unit_hits = [
+            listing
+            for listing in visible
+            if re.search(
+                rf"\bunit\s*#?\s*{re.escape(unit_num)}\b",
+                compact(listing.get("MarketplaceTitle")).lower(),
+            )
+            or unit_num in compact(listing.get("ListingKey")).lower()
+        ]
+        if len(unit_hits) == 1:
+            return unit_hits[0]
+
+    for listing in visible:
+        listing_key = compact(listing.get("ListingKey"))
+        if listing_key and listing_key.lower() in q.replace(" ", ""):
+            return listing
+
     if not shared:
         return None
 
-    q = query.lower()
     ordinal_words = (
         ("third", 2),
         ("3rd", 2),
@@ -2396,6 +2515,15 @@ def handle_post_qualification_booking(
     if not calendly_url:
         return "I can help you move forward on that. Nabeel’s booking link is not configured yet, but I can still note your interest."
 
+    specific = resolve_listing_reference(query, session, drafts)
+    if specific and is_listing_ready(specific):
+        listing = summarize_shared_listing(specific)
+        session["selected_listing_key"] = compact(specific.get("ListingKey"))
+        return (
+            f"Perfect. For {listing}, you can book a time with Nabeel here: {calendly_url} "
+            "When you book, please add the property address or ListingKey in the notes so we can prepare properly."
+        )
+
     last_shared_keys = [key for key in session.get("last_shared_listing_keys", []) if key]
     if last_shared_keys:
         visible = {compact(draft.get("ListingKey")): draft for draft in customer_visible_drafts(drafts)}
@@ -2468,9 +2596,17 @@ def handle_qualified_listing_search(
     openai_model: str = DEFAULT_OPENAI_MODEL,
     use_ai: bool = True,
 ) -> Optional[str]:
+    if looks_like_more_listings_request(query):
+        return build_qualified_listing_reply(
+            session,
+            compact(session.get("search_query")),
+            drafts,
+            show_more=True,
+        )
+
     search_query = compact(query)
     refinement = looks_like_search_refinement(query)
-    should_search = refinement or wants_listing_refresh(query)
+    should_search = refinement or wants_listing_refresh(query) or wants_listing_help(query)
     if looks_like_listing_detail_request(query) or resolve_listing_reference(query, session, drafts):
         return None
     if use_ai and openai_api_key:
@@ -3166,13 +3302,30 @@ def all_qualification_fields_complete(answers: dict) -> bool:
     return all(compact(answers.get(key)) for key in QUALIFICATION_FIELD_KEYS)
 
 
-def build_qualified_listing_reply(session: dict, search_query: str, drafts: List[dict]) -> str:
+def build_qualified_listing_reply(
+    session: dict,
+    search_query: str,
+    drafts: List[dict],
+    *,
+    show_more: bool = False,
+) -> str:
     search_query = merge_search_queries(session, compact(search_query) or compact(session.get("search_query")))
     session["search_query"] = search_query
-    matches, note = rank_drafts_with_note(search_query, drafts, limit=3)
-    session["last_shared_listing_keys"] = [
-        compact(match.get("ListingKey")) for match in matches if compact(match.get("ListingKey"))
-    ]
+    exclude = list(session.get("last_shared_listing_keys", [])) if show_more else []
+    matches, note = rank_drafts_with_note(
+        search_query,
+        drafts,
+        limit=3,
+        exclude_keys=exclude if show_more else None,
+    )
+    if show_more and not matches and exclude:
+        return (
+            "Those are all the active options I have for that search right now. "
+            "Tell me if you want to change the city, budget, or bedrooms."
+        )
+    session["last_shared_listing_keys"] = list(dict.fromkeys(
+        exclude + [compact(match.get("ListingKey")) for match in matches if compact(match.get("ListingKey"))]
+    ))
     if not matches:
         return (
             "I looked again but nothing active matches that right now. "
@@ -3181,6 +3334,8 @@ def build_qualified_listing_reply(session: dict, search_query: str, drafts: List
     lines = []
     if note:
         lines.append(note)
+    elif show_more:
+        lines.append("Here are a few more options:")
     else:
         lines.append("Here are a few that fit:")
     for match in matches:
@@ -4051,6 +4206,17 @@ def build_qualified_reply(
             return f"Here is the current listing packet: {listing_doc_url}"
         return "I do not have the document URL configured yet."
 
+    listing_reply = handle_qualified_listing_search(
+        session,
+        query,
+        drafts,
+        openai_api_key=openai_api_key if use_ai else "",
+        openai_model=openai_model,
+        use_ai=use_ai,
+    )
+    if listing_reply:
+        return listing_reply
+
     booking_reply = handle_post_qualification_booking(session, query, drafts, calendly_url)
     if booking_reply:
         return booking_reply
@@ -4075,17 +4241,6 @@ def build_qualified_reply(
     )
     if interest_reply:
         return interest_reply
-
-    listing_reply = handle_qualified_listing_search(
-        session,
-        query,
-        drafts,
-        openai_api_key=openai_api_key if use_ai else "",
-        openai_model=openai_model,
-        use_ai=use_ai,
-    )
-    if listing_reply:
-        return listing_reply
 
     return (
         "Tell me the address, ListingKey, or what you'd like to refine — "
