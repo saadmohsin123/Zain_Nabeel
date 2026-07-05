@@ -611,6 +611,18 @@ def looks_like_listing_followup_question(query: str) -> bool:
     q = query.lower()
     if looks_like_booking_request(query):
         return False
+    if (
+        wants_listing_help(query)
+        or looks_like_more_listings_request(query)
+        or wants_listing_refresh(query)
+    ):
+        return False
+    if looks_like_search_refinement(query) and "?" not in query:
+        return False
+    if looks_like_search_refinement(query) and not re.search(
+        r"\b(does|do they|is it|is there|are there|can i|could i|what about)\b", q
+    ):
+        return False
     topic_patterns = (
         r"\bpet",
         r"pet[\s-]?friendly",
@@ -628,8 +640,6 @@ def looks_like_listing_followup_question(query: str) -> bool:
         r"\bavailable\b",
         r"\bsq\.?\s*ft\b",
         r"\bsqft\b",
-        r"\bbedroom",
-        r"\bbathroom",
         r"\bamenit",
     )
     if any(re.search(pattern, q) for pattern in topic_patterns):

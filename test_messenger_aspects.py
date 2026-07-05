@@ -483,6 +483,14 @@ class AspectTest:
             "pet_question_is_listing_followup",
             bot.looks_like_listing_followup_question("Ok cool, does it allows pet?"),
         )
+        self.check(
+            "listing_search_not_followup",
+            not bot.looks_like_listing_followup_question("Send me listings of 2 bedrooms from toronto"),
+        )
+        self.check(
+            "refinement_not_followup",
+            not bot.looks_like_listing_followup_question("I wanted 3 bedrooms"),
+        )
 
         pet_listing = {
             "ListingKey": "N13249904",
