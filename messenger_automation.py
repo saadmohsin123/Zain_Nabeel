@@ -29,7 +29,7 @@ Optional env vars:
 - CALENDLY_URL                # optional booking link for calls/showings
 - AGENT_NAME                  # default: Nabeel
 - POLL_CONVERSATIONS_SECONDS  # optional fallback when Meta does not deliver webhooks
-- STABLE_MODE                 # 1 = webhook-only, no poll (AI stays on if OPENAI_API_KEY is set)
+- STABLE_MODE                 # 1 = conservative defaults; does not disable poll or AI
 - POLL_STATE_FILE             # default: messenger_poll_state.json
 - DATABASE_URL                # optional Railway PostgreSQL for per-sender session storage
 - LEAD_STATE_FILE             # default: lead_intake_state.json (local dev fallback)
@@ -5032,6 +5032,8 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                 if not sender_id or not text:
                     continue
 
+                print(f"Webhook inbound from {sender_id}: {text[:120]}")
+
                 if not claim_inbound_message(message_id, self.config.poll_state_path):
                     print(f"Skipping duplicate webhook message {message_id}")
                     continue
@@ -5292,13 +5294,15 @@ def main():
         return
 
     poll_interval = int(os.getenv("POLL_CONVERSATIONS_SECONDS", "0") or "0")
-    if config.stable_mode:
-        if poll_interval > 0:
-            print("STABLE_MODE=1: conversation poller disabled (webhook-only delivery)")
-        poll_interval = 0
-        print("STABLE_MODE=1: webhook-only delivery (OpenAI conversational replies enabled)")
+    if config.stable_mode and poll_interval <= 0:
+        poll_interval = 30
+        print("STABLE_MODE=1: enabling conversation poll fallback every 30s (Meta webhooks often lag)")
+    elif config.stable_mode:
+        print(f"STABLE_MODE=1: poll fallback every {poll_interval}s")
     if poll_interval > 0:
         start_conversation_poller(config, poll_interval)
+    elif config.stable_mode:
+        print("STABLE_MODE=1: webhook-only delivery (set POLL_CONVERSATIONS_SECONDS>0 for fallback)")
 
     run_server(config, args.port)
 
