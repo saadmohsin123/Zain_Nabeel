@@ -523,7 +523,18 @@ class FlowTest:
             },
         ):
             r1 = reply_ai("sync-user", "hello")
-        r2 = reply_ai("sync-user", "Actually I am looking for 2bed Condo in Ontario")
+            with patch.object(
+                bot,
+                "ai_compose_turn",
+                return_value={
+                    "fields": {},
+                    "reply": (
+                        "Got it — a 2-bedroom condo in Ontario sounds good. "
+                        "Would you like me to send you the best active options? Just say yes and I'll ask a few quick questions first."
+                    ),
+                },
+            ):
+                r2 = reply_ai("sync-user", "Actually I am looking for 2bed Condo in Ontario")
         sync_state = json.loads(Path(self.state_path).read_text())["sessions"]["sync-user"]
         self.check("sync_awaiting_opt_in", sync_state.get("awaiting_opt_in") is True)
         self.check("sync_search_saved", "condo" in sync_state.get("search_query", "").lower())

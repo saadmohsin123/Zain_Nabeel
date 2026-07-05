@@ -6,13 +6,16 @@ This document lists every prompt the bot uses: **hardcoded templates** (what use
 
 | Setting | Value |
 |---------|--------|
-| `STABLE_MODE` | `1` |
+| `OPENAI_API_KEY` | **Required** — OpenAI composes every reply in a natural, human voice |
+| `STABLE_MODE` | `1` — webhook-only (disables poll; **does not** disable AI) |
 | `POLL_CONVERSATIONS_SECONDS` | `0` |
-| Reply path | `build_reply` → `_reply_deterministic` (Python only) |
-| Listings | Google Sheet / `marketplace_drafts.json` only — never invented |
+| Reply path | `build_reply` → `_unified_ai_turn` → `AI_MASTER_SYSTEM_PROMPT` |
+| Listings | Google Sheet data injected into AI context — never invented |
 | Sessions | PostgreSQL `messenger_sessions` per sender |
 
-When **`STABLE_MODE=1`**: no OpenAI calls, no conversation poll, webhook-only delivery. Routing uses regex + `looks_like_*` helpers.
+When **`STABLE_MODE=1`**: no conversation poll (webhook-only). OpenAI stays on if `OPENAI_API_KEY` is set.
+
+When **`OPENAI_API_KEY` is missing**: bot falls back to deterministic templates (`_reply_deterministic`).
 
 ---
 

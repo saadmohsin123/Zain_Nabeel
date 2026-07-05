@@ -458,8 +458,8 @@ class AspectTest:
             stable_mode=True,
             openai_api_key="sk-fake-key",
         )
-        self.check("stable_mode_disables_ai", not bot.resolve_use_ai(cfg))
-        self.check("stable_mode_overrides_explicit_true", not bot.resolve_use_ai(cfg, explicit=True))
+        self.check("stable_mode_allows_ai", bot.resolve_use_ai(cfg))
+        self.check("stable_mode_overrides_explicit_false", bot.resolve_use_ai(cfg, explicit=False) is False)
 
         cfg_normal = bot.MessengerConfig(
             page_access_token="token",
@@ -519,7 +519,7 @@ def main() -> int:
     print("PASSED: AI path and poll state")
     print("PASSED: qual resume, profanity, and post-qual refinement")
     print("PASSED: Zain Toronto refine and more-options flow")
-    print("PASSED: STABLE_MODE deterministic flow")
+    print("PASSED: STABLE_MODE keeps AI enabled with poll off")
     return 0
 
 

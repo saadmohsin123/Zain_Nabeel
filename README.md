@@ -38,9 +38,10 @@ OPENAI_MODEL=gpt-4.1-mini
 ```env
 STABLE_MODE=1
 POLL_CONVERSATIONS_SECONDS=0
+OPENAI_API_KEY=sk-...
 ```
 
-With `STABLE_MODE=1`, the bot uses **webhook-only delivery**, **no OpenAI calls**, and **100% code-driven replies** (see `PROMPTS.md`). This prevents out-of-sync AI routing.
+With `OPENAI_API_KEY` set, the bot uses **OpenAI to compose natural, human-like replies** via `AI_MASTER_SYSTEM_PROMPT` (see `PROMPTS.md`). Listing facts still come from the Google Sheet — the model phrases them conversationally but must not invent units or prices. `STABLE_MODE=1` disables the poll fallback only (webhook-only delivery).
 
 ```env
 POLL_CONVERSATIONS_SECONDS=0

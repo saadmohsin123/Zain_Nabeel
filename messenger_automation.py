@@ -29,7 +29,7 @@ Optional env vars:
 - CALENDLY_URL                # optional booking link for calls/showings
 - AGENT_NAME                  # default: Nabeel
 - POLL_CONVERSATIONS_SECONDS  # optional fallback when Meta does not deliver webhooks
-- STABLE_MODE                 # 1 = webhook-only, no AI, no poll (recommended for production)
+- STABLE_MODE                 # 1 = webhook-only, no poll (AI stays on if OPENAI_API_KEY is set)
 - POLL_STATE_FILE             # default: messenger_poll_state.json
 - DATABASE_URL                # optional Railway PostgreSQL for per-sender session storage
 - LEAD_STATE_FILE             # default: lead_intake_state.json (local dev fallback)
@@ -172,52 +172,47 @@ QUALIFICATION_FIELD_KEYS = [step["key"] for step in QUALIFICATION_STEPS]
 
 DEFAULT_OPENAI_MODEL = "gpt-4.1"
 
-AI_MASTER_SYSTEM_PROMPT = """You are the Durham New Homes Messenger assistant for Nabeel's rental leads.
+AI_MASTER_SYSTEM_PROMPT = """You are Nabeel's leasing assistant for Durham New Homes on Facebook Messenger.
 
-ROLE: Sound human — warm, brief, natural. Usually 1-2 short sentences. Never robotic.
-TONE: Stay calm and professional even if the user is rude. Never use profanity, insults, or aggressive language.
+VOICE: Text like a real, helpful person — warm, natural, concise. Vary your wording every turn.
+Never sound like a form letter, FAQ bot, or scripted template. Use contractions when natural.
+Usually 1-3 short sentences unless you are sharing listings (then a short intro plus the list).
 
-OUTPUT: Return JSON only (no markdown):
+OUTPUT: Return JSON only (no markdown fences):
 {
   "fields": {"field_key": "value"},
   "reply": "your message to the user"
 }
 
-=== PIPELINE (strict order) ===
-1. NEW → greet; learn what they want
-2. AWAITING_OPT_IN → offer free listing help after a few quick questions; need yes to proceed
-3. QUALIFYING → collect ALL fields below before any listings
-4. QUALIFIED → discuss shared listings, booking, search refinements
+=== STAGES (follow directive + ai_stage) ===
+1. NEW — greet; learn what they want
+2. AWAITING_OPT_IN — offer free listing help; need yes before qualification
+3. QUALIFYING — collect qualification fields one at a time
+4. QUALIFIED — discuss listings, refinements, booking
 
-=== QUALIFICATION FIELDS (never re-ask if in collected_answers) ===
-Batch 1: move_in_date, people_on_lease
-Batch 2: adults_in_unit, kids_in_unit
-Batch 3: family_gross_income, occupation
-Batch 4: resident_status, working_with_agent (Yes or No only)
-Batch 5: phone_number
+=== QUALIFICATION FIELDS (never re-ask if already in collected_answers) ===
+move_in_date, people_on_lease, adults_in_unit, kids_in_unit, family_gross_income,
+occupation, resident_status, working_with_agent (Yes/No only), phone_number
 
-=== PARSING RULES (fields) ===
+=== PARSING (fields) ===
 - Only fill fields clearly stated in the latest user message
-- Only use keys listed in allowed_field_keys when provided
-- "just me" / "only me" → people_on_lease=1, adults_in_unit=1, kids_in_unit=0
-- "me and my brother/sister/partner" → people_on_lease=2
-- Adults only → kids_in_unit=0
-- adults_in_unit cannot exceed people_on_lease
-- Fix typos: "pf" → "of" in dates
+- Only use keys in allowed_field_keys when provided
+- "just me" → people_on_lease=1, adults_in_unit=1, kids_in_unit=0
 - working_with_agent must be exactly Yes or No
 
 === REPLY RULES ===
-- Follow directive exactly — it tells you what stage you're in and what to ask
-- NEVER ask about fields already in collected_answers
-- NEVER mention listings, prices, or units before stage is QUALIFIED
-- NEVER send or mention a booking/Calendly link unless directive allows_booking is true
-- When discussing listings after qualification, use ONLY listing_data provided — do not invent
-- For first/second/third listing references, use list_position from last_shared_listings
+- Follow directive — it tells you the goal of this turn
+- Understand casual phrasing, typos, and indirect questions; respond to intent
+- NEVER invent listings, prices, addresses, amenities, or availability
+- Use ONLY listing_data, listing_block, and last_shared_listings for property facts
+- NEVER mention listings before QUALIFIED unless directive says otherwise
+- NEVER send a booking/Calendly link unless allow_booking is true and calendly_url is set
+- If listing_block is provided, include every listing with accurate price and unit details
 - Do not repeat last_assistant_message verbatim
-- If directive says ask for one field, ask exactly one question — never combine multiple qualification questions in one message
+- Ask exactly ONE qualification question per turn when qualifying
 
 === WHEN fields should be empty ===
-Set fields to {} when stage is NEW, AWAITING_OPT_IN (unless user volunteered qual info with yes), or when reply-only turns."""
+Set fields to {} for reply-only turns, or when nothing new was stated."""
 
 
 def must_env(name: str, default: Optional[str] = None) -> str:
@@ -240,9 +235,7 @@ def env_flag(name: str, default: bool = False) -> bool:
 
 
 def resolve_use_ai(config: "MessengerConfig", explicit: Optional[bool] = None) -> bool:
-    """When STABLE_MODE is on, all OpenAI calls are disabled regardless of API key."""
-    if config.stable_mode:
-        return False
+    """OpenAI is used whenever an API key is present unless explicitly overridden."""
     if explicit is not None:
         return explicit
     return bool(config.openai_api_key)
@@ -2483,6 +2476,29 @@ def handle_qualified_listing_interest(
     return None
 
 
+def prepare_post_qualification_listings(session: dict, drafts: List[dict]) -> str:
+    """Build factual post-qual listing content for AI to phrase naturally."""
+    validate_household_counts(session.setdefault("answers", {}))
+    summary = format_lead_summary(session.get("answers", {}))
+    search_query = compact(session.get("search_query"))
+    matches, note = rank_drafts_with_note(search_query, drafts, limit=3) if search_query else ([], "")
+    session["last_shared_listing_keys"] = [
+        compact(match.get("ListingKey")) for match in matches if compact(match.get("ListingKey"))
+    ]
+    lines: List[str] = []
+    if summary:
+        lines.append(f"Lead summary:\n{summary}")
+    if note:
+        lines.append(note)
+    if matches:
+        lines.append("Matching active listings:")
+        for match in matches:
+            lines.append(f"- {summarize_shared_listing(match)}")
+    else:
+        lines.append("No active listings closely match the search right now.")
+    return "\n".join(lines)
+
+
 def build_post_qualification_reply(
     session: dict,
     drafts: List[dict],
@@ -2492,16 +2508,18 @@ def build_post_qualification_reply(
     summary = format_lead_summary(session.get("answers", {}))
     search_query = compact(session.get("search_query"))
     matches, note = rank_drafts_with_note(search_query, drafts, limit=3) if search_query else ([], "")
-    session["last_shared_listing_keys"] = [compact(match.get("ListingKey")) for match in matches if compact(match.get("ListingKey"))]
+    session["last_shared_listing_keys"] = [
+        compact(match.get("ListingKey")) for match in matches if compact(match.get("ListingKey"))
+    ]
 
-    intro = "Perfect, I’ve got everything I need and I’ll use this to narrow down the best active listings for you."
+    intro = "Perfect, I've got everything I need and I'll use this to narrow down the best active listings for you."
     if summary:
-        intro += f"\n\nHere’s what I collected:\n{summary}"
+        intro += f"\n\nHere's what I collected:\n{summary}"
 
     if not matches:
         return (
             intro
-            + "\n\nI don’t see any active listings that match closely enough right now. "
+            + "\n\nI don't see any active listings that match closely enough right now. "
             "If you want, I can help refine the area, budget, or unit type and keep an eye out for new options as they come up."
         )
 
@@ -3500,8 +3518,11 @@ def compute_conversation_directive(
                 "User is asking about a specific listing from last_shared_listings. "
                 "Answer using listing_data only. End by asking if they want to book a viewing."
             )
-        elif wants_listing_refresh(query) or wants_listing_help(query):
-            directive = "User wants to see or refine listings. Acknowledge briefly; server will append matching listings."
+        elif wants_listing_refresh(query) or wants_listing_help(query) or looks_like_more_listings_request(query) or looks_like_search_refinement(query):
+            directive = (
+                "User wants to see or refine listings. Acknowledge naturally; "
+                "listing_block will contain accurate inventory to share."
+            )
         else:
             directive = "Help with their rental question using listing_data. Stay concise."
 
@@ -3650,7 +3671,7 @@ def reply_reasks_collected_fields(reply: str, answers: dict) -> bool:
     return False
 
 
-def _unified_ai_turn(
+def _finish_ai_turn(
     session: dict,
     state: dict,
     query: str,
@@ -3661,127 +3682,23 @@ def _unified_ai_turn(
     listing_doc_url: str,
     openai_api_key: str,
     openai_model: str,
+    *,
+    listing_block: str = "",
+    directive_extra: str = "",
+    must_include: str = "",
 ) -> str:
-    reset_stale_opt_in_session(session, query)
-    control_reply = handle_messaging_controls(session, query)
-    if control_reply is not None:
-        return save_session_reply(lead_state_path, state, session, control_reply)
-
-    if contains_profanity(query) and (
-        session.get("active") or qualification_in_progress(session) or session.get("qualified")
-    ):
-        if session.get("qualified"):
-            reply = (
-                "I'm here to help with your rental search. "
-                "Tell me the area, budget, or unit type you'd like to refine."
-            )
-        else:
-            if not session.get("active") and qualification_in_progress(session):
-                begin_structured_qualification(session, query)
-            reply = profanity_safe_qualification_reply(session)
-        return save_session_reply(lead_state_path, state, session, reply)
-
-    if session.get("awaiting_opt_in") and looks_like_affirmative(query):
-        begin_structured_qualification(session, query)
-        extract_qualification_only(session, query, openai_api_key, openai_model)
-        reply = build_next_qualification_reply(
-            session, session.get("answers", {}), drafts, listing_doc_url
-        )
-        return save_session_reply(lead_state_path, state, session, reply)
-
-    if (
-        not session.get("active")
-        and not session.get("qualified")
-        and looks_like_opt_in_acceptance(query, session)
-    ):
-        begin_structured_qualification(session, query)
-        extract_qualification_only(session, query, openai_api_key, openai_model)
-        reply = build_next_qualification_reply(
-            session, session.get("answers", {}), drafts, listing_doc_url
-        )
-        return save_session_reply(lead_state_path, state, session, reply)
-
-    if qualification_in_progress(session) and not session.get("active") and not session.get("qualified"):
-        begin_structured_qualification(session, query)
-
-    extract_qualification_only(session, query, openai_api_key, openai_model)
-
-    if session.get("active") and all_qualification_fields_complete(session.get("answers", {})):
-        session["active"] = False
-        session["qualified"] = True
-        session["completed_at"] = int(time.time())
-        post_reply = build_post_qualification_reply(session, drafts, listing_doc_url)
-        return save_session_reply(lead_state_path, state, session, post_reply)
-
-    if session.get("qualified"):
-        if (
-            (looks_like_greeting(query) or looks_like_small_talk(query))
-            and not wants_listing_help(query)
-            and not looks_like_search_refinement(query)
-            and not resolve_listing_reference(query, session, drafts)
-            and not looks_like_booking_request(query)
-        ):
-            reply = qualified_conversational_reply(session, agent_name, query)
-            return save_session_reply(lead_state_path, state, session, reply)
-
-        interest = handle_qualified_listing_interest(
-            session, query, drafts, calendly_url, openai_api_key, openai_model, agent_name
-        )
-        if interest:
-            return save_session_reply(lead_state_path, state, session, interest)
-        listing = handle_qualified_listing_search(
-            session, query, drafts,
-            openai_api_key=openai_api_key, openai_model=openai_model, use_ai=True,
-        )
-        if listing:
-            return save_session_reply(lead_state_path, state, session, listing)
-
-    answers = session.get("answers", {})
-
-    if session.get("active"):
-        reply = build_next_qualification_reply(session, answers, drafts, listing_doc_url)
-        return save_session_reply(lead_state_path, state, session, reply)
-
-    if should_offer_search_opt_in(session, query, calendly_url):
-        reply = build_search_opt_in_reply(session, query, agent_name)
-        return save_session_reply(lead_state_path, state, session, reply)
-
-    if session.get("awaiting_opt_in") and not looks_like_affirmative(query):
-        reply = build_awaiting_opt_in_reply(session, query, agent_name)
-        return save_session_reply(lead_state_path, state, session, reply)
-
-    if (
-        not session.get("qualified")
-        and not session.get("active")
-        and not session.get("awaiting_opt_in")
-        and looks_like_greeting(query)
-        and not wants_listing_help(query)
-    ):
-        reply = local_conversational_fallback(
-            "new",
-            query,
-            agent_name,
-            last_assistant_message=compact(session.get("last_prompt")),
-        )
-        return save_session_reply(lead_state_path, state, session, reply)
-
-    if looks_like_user_pushback(query):
-        reply = (
-            "No problem — I only ask so I can match you with the right rentals. "
-            "What would you like to share next?"
-        )
-        return save_session_reply(lead_state_path, state, session, reply)
-
-    if qualification_in_progress(session) and not session.get("qualified"):
-        if not session.get("active"):
-            begin_structured_qualification(session, query)
-        extract_qualification_only(session, query, openai_api_key, openai_model)
-        reply = build_next_qualification_reply(
-            session, session.get("answers", {}), drafts, listing_doc_url
-        )
-        return save_session_reply(lead_state_path, state, session, reply)
-
     directive_ctx = compute_conversation_directive(session, query, agent_name, drafts, calendly_url)
+    base_directive = compact(directive_ctx.get("directive"))
+    if directive_extra:
+        base_directive = f"{base_directive} {directive_extra}".strip()
+    if listing_block:
+        directive_ctx["listing_block"] = listing_block
+        base_directive = (
+            f"{base_directive} Include every listing below with accurate prices and unit details "
+            f"(rephrase naturally, do not invent or drop any): {listing_block}"
+        ).strip()
+    directive_ctx["directive"] = base_directive
+
     result = ai_compose_turn(openai_api_key, openai_model, query, directive_ctx)
 
     fields = result.get("fields") if isinstance(result.get("fields"), dict) else {}
@@ -3800,30 +3717,218 @@ def _unified_ai_turn(
         session["active"] = False
         session["qualified"] = True
         session["completed_at"] = int(time.time())
-        post_reply = build_post_qualification_reply(session, drafts, listing_doc_url)
-        return save_session_reply(lead_state_path, state, session, post_reply)
+        facts = prepare_post_qualification_listings(session, drafts)
+        return _finish_ai_turn(
+            session,
+            state,
+            query,
+            lead_state_path,
+            agent_name,
+            calendly_url,
+            drafts,
+            listing_doc_url,
+            openai_api_key,
+            openai_model,
+            listing_block=facts,
+            directive_extra=(
+                "They just finished qualification. Thank them warmly in your own words, "
+                "then share matching listings from listing_block."
+            ),
+        )
 
-    reply = compact(result.get("reply"))
+    reply = sanitize_bot_reply(compact(result.get("reply")))
     answers = session.get("answers", {})
 
     if reply and reply_reasks_collected_fields(reply, answers):
         missing_key = first_missing_qualification_key(answers)
         if missing_key:
-            reply = build_missing_field_prompt([missing_key], answers)
-
-    if not reply:
-        if session.get("active"):
-            reply = build_next_qualification_reply(session, answers, drafts, listing_doc_url)
-        else:
-            reply = local_conversational_fallback(
-                directive_ctx.get("ai_stage", "new").lower(),
-                query,
-                agent_name,
-                last_assistant_message=compact(session.get("last_prompt")),
-                search_query=compact(session.get("search_query")),
+            retry_ctx = dict(directive_ctx)
+            collected = {
+                key: compact(answers.get(key)) for key in QUALIFICATION_FIELD_KEYS if compact(answers.get(key))
+            }
+            retry_ctx["directive"] = (
+                f"Do NOT re-ask fields already collected: {json.dumps(collected)}. "
+                f"Ask ONLY about: {missing_key}"
+            )
+            retry = ai_compose_turn(openai_api_key, openai_model, query, retry_ctx)
+            reply = sanitize_bot_reply(compact(retry.get("reply"))) or build_missing_field_prompt(
+                [missing_key], answers
             )
 
+    if not reply:
+        reply = sanitize_bot_reply(
+            ai_generate_conversational_reply(
+                openai_api_key,
+                openai_model,
+                query,
+                agent_name,
+                conversation_stage(session),
+                search_query=compact(session.get("search_query")),
+                last_assistant_message=compact(session.get("last_prompt")),
+            )
+        )
+    if not reply:
+        reply = ensure_outbound_reply("", session, query, agent_name)
+
+    if must_include and must_include not in reply:
+        reply = f"{reply}\n\n{must_include}".strip()
+
     return save_session_reply(lead_state_path, state, session, reply)
+
+
+def _unified_ai_turn(
+    session: dict,
+    state: dict,
+    query: str,
+    lead_state_path: Path,
+    agent_name: str,
+    calendly_url: str,
+    drafts: List[dict],
+    listing_doc_url: str,
+    openai_api_key: str,
+    openai_model: str,
+) -> str:
+    session["last_user_message"] = compact(query)
+    session["_agent_name"] = agent_name
+    reset_stale_opt_in_session(session, query)
+
+    control_reply = handle_messaging_controls(session, query)
+    if control_reply is not None:
+        return save_session_reply(lead_state_path, state, session, control_reply)
+
+    if contains_profanity(query) and (
+        session.get("active") or qualification_in_progress(session) or session.get("qualified")
+    ):
+        if session.get("qualified"):
+            return _finish_ai_turn(
+                session, state, query, lead_state_path, agent_name, calendly_url, drafts,
+                listing_doc_url, openai_api_key, openai_model,
+                directive_extra="User was rude. Stay calm and redirect to their rental search.",
+            )
+        if not session.get("active") and qualification_in_progress(session):
+            begin_structured_qualification(session, query)
+        extract_qualification_only(session, query, openai_api_key, openai_model)
+        return _finish_ai_turn(
+            session, state, query, lead_state_path, agent_name, calendly_url, drafts,
+            listing_doc_url, openai_api_key, openai_model,
+            directive_extra="User was rude. Stay calm and continue qualification.",
+        )
+
+    if (
+        wants_listing_help(query)
+        and search_preferences_changed(compact(session.get("search_query")), query)
+        and not session.get("qualified")
+    ):
+        if session.get("awaiting_opt_in"):
+            session["search_query"] = compact(query)
+        elif has_partial_qualification(session) or session.get("active"):
+            restart_qualification_for_search(session, query, agent_name)
+            return _finish_ai_turn(
+                session, state, query, lead_state_path, agent_name, calendly_url, drafts,
+                listing_doc_url, openai_api_key, openai_model,
+                directive_extra="They changed their search preferences. Acknowledge and ask for move-in date.",
+            )
+
+    if session.get("awaiting_opt_in") and looks_like_affirmative(query):
+        begin_structured_qualification(session, query)
+        extract_qualification_only(session, query, openai_api_key, openai_model)
+        return _finish_ai_turn(
+            session, state, query, lead_state_path, agent_name, calendly_url, drafts,
+            listing_doc_url, openai_api_key, openai_model,
+        )
+
+    if (
+        not session.get("active")
+        and not session.get("qualified")
+        and looks_like_opt_in_acceptance(query, session)
+    ):
+        begin_structured_qualification(session, query)
+        extract_qualification_only(session, query, openai_api_key, openai_model)
+        return _finish_ai_turn(
+            session, state, query, lead_state_path, agent_name, calendly_url, drafts,
+            listing_doc_url, openai_api_key, openai_model,
+        )
+
+    if qualification_in_progress(session) and not session.get("active") and not session.get("qualified"):
+        begin_structured_qualification(session, query)
+
+    extract_qualification_only(session, query, openai_api_key, openai_model)
+
+    if session.get("qualified"):
+        booking_reply = handle_post_qualification_booking(session, query, drafts, calendly_url)
+        if booking_reply:
+            return _finish_ai_turn(
+                session, state, query, lead_state_path, agent_name, calendly_url, drafts,
+                listing_doc_url, openai_api_key, openai_model,
+                directive_extra="User wants to book a viewing. Be natural and helpful.",
+                must_include=booking_reply,
+            )
+
+        interest = handle_qualified_listing_interest(
+            session, query, drafts, calendly_url, openai_api_key, openai_model, agent_name
+        )
+        if interest:
+            return _finish_ai_turn(
+                session, state, query, lead_state_path, agent_name, calendly_url, drafts,
+                listing_doc_url, openai_api_key, openai_model,
+                listing_block=interest,
+                directive_extra="Answer about the listing using these facts only.",
+            )
+
+        listing_block = ""
+        if (
+            looks_like_more_listings_request(query)
+            or looks_like_search_refinement(query)
+            or wants_listing_refresh(query)
+            or wants_listing_help(query)
+        ):
+            listing_block = handle_qualified_listing_search(
+                session,
+                query,
+                drafts,
+                openai_api_key=openai_api_key,
+                openai_model=openai_model,
+                use_ai=False,
+            ) or ""
+
+        return _finish_ai_turn(
+            session, state, query, lead_state_path, agent_name, calendly_url, drafts,
+            listing_doc_url, openai_api_key, openai_model,
+            listing_block=listing_block,
+        )
+
+    if session.get("active"):
+        return _finish_ai_turn(
+            session, state, query, lead_state_path, agent_name, calendly_url, drafts,
+            listing_doc_url, openai_api_key, openai_model,
+        )
+
+    if should_offer_search_opt_in(session, query, calendly_url):
+        session["search_query"] = compact(query)
+        session["awaiting_opt_in"] = True
+        session["active"] = False
+        return _finish_ai_turn(
+            session, state, query, lead_state_path, agent_name, calendly_url, drafts,
+            listing_doc_url, openai_api_key, openai_model,
+        )
+
+    if session.get("awaiting_opt_in"):
+        return _finish_ai_turn(
+            session, state, query, lead_state_path, agent_name, calendly_url, drafts,
+            listing_doc_url, openai_api_key, openai_model,
+        )
+
+    if looks_like_user_pushback(query):
+        return _finish_ai_turn(
+            session, state, query, lead_state_path, agent_name, calendly_url, drafts,
+            listing_doc_url, openai_api_key, openai_model,
+            directive_extra="User pushed back on questions. Explain briefly why you ask, stay friendly.",
+        )
+
+    return _finish_ai_turn(
+        session, state, query, lead_state_path, agent_name, calendly_url, drafts,
+        listing_doc_url, openai_api_key, openai_model,
+    )
 
 
 def handle_unified_ai_turn(
@@ -4468,6 +4573,23 @@ def build_reply(
     openai_model: str = DEFAULT_OPENAI_MODEL,
     use_ai: bool = True,
 ) -> str:
+    if use_ai and compact(openai_api_key):
+        return with_lead_session(
+            sender_id,
+            lead_state_path,
+            lambda session, state: _unified_ai_turn(
+                session,
+                state,
+                query,
+                lead_state_path,
+                agent_name,
+                calendly_url,
+                drafts,
+                listing_doc_url,
+                openai_api_key,
+                openai_model,
+            ),
+        )
     return build_reply_deterministic(
         sender_id,
         query,
@@ -4478,7 +4600,7 @@ def build_reply(
         lead_state_path=lead_state_path,
         openai_api_key=openai_api_key,
         openai_model=openai_model,
-        use_ai=use_ai,
+        use_ai=False,
     )
 
 
@@ -5031,9 +5153,8 @@ def main():
     if config.stable_mode:
         if poll_interval > 0:
             print("STABLE_MODE=1: conversation poller disabled (webhook-only delivery)")
-        else:
-            print("STABLE_MODE=1: deterministic webhook-only bot (no OpenAI, no poll)")
         poll_interval = 0
+        print("STABLE_MODE=1: webhook-only delivery (OpenAI conversational replies enabled)")
     if poll_interval > 0:
         start_conversation_poller(config, poll_interval)
 
