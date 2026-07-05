@@ -28,6 +28,7 @@ DEFAULT_SESSION = {
     "pending_booking_offer": False,
     "last_prompt": "",
     "messaging_paused": False,
+    "message_history": [],
 }
 
 SCHEMA_SQL = """
@@ -94,6 +95,7 @@ def merge_session_defaults(session: dict) -> dict:
     merged.setdefault("answers", {})
     merged.setdefault("raw_answers", {})
     merged.setdefault("last_shared_listing_keys", [])
+    merged.setdefault("message_history", [])
     return merged
 
 

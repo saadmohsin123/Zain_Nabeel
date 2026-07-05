@@ -171,6 +171,7 @@ QUALIFICATION_BATCHES = [
 QUALIFICATION_FIELD_KEYS = [step["key"] for step in QUALIFICATION_STEPS]
 
 DEFAULT_OPENAI_MODEL = "gpt-4.1"
+MAX_MESSAGE_HISTORY = 40
 
 AI_MASTER_SYSTEM_PROMPT = """You are Nabeel's leasing assistant for Durham New Homes on Facebook Messenger.
 
@@ -208,6 +209,7 @@ occupation, resident_status, working_with_agent (Yes/No only), phone_number
 - NEVER mention listings before QUALIFIED unless directive says otherwise
 - NEVER send a booking/Calendly link unless allow_booking is true and calendly_url is set
 - If listing_block is provided, include every listing with accurate price and unit details
+- Use recent_message_history for conversational continuity; do not re-ask what was already answered
 - Do not repeat last_assistant_message verbatim
 - Ask exactly ONE qualification question per turn when qualifying
 
@@ -581,6 +583,74 @@ def looks_like_more_listings_request(query: str) -> bool:
 
 def shortlist_for_booking(matches: List[dict]) -> List[dict]:
     return [draft for draft in matches if is_listing_ready(draft)]
+
+
+def append_message_history(session: dict, role: str, text: str) -> None:
+    text = compact(text)
+    if not text or role not in {"user", "assistant"}:
+        return
+    history = session.get("message_history")
+    if not isinstance(history, list):
+        history = []
+    history.append({"role": role, "text": text, "at": int(time.time())})
+    session["message_history"] = history[-MAX_MESSAGE_HISTORY:]
+
+
+def recent_message_history(session: dict, limit: int = 12) -> List[dict]:
+    history = session.get("message_history")
+    if not isinstance(history, list):
+        return []
+    return [
+        {"role": compact(item.get("role")), "text": compact(item.get("text"))}
+        for item in history[-limit:]
+        if isinstance(item, dict) and compact(item.get("text"))
+    ]
+
+
+def looks_like_listing_followup_question(query: str) -> bool:
+    q = query.lower()
+    if looks_like_booking_request(query):
+        return False
+    topic_patterns = (
+        r"\bpet",
+        r"pet[\s-]?friendly",
+        r"\ballow",
+        r"\ballowed\b",
+        r"\bparking\b",
+        r"\blaundry\b",
+        r"\bwasher\b",
+        r"\bdryer\b",
+        r"\bbasement\b",
+        r"\bgarage\b",
+        r"\butilities\b",
+        r"\bincluded\b",
+        r"\bdeposit\b",
+        r"\bavailable\b",
+        r"\bsq\.?\s*ft\b",
+        r"\bsqft\b",
+        r"\bbedroom",
+        r"\bbathroom",
+        r"\bamenit",
+    )
+    if any(re.search(pattern, q) for pattern in topic_patterns):
+        return True
+    if "?" in q and any(
+        phrase in q
+        for phrase in (
+            "does it",
+            "do they",
+            "is it",
+            "is there",
+            "are there",
+            "can i",
+            "could i",
+            "what about",
+            "how much",
+            "how many",
+        )
+    ):
+        return True
+    return False
 
 
 def looks_like_affirmative(query: str) -> bool:
@@ -1289,6 +1359,7 @@ def save_session_reply(
         compact(session.get("_agent_name")) or agent_name,
     )
     session["last_prompt"] = reply
+    append_message_history(session, "assistant", reply)
     persist_lead_state(lead_state_path, state)
     return reply
 
@@ -1681,6 +1752,7 @@ def get_lead_session(state: dict, sender_id: str) -> dict:
             "pending_booking_offer": False,
             "last_prompt": "",
             "messaging_paused": False,
+            "message_history": [],
         },
     )
 
@@ -2369,7 +2441,12 @@ def looks_like_listing_detail_request(query: str) -> bool:
 
 
 def looks_like_booking_confirmation(query: str, session: dict) -> bool:
+    if looks_like_listing_followup_question(query):
+        return False
     if not looks_like_affirmative(query):
+        return False
+    # "Ok cool, does it allow pets?" starts with ok but is a follow-up question, not booking.
+    if "?" in query:
         return False
     if compact(session.get("selected_listing_key")):
         return True
@@ -2455,6 +2532,30 @@ def handle_qualified_listing_interest(
     openai_model: str,
     agent_name: str,
 ) -> Optional[str]:
+    shared = listings_from_session(session, drafts)
+    listing = resolve_listing_reference(query, session, drafts)
+
+    if looks_like_listing_followup_question(query) or looks_like_listing_detail_request(query):
+        if not listing and compact(session.get("selected_listing_key")):
+            listing = draft_by_listing_key(drafts, compact(session.get("selected_listing_key")))
+        if not listing and shared:
+            listing = shared[0]
+        if listing:
+            listing_key = compact(listing.get("ListingKey"))
+            session["selected_listing_key"] = listing_key
+            position = shared.index(listing) + 1 if listing in shared else None
+            reply = generate_listing_detail_reply(
+                query,
+                listing,
+                openai_api_key,
+                openai_model,
+                agent_name,
+                position=position,
+            )
+            if any(word in reply.lower() for word in ("viewing", "book", "schedule")):
+                session["pending_booking_offer"] = True
+            return reply
+
     if user_asking_booking_options(query, session):
         session["pending_booking_offer"] = False
         return build_calendly_booking_reply(session, calendly_url, drafts)
@@ -2462,9 +2563,6 @@ def handle_qualified_listing_interest(
     if looks_like_booking_confirmation(query, session):
         session["pending_booking_offer"] = False
         return build_calendly_booking_reply(session, calendly_url, drafts)
-
-    shared = listings_from_session(session, drafts)
-    listing = resolve_listing_reference(query, session, drafts)
     if not listing and compact(session.get("selected_listing_key")):
         if (
             looks_like_listing_detail_request(query)
@@ -2672,7 +2770,11 @@ def handle_qualified_listing_search(
     search_query = compact(query)
     refinement = looks_like_search_refinement(query)
     should_search = refinement or wants_listing_refresh(query) or wants_listing_help(query)
-    if looks_like_listing_detail_request(query) or resolve_listing_reference(query, session, drafts):
+    if (
+        looks_like_listing_followup_question(query)
+        or looks_like_listing_detail_request(query)
+        or resolve_listing_reference(query, session, drafts)
+    ):
         return None
     if use_ai and openai_api_key:
         interpretation = ai_interpret_qualified_message(
@@ -3543,10 +3645,16 @@ def compute_conversation_directive(
                 "User wants to book a viewing. Confirm briefly and tell them you'll share the booking link. "
                 "Do not invent times."
             )
-        elif looks_like_listing_detail_request(query) or resolve_listing_reference(query, session, drafts):
+        elif (
+            looks_like_listing_followup_question(query)
+            or looks_like_listing_detail_request(query)
+            or resolve_listing_reference(query, session, drafts)
+        ):
             directive = (
                 "User is asking about a specific listing from last_shared_listings. "
-                "Answer using listing_data only. End by asking if they want to book a viewing."
+                "Answer using listing_data only (including PetsAllowed when they ask about pets). "
+                "Do NOT send a booking link unless they explicitly ask to book. "
+                "End by asking if they want to book a viewing."
             )
         elif wants_listing_refresh(query) or wants_listing_help(query) or looks_like_more_listings_request(query) or looks_like_search_refinement(query):
             directive = (
@@ -3656,6 +3764,7 @@ def compute_conversation_directive(
         "listing_data": listing_data,
         "selected_listing_key": compact(session.get("selected_listing_key")),
         "last_assistant_message": compact(session.get("last_prompt")),
+        "recent_message_history": recent_message_history(session),
         "agent_name": agent_name,
     }
 
@@ -3902,6 +4011,7 @@ def _unified_ai_turn(
 ) -> str:
     session["last_user_message"] = compact(query)
     session["_agent_name"] = agent_name
+    append_message_history(session, "user", query)
     reset_stale_opt_in_session(session, query)
 
     control_reply = handle_messaging_controls(session, query)
@@ -4501,6 +4611,7 @@ def _reply_deterministic(
 ) -> str:
     session["last_user_message"] = compact(query)
     session["_agent_name"] = agent_name
+    append_message_history(session, "user", query)
     reset_stale_opt_in_session(session, query)
     control_reply = handle_messaging_controls(session, query)
     if control_reply is not None:

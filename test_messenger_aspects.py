@@ -465,6 +465,58 @@ class AspectTest:
         r = self.reply(sender, q, use_ai=False)
         self.check("family_search_gets_listings", "here are" in r.lower() or "help" in r.lower())
 
+    def run_listing_followup_tests(self) -> None:
+        session = {
+            "qualified": True,
+            "selected_listing_key": "N13249904",
+            "last_shared_listing_keys": ["N13249904"],
+        }
+        self.check(
+            "pet_question_not_booking_confirmation",
+            not bot.looks_like_booking_confirmation("Ok cool, does it allows pet?", session),
+        )
+        self.check(
+            "ok_only_is_booking_confirmation_with_selection",
+            bot.looks_like_booking_confirmation("ok cool", session),
+        )
+        self.check(
+            "pet_question_is_listing_followup",
+            bot.looks_like_listing_followup_question("Ok cool, does it allows pet?"),
+        )
+
+        pet_listing = {
+            "ListingKey": "N13249904",
+            "MarketplaceStatus": "Posted",
+            "ListingLifecycleStatus": "Active",
+            "TransactionType": "For Lease",
+            "MarketplaceTitle": "4 Bed House Newmarket",
+            "Address": "71 Gail Parks Crescent, Newmarket, ON",
+            "City": "Newmarket",
+            "BedroomsTotal": "4",
+            "PetsAllowed": "Yes",
+            "MarketplacePriceDisplay": "$3,500/month",
+        }
+        interest = bot.handle_qualified_listing_interest(
+            session,
+            "Ok cool, does it allows pet?",
+            SAMPLE_DRAFTS + [pet_listing],
+            self.calendly,
+            "",
+            "",
+            "Nabeel",
+        )
+        self.check("pet_followup_not_calendly_first", interest and "calendly.com" not in interest.lower())
+        self.check("pet_followup_mentions_pets", interest and "pet" in interest.lower())
+
+        sender = "listing-followup-user"
+        self.reply(sender, "Hi", use_ai=False)
+        r = self.reply(sender, "Toronto 2 bed", use_ai=False)
+        s2 = self.session(sender)
+        history = s2.get("message_history") or []
+        self.check("message_history_saved", len(history) >= 2)
+        self.check("message_history_has_user_turn", any(item.get("role") == "user" for item in history))
+        self.check("message_history_has_assistant_turn", any(item.get("role") == "assistant" for item in history))
+
     def run_stable_mode_tests(self) -> None:
         cfg = bot.MessengerConfig(
             page_access_token="token",
@@ -515,6 +567,7 @@ class AspectTest:
         self.run_special_search_tests()
         self.run_zain_regression_tests()
         self.run_family_search_tests()
+        self.run_listing_followup_tests()
         self.run_stable_mode_tests()
         self.run_poll_state_tests()
         return self.failures
@@ -534,6 +587,7 @@ def main() -> int:
     print("PASSED: AI path and poll state")
     print("PASSED: qual resume, profanity, and post-qual refinement")
     print("PASSED: Zain Toronto refine and more-options flow")
+    print("PASSED: listing follow-up questions and message history")
     print("PASSED: STABLE_MODE keeps AI enabled with poll off")
     return 0
 
