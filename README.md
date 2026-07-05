@@ -33,12 +33,29 @@ OPENAI_MODEL=gpt-4.1-mini
 
 `OPENAI_API_KEY` powers intelligent qualification parsing (understanding messy natural answers), post-qualification search intent, and natural listing replies. Without it, the bot falls back to basic rule-based parsing.
 
+**Recommended for production stability:**
+
 ```env
-POLL_CONVERSATIONS_SECONDS=15
+STABLE_MODE=1
+POLL_CONVERSATIONS_SECONDS=0
+```
+
+With `STABLE_MODE=1`, the bot uses **webhook-only delivery**, **no OpenAI calls**, and **100% code-driven replies** (see `PROMPTS.md`). This prevents out-of-sync AI routing.
+
+```env
+POLL_CONVERSATIONS_SECONDS=0
 POLL_STATE_FILE=messenger_poll_state.json
 ```
 
-Use the polling fallback only until the Meta app is Live/approved and normal webhook delivery is confirmed.
+Use the polling fallback only until the Meta app is Live/approved and normal webhook delivery is confirmed. Disable poll entirely when `STABLE_MODE=1`.
+
+See **`PROMPTS.md`** for all bot prompts, templates, and the conversation pipeline.
+
+### Clear a user's session (fresh retest)
+
+```bash
+python3 scripts/clear_messenger_session.py 36173247835655833
+```
 
 ### PostgreSQL session storage (recommended on Railway)
 

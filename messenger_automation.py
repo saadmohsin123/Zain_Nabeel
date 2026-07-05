@@ -29,6 +29,7 @@ Optional env vars:
 - CALENDLY_URL                # optional booking link for calls/showings
 - AGENT_NAME                  # default: Nabeel
 - POLL_CONVERSATIONS_SECONDS  # optional fallback when Meta does not deliver webhooks
+- STABLE_MODE                 # 1 = webhook-only, no AI, no poll (recommended for production)
 - POLL_STATE_FILE             # default: messenger_poll_state.json
 - DATABASE_URL                # optional Railway PostgreSQL for per-sender session storage
 - LEAD_STATE_FILE             # default: lead_intake_state.json (local dev fallback)
@@ -229,6 +230,22 @@ def must_env(name: str, default: Optional[str] = None) -> str:
 def optional_env(name: str, default: str = "") -> str:
     value = os.getenv(name, default)
     return "" if value is None else value
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def resolve_use_ai(config: "MessengerConfig", explicit: Optional[bool] = None) -> bool:
+    """When STABLE_MODE is on, all OpenAI calls are disabled regardless of API key."""
+    if config.stable_mode:
+        return False
+    if explicit is not None:
+        return explicit
+    return bool(config.openai_api_key)
 
 
 def resolve_page_access_token(user_access_token: str, page_id: str) -> str:
@@ -4564,6 +4581,7 @@ class MessengerConfig:
     openai_model: str = "gpt-4.1-mini"
     token_source: str = "page"
     bootstrap_reply_lookback_seconds: int = 86400
+    stable_mode: bool = False
 
 
 def make_config() -> MessengerConfig:
@@ -4602,6 +4620,7 @@ def make_config() -> MessengerConfig:
         openai_model=os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
         token_source=token_source,
         bootstrap_reply_lookback_seconds=int(os.getenv("POLL_BOOTSTRAP_LOOKBACK_SECONDS", "86400") or "86400"),
+        stable_mode=env_flag("STABLE_MODE"),
     )
 
 
@@ -4663,6 +4682,8 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                     "poll_state_file": str(self.config.poll_state_path),
                     "seen_message_count": seen_count,
                     "session_store": session_store.session_store_status(),
+                    "stable_mode": self.config.stable_mode,
+                    "use_ai": resolve_use_ai(self.config),
                 },
             )
             return
@@ -4670,7 +4691,8 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
             token = params.get("token", [""])[0]
             initialize_only = params.get("initialize_only", ["0"])[0] in ("1", "true", "yes")
             reset_seen = params.get("reset_seen", ["0"])[0] in ("1", "true", "yes")
-            use_ai = params.get("use_ai", ["1"])[0] not in ("0", "false", "no")
+            explicit_ai = params.get("use_ai", ["1"])[0] not in ("0", "false", "no")
+            use_ai = resolve_use_ai(self.config, explicit=explicit_ai)
             conversation_limit = int(params.get("conversation_limit", ["10"])[0] or "10")
             per_conversation_limit = int(params.get("per_conversation_limit", ["5"])[0] or "5")
             if token != self.config.verify_token:
@@ -4772,7 +4794,7 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                     lead_state_path=self.config.lead_state_path,
                     openai_api_key=self.config.openai_api_key,
                     openai_model=self.config.openai_model,
-                    use_ai=True,
+                    use_ai=resolve_use_ai(self.config),
                 )
                 if not compact(reply):
                     print(f"Empty reply for {sender_id}: {text[:80]}")
@@ -4931,7 +4953,7 @@ def poll_conversations_once(
                 lead_state_path=config.lead_state_path,
                 openai_api_key=config.openai_api_key,
                 openai_model=config.openai_model,
-                use_ai=use_ai,
+                use_ai=resolve_use_ai(config, explicit=use_ai),
             )
             if not compact(reply):
                 continue
@@ -4973,7 +4995,7 @@ def start_conversation_poller(config: MessengerConfig, interval_seconds: int):
         while True:
             time.sleep(interval_seconds)
             try:
-                result = poll_conversations_once(config)
+                result = poll_conversations_once(config, use_ai=resolve_use_ai(config))
                 if result.get("reply_count") or result.get("errors"):
                     print(f"Conversation poll result: {json.dumps(result)}")
             except Exception as exc:
@@ -5006,6 +5028,12 @@ def main():
         return
 
     poll_interval = int(os.getenv("POLL_CONVERSATIONS_SECONDS", "0") or "0")
+    if config.stable_mode:
+        if poll_interval > 0:
+            print("STABLE_MODE=1: conversation poller disabled (webhook-only delivery)")
+        else:
+            print("STABLE_MODE=1: deterministic webhook-only bot (no OpenAI, no poll)")
+        poll_interval = 0
     if poll_interval > 0:
         start_conversation_poller(config, poll_interval)
 

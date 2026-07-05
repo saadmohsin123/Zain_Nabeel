@@ -451,6 +451,41 @@ class AspectTest:
             not bot.looks_like_booking_request("I'm looking specifically in Toronto"),
         )
 
+    def run_stable_mode_tests(self) -> None:
+        cfg = bot.MessengerConfig(
+            page_access_token="token",
+            verify_token="verify",
+            stable_mode=True,
+            openai_api_key="sk-fake-key",
+        )
+        self.check("stable_mode_disables_ai", not bot.resolve_use_ai(cfg))
+        self.check("stable_mode_overrides_explicit_true", not bot.resolve_use_ai(cfg, explicit=True))
+
+        cfg_normal = bot.MessengerConfig(
+            page_access_token="token",
+            verify_token="verify",
+            stable_mode=False,
+            openai_api_key="sk-fake-key",
+        )
+        self.check("normal_mode_uses_ai_when_key_set", bot.resolve_use_ai(cfg_normal))
+
+        sender = "stable-flow-user"
+        self.reply(sender, "2 bed in Toronto under 2500", use_ai=False)
+        s = self.session(sender)
+        self.check("stable_flow_opt_in", s.get("awaiting_opt_in") and "toronto" in s.get("search_query", "").lower())
+        r = self.reply(sender, "yes", use_ai=False)
+        self.check("stable_flow_qual_start", "move-in" in r.lower() or "move in" in r.lower())
+
+        with patch.object(
+            bot,
+            "call_openai_json",
+            side_effect=AssertionError("OpenAI must not be called when use_ai=False"),
+        ):
+            self.reply("stable-no-ai-user", "2 bed toronto", use_ai=False)
+            self.reply("stable-no-ai-user", "yes", use_ai=False)
+            self.reply("stable-no-ai-user", "June 1", use_ai=False)
+        self.check("stable_no_openai_calls", True)
+
     def run(self) -> list[str]:
         self.run_search_tests()
         self.run_session_tests()
@@ -465,6 +500,7 @@ class AspectTest:
         self.run_search_change_tests()
         self.run_special_search_tests()
         self.run_zain_regression_tests()
+        self.run_stable_mode_tests()
         self.run_poll_state_tests()
         return self.failures
 
@@ -483,6 +519,7 @@ def main() -> int:
     print("PASSED: AI path and poll state")
     print("PASSED: qual resume, profanity, and post-qual refinement")
     print("PASSED: Zain Toronto refine and more-options flow")
+    print("PASSED: STABLE_MODE deterministic flow")
     return 0
 
 
