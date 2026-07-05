@@ -451,6 +451,20 @@ class AspectTest:
             not bot.looks_like_booking_request("I'm looking specifically in Toronto"),
         )
 
+    def run_family_search_tests(self) -> None:
+        q = "Can you help me find new homes for my family?"
+        self.check("family_search_intent", bot.wants_listing_help(q))
+        self.check("family_search_refinement", bot.looks_like_search_refinement(q))
+
+        sender = "family-search-user"
+        for step in (
+            "2 bed toronto", "yes", "June 1", "1", "120000",
+            "engineer", "PR", "No", "4165551234",
+        ):
+            self.reply(sender, step, use_ai=False)
+        r = self.reply(sender, q, use_ai=False)
+        self.check("family_search_gets_listings", "here are" in r.lower() or "help" in r.lower())
+
     def run_stable_mode_tests(self) -> None:
         cfg = bot.MessengerConfig(
             page_access_token="token",
@@ -500,6 +514,7 @@ class AspectTest:
         self.run_search_change_tests()
         self.run_special_search_tests()
         self.run_zain_regression_tests()
+        self.run_family_search_tests()
         self.run_stable_mode_tests()
         self.run_poll_state_tests()
         return self.failures

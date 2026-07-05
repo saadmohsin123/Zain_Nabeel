@@ -661,6 +661,17 @@ def wants_listing_help(query: str) -> bool:
         return True
     phrases = [
         "looking for",
+        "help me find",
+        "help us find",
+        "help me search",
+        "find me",
+        "find us",
+        "new home",
+        "new homes",
+        "for my family",
+        "for our family",
+        "need a home",
+        "need a place",
         "show me",
         "send me listings",
         "send listings",
@@ -981,6 +992,11 @@ def looks_like_search_refinement(query: str) -> bool:
         r"\bontario\b",
         r"\bcheaper\b",
         r"\blower price\b",
+        r"\bnew homes?\b",
+        r"\bhelp me find\b",
+        r"\bhelp us find\b",
+        r"\bfor my family\b",
+        r"\bfor our family\b",
     )
     if any(re.search(pattern, q) for pattern in patterns):
         return True
@@ -1354,6 +1370,20 @@ def qualification_greeting_nudge(session: dict, query: str) -> Optional[str]:
     return prompt
 
 
+def qualified_helpful_fallback(session: dict, query: str, agent_name: str) -> str:
+    if wants_listing_help(query) or looks_like_search_refinement(query) or looks_like_more_listings_request(query):
+        return (
+            "Absolutely — I can help with that. Tell me the city or area, how many bedrooms you need, "
+            "and your budget, and I'll pull the best active options for your family."
+        )
+    if looks_like_greeting(query) or looks_like_small_talk(query):
+        return qualified_conversational_reply(session, agent_name, query)
+    return (
+        "Happy to help — tell me the area, bedrooms, or budget you'd like to refine, "
+        "ask about a listing, or say if you want to book a viewing."
+    )
+
+
 def ensure_outbound_reply(
     reply: str,
     session: dict,
@@ -1376,7 +1406,7 @@ def ensure_outbound_reply(
             search_query=compact(session.get("search_query")),
         )
     if session.get("qualified"):
-        return "Happy to help — want to refine your search, ask about a listing, or book a viewing?"
+        return qualified_helpful_fallback(session, query, agent_name)
     return (
         f"Hi! I'm {agent_name}'s assistant at Durham New Homes. "
         "Tell me the area, budget, or type of place you're looking for."
@@ -3671,7 +3701,89 @@ def reply_reasks_collected_fields(reply: str, answers: dict) -> bool:
     return False
 
 
+def _safe_deterministic_fallback(
+    session: dict,
+    state: dict,
+    query: str,
+    lead_state_path: Path,
+    drafts: List[dict],
+    listing_doc_url: str,
+    calendly_url: str,
+    agent_name: str,
+    openai_api_key: str,
+    openai_model: str,
+) -> str:
+    try:
+        reply = _reply_deterministic(
+            session,
+            state,
+            query,
+            lead_state_path,
+            drafts,
+            listing_doc_url,
+            calendly_url,
+            agent_name,
+            openai_api_key,
+            openai_model,
+            use_ai=False,
+        )
+        if compact(reply):
+            return reply
+    except Exception as exc:
+        print(f"Deterministic fallback failed: {exc}")
+    agent = agent_name or "Nabeel"
+    fallback = (
+        qualified_helpful_fallback(session, query, agent)
+        if session.get("qualified")
+        else (
+            f"Hi! I'm {agent}'s assistant at Durham New Homes. "
+            "Tell me the area, budget, or type of place you're looking for and I'll help from there."
+        )
+    )
+    return save_session_reply(lead_state_path, state, session, fallback)
+
+
 def _finish_ai_turn(
+    session: dict,
+    state: dict,
+    query: str,
+    lead_state_path: Path,
+    agent_name: str,
+    calendly_url: str,
+    drafts: List[dict],
+    listing_doc_url: str,
+    openai_api_key: str,
+    openai_model: str,
+    *,
+    listing_block: str = "",
+    directive_extra: str = "",
+    must_include: str = "",
+) -> str:
+    try:
+        return _finish_ai_turn_impl(
+            session,
+            state,
+            query,
+            lead_state_path,
+            agent_name,
+            calendly_url,
+            drafts,
+            listing_doc_url,
+            openai_api_key,
+            openai_model,
+            listing_block=listing_block,
+            directive_extra=directive_extra,
+            must_include=must_include,
+        )
+    except Exception as exc:
+        print(f"AI compose failed, using deterministic fallback: {exc}")
+        return _safe_deterministic_fallback(
+            session, state, query, lead_state_path, drafts, listing_doc_url,
+            calendly_url, agent_name, openai_api_key, openai_model,
+        )
+
+
+def _finish_ai_turn_impl(
     session: dict,
     state: dict,
     query: str,
@@ -3882,6 +3994,8 @@ def _unified_ai_turn(
             or wants_listing_refresh(query)
             or wants_listing_help(query)
         ):
+            if wants_listing_help(query) or looks_like_search_refinement(query):
+                session["search_query"] = merge_search_queries(session, query)
             listing_block = handle_qualified_listing_search(
                 session,
                 query,
@@ -3890,6 +4004,8 @@ def _unified_ai_turn(
                 openai_model=openai_model,
                 use_ai=False,
             ) or ""
+            if not listing_block and wants_listing_help(query):
+                listing_block = qualified_helpful_fallback(session, query, agent_name)
 
         return _finish_ai_turn(
             session, state, query, lead_state_path, agent_name, calendly_url, drafts,
@@ -4574,22 +4690,41 @@ def build_reply(
     use_ai: bool = True,
 ) -> str:
     if use_ai and compact(openai_api_key):
-        return with_lead_session(
-            sender_id,
-            lead_state_path,
-            lambda session, state: _unified_ai_turn(
-                session,
-                state,
-                query,
+        try:
+            return with_lead_session(
+                sender_id,
                 lead_state_path,
-                agent_name,
-                calendly_url,
-                drafts,
-                listing_doc_url,
-                openai_api_key,
-                openai_model,
-            ),
-        )
+                lambda session, state: _unified_ai_turn(
+                    session,
+                    state,
+                    query,
+                    lead_state_path,
+                    agent_name,
+                    calendly_url,
+                    drafts,
+                    listing_doc_url,
+                    openai_api_key,
+                    openai_model,
+                ),
+            )
+        except Exception as exc:
+            print(f"build_reply AI path failed: {exc}")
+            return with_lead_session(
+                sender_id,
+                lead_state_path,
+                lambda session, state: _safe_deterministic_fallback(
+                    session,
+                    state,
+                    query,
+                    lead_state_path,
+                    drafts,
+                    listing_doc_url,
+                    calendly_url,
+                    agent_name,
+                    openai_api_key,
+                    openai_model,
+                ),
+            )
     return build_reply_deterministic(
         sender_id,
         query,
@@ -4906,18 +5041,25 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     print(f"Failed sending typing indicator to {sender_id}: {exc}")
 
-                reply = build_reply(
-                    sender_id,
-                    text,
-                    drafts,
-                    self.config.listing_doc_url,
-                    calendly_url=self.config.calendly_url,
-                    agent_name=self.config.agent_name,
-                    lead_state_path=self.config.lead_state_path,
-                    openai_api_key=self.config.openai_api_key,
-                    openai_model=self.config.openai_model,
-                    use_ai=resolve_use_ai(self.config),
-                )
+                try:
+                    reply = build_reply(
+                        sender_id,
+                        text,
+                        drafts,
+                        self.config.listing_doc_url,
+                        calendly_url=self.config.calendly_url,
+                        agent_name=self.config.agent_name,
+                        lead_state_path=self.config.lead_state_path,
+                        openai_api_key=self.config.openai_api_key,
+                        openai_model=self.config.openai_model,
+                        use_ai=resolve_use_ai(self.config),
+                    )
+                except Exception as exc:
+                    print(f"build_reply crashed for {sender_id}: {exc}")
+                    reply = (
+                        "Sorry about that — I'm here to help find rentals for your family. "
+                        "What city or area are you looking in, and how many bedrooms do you need?"
+                    )
                 if not compact(reply):
                     print(f"Empty reply for {sender_id}: {text[:80]}")
                     continue
