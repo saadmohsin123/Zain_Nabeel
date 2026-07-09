@@ -102,7 +102,7 @@ class AspectTest:
         self.check("constraint_max_price", c.get("max_price") == 2500)
 
         c2 = bot.extract_search_constraints("condo around $2200 in Mississauga")
-        self.check("constraint_around_price", c2.get("max_price") == int(2200 * 1.15))
+        self.check("constraint_around_price", c2.get("max_price") == int(2200 * 1.2))
         self.check("constraint_mississauga", c2.get("city") == "mississauga")
 
         self.check(
@@ -228,6 +228,66 @@ class AspectTest:
         self.check("special_no_commercial", all(d.get("ListingKey") != "C1" for d in matches))
         if note:
             self.check("special_honest_note", "gated" in note.lower() or "security" in note.lower())
+
+        soft = bot.extract_search_constraints("2 bedroom apartment in Mississauga budget $2100")
+        self.check("soft_budget_above_target", int(soft.get("max_price") or 0) >= 2400)
+        self.check("soft_budget_city", soft.get("city") == "mississauga")
+
+        tight_drafts = SAMPLE_DRAFTS + [
+            {
+                "ListingKey": "M1809",
+                "MarketplaceStatus": "Posted",
+                "ListingLifecycleStatus": "Active",
+                "TransactionType": "For Lease",
+                "MarketplaceTitle": "2 Bed | 2 Bath | Condo | For Rent | Unit 1809",
+                "Address": "100 Burnhamthorpe Rd, Mississauga",
+                "City": "Mississauga",
+                "BedroomsTotal": "2",
+                "MarketplacePrice": 2499,
+                "MarketplacePriceDisplay": "$2,499/month",
+            },
+            {
+                "ListingKey": "T715",
+                "MarketplaceStatus": "Posted",
+                "ListingLifecycleStatus": "Active",
+                "TransactionType": "For Lease",
+                "MarketplaceTitle": "2 Bed | 2 Bath | Condo | For Rent | Unit 715",
+                "Address": "3429 Sheppard Ave E, Toronto",
+                "City": "Toronto E05",
+                "BedroomsTotal": "2",
+                "MarketplacePrice": 2150,
+                "MarketplacePriceDisplay": "$2,150/month",
+            },
+        ]
+        miss_matches, _ = bot.rank_drafts_with_note(
+            "2 bedroom apartment in Mississauga budget $2100",
+            tight_drafts,
+            limit=3,
+        )
+        self.check("mississauga_soft_budget_finds_listing", any(d.get("ListingKey") == "M1809" for d in miss_matches))
+
+        session = {"search_query": "2 bedroom apartment in Mississauga budget $2100"}
+        toronto_merged = bot.merge_search_queries(
+            session,
+            "show me listings in Toronto for the same requirements",
+        )
+        self.check("toronto_merge_replaces_city", "toronto" in toronto_merged.lower())
+        self.check("toronto_merge_drops_mississauga", "mississauga" not in toronto_merged.lower())
+        toronto_matches, _ = bot.rank_drafts_with_note(toronto_merged, tight_drafts, limit=3)
+        self.check("toronto_same_requirements_finds_listing", any(d.get("ListingKey") == "T715" for d in toronto_matches))
+
+        broaden_merged = bot.merge_search_queries(session, "Broaden the search and send me options")
+        self.check("broaden_drops_city", "mississauga" not in broaden_merged.lower())
+        broaden_matches, _ = bot.rank_drafts_with_note(broaden_merged, tight_drafts, limit=3)
+        self.check("broaden_returns_listings", len(broaden_matches) >= 1)
+
+        hard_empty, hard_note = bot.rank_drafts_with_note(
+            "2 bedroom in Mississauga under 2100",
+            tight_drafts,
+            limit=3,
+        )
+        self.check("hard_budget_still_shows_nearest", any(d.get("ListingKey") == "M1809" for d in hard_empty))
+        self.check("hard_budget_nearest_note", "closest" in hard_note.lower() or "budget" in hard_note.lower())
 
     def run_booking_tests(self) -> None:
         sender = "booking-user"

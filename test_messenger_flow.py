@@ -472,8 +472,15 @@ class FlowTest:
         ]
         oshawa_matches = bot.rank_drafts("3 bedroom in Oshawa under 2500", location_drafts, limit=3)
         self.check("oshawa_city_price_filter", len(oshawa_matches) == 1 and oshawa_matches[0].get("ListingKey") == "O1")
-        no_match = bot.rank_drafts("3 bedroom in Oshawa under 2000", location_drafts, limit=3)
-        self.check("oshawa_no_match_when_over_budget", len(no_match) == 0)
+        no_match, no_match_note = bot.rank_drafts_with_note("3 bedroom in Oshawa under 2000", location_drafts, limit=3)
+        self.check(
+            "oshawa_over_budget_shows_nearest",
+            len(no_match) == 1 and no_match[0].get("ListingKey") == "O1",
+        )
+        self.check(
+            "oshawa_over_budget_note",
+            "closest" in no_match_note.lower() or "budget" in no_match_note.lower(),
+        )
         self.check(
             "single_digit_income_rejected",
             not bot.is_plausible_field_value("family_gross_income", "1", "1", {}),

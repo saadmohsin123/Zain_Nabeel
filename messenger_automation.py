@@ -423,6 +423,52 @@ def rank_drafts_with_note(
                 "so here are the closest pet-friendly condos in Ontario sorted by price."
             )
 
+    # Soften a tight budget before giving up — show closest over-budget matches.
+    if not filtered and constraints.get("max_price") is not None:
+        soft = dict(constraints)
+        soft_price = int(constraints["max_price"] * 1.25)
+        soft["max_price"] = soft_price
+        filtered = filter_candidates(soft)
+        if filtered:
+            city_label = compact(constraints.get("city")).title() or "that area"
+            note = (
+                f"Nothing exact under your budget in {city_label} right now — "
+                f"here are the closest options nearby in price:"
+            )
+
+    # Same city + beds, ignore budget entirely and show cheapest matches.
+    if not filtered and constraints.get("city") and constraints.get("bedrooms") is not None:
+        soft = dict(constraints)
+        soft.pop("max_price", None)
+        filtered = filter_candidates(soft)
+        if filtered:
+            filtered = sorted(
+                filtered,
+                key=lambda draft: draft_listing_price(draft) if draft_listing_price(draft) is not None else 10**9,
+            )
+            city_label = compact(constraints.get("city")).title()
+            note = (
+                f"I don't have anything at that budget in {city_label} right now — "
+                f"here are the closest {constraints['bedrooms']}-bed options there:"
+            )
+
+    # Broaden: keep beds/type, drop city, keep a soft budget if present.
+    if not filtered and constraints.get("city"):
+        soft = dict(constraints)
+        soft.pop("city", None)
+        if soft.get("max_price") is not None:
+            soft["max_price"] = int(soft["max_price"] * 1.25)
+        filtered = filter_candidates(soft)
+        if filtered:
+            filtered = sorted(
+                filtered,
+                key=lambda draft: draft_listing_price(draft) if draft_listing_price(draft) is not None else 10**9,
+            )
+            note = (
+                "Nothing exact in that city for your criteria — "
+                "here are the closest options from nearby areas:"
+            )
+
     if not filtered and constraints:
         if constraints.get("out_of_area"):
             note = (
@@ -1077,6 +1123,12 @@ def looks_like_search_refinement(query: str) -> bool:
         r"\bhelp us find\b",
         r"\bfor my family\b",
         r"\bfor our family\b",
+        r"\bbroaden\b",
+        r"\bwiden\b",
+        r"\bnearby\b",
+        r"\bother cities\b",
+        r"\bother areas\b",
+        r"\bexpand\b",
     )
     if any(re.search(pattern, q) for pattern in patterns):
         return True
@@ -1126,9 +1178,10 @@ def extract_search_constraints(query: str) -> dict:
 
 
 def extract_max_price_from_query(normalized: str) -> Optional[int]:
-    flexible = re.search(r"(?:around|about)\s*\$?\s*([\d,]{3,7})", normalized)
+    flexible = re.search(r"(?:around|about|budget(?:\s+is|\s+of|\s+it)?)\s*\$?\s*([\d,]{3,7})", normalized)
     if flexible:
-        return int(int(flexible.group(1).replace(",", "")) * 1.15)
+        # Soft budget: treat "budget $2100" / "around 2100" as a target, not a hard ceiling.
+        return int(int(flexible.group(1).replace(",", "")) * 1.2)
 
     strict = re.search(
         r"(?:under|below|less than|max(?:imum)?|up to)\s*\$?\s*([\d,]{3,7})",
@@ -1139,14 +1192,43 @@ def extract_max_price_from_query(normalized: str) -> Optional[int]:
 
     money = re.search(r"\$\s*([\d,]{3,7})", normalized)
     if money:
-        return int(money.group(1).replace(",", ""))
+        value = int(money.group(1).replace(",", ""))
+        if re.search(r"\bbudget\b", normalized):
+            return int(value * 1.2)
+        return value
 
     bare = re.search(r"\b([\d,]{4,7})\b", normalized.replace(",", ""))
     if bare and not re.search(r"\b\d\s*bed", normalized):
         value = int(bare.group(1))
         if value >= 800:
+            if re.search(r"\bbudget\b", normalized):
+                return int(value * 1.2)
             return value
     return None
+
+
+def looks_like_broaden_request(query: str) -> bool:
+    q = query.lower()
+    if looks_like_booking_request(query):
+        return False
+    phrases = (
+        "broaden",
+        "widen",
+        "nearby",
+        "near by",
+        "other cities",
+        "other areas",
+        "other city",
+        "open to other",
+        "more flexible",
+        "anywhere in",
+        "gta",
+        "greater toronto",
+        "expand the search",
+        "expand search",
+        "broader search",
+    )
+    return any(phrase in q for phrase in phrases)
 
 
 def draft_listing_price(draft: dict) -> Optional[int]:
@@ -1184,12 +1266,31 @@ def merge_search_queries(session: dict, query: str) -> str:
 
     base_constraints = extract_search_constraints(base)
     current_constraints = extract_search_constraints(current)
+
+    # "Broaden the search" should drop the city lock and soften budget.
+    if looks_like_broaden_request(current):
+        parts: List[str] = []
+        beds = current_constraints.get("bedrooms") or base_constraints.get("bedrooms")
+        if beds:
+            parts.append(f"{beds} bedroom")
+        prop = current_constraints.get("property_type") or base_constraints.get("property_type")
+        if prop:
+            parts.append(str(prop))
+        price = current_constraints.get("max_price") or base_constraints.get("max_price")
+        if price:
+            parts.append(f"under {int(price * 1.25)}")
+        if current_constraints.get("city"):
+            parts.append(str(current_constraints["city"]))
+        return " ".join(parts) if parts else current
+
     parts = [current]
+    # City in the new message replaces the old city — do not re-append the old one.
     if base_constraints.get("city") and not current_constraints.get("city"):
         parts.append(base_constraints["city"])
     if base_constraints.get("bedrooms") and not current_constraints.get("bedrooms"):
         parts.append(f"{base_constraints['bedrooms']} bedroom")
     if base_constraints.get("max_price") and not current_constraints.get("max_price"):
+        # base max_price is already the effective ceiling (soft budgets included).
         parts.append(f"under {base_constraints['max_price']}")
     return " ".join(parts)
 
@@ -2755,8 +2856,14 @@ def wants_listing_refresh(query: str) -> bool:
         "show me places",
         "find me listings",
         "search in",
+        "send me options",
+        "broaden the search",
+        "widen the search",
+        "expand the search",
     ]
     if any(marker in q for marker in refresh_markers):
+        return True
+    if looks_like_broaden_request(query):
         return True
     return "listings" in q and any(token in q for token in ("ontario", "toronto", "in ", "area", "city"))
 

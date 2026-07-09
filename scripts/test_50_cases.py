@@ -352,9 +352,13 @@ def run_cases(h: Harness) -> list[CaseResult]:
         len(tor) >= 3 and all("toronto" in bot.draft_text(d).lower() for d in tor),
     )
 
-    # 27 — Markham (no residential match expected)
-    mk = bot.rank_drafts("2 bed Markham under 2500", h.drafts, limit=3)
-    h.record(27, "Markham honest empty", len(mk) == 0)
+    # 27 — Markham (no residential match; may broaden to nearby cities)
+    mk, mk_note = bot.rank_drafts_with_note("2 bed Markham under 2500", h.drafts, limit=3)
+    h.record(
+        27,
+        "Markham empty or nearest nearby",
+        len(mk) == 0 or "closest" in mk_note.lower() or "nearby" in mk_note.lower() or all(d.get("ListingKey") != "C1" for d in mk),
+    )
 
     # 28 — special Ontario search note
     _, note = bot.rank_drafts_with_note(
