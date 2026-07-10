@@ -209,7 +209,8 @@ occupation, resident_status, working_with_agent (Yes/No only), phone_number
 - NEVER mention listings before QUALIFIED unless directive says otherwise
 - NEVER send a booking/Calendly link unless allow_booking is true and calendly_url is set
 - If listing_block is provided, include every listing with accurate price and unit details
-- Use recent_message_history for conversational continuity; do not re-ask what was already answered
+- Use recent_message_history ONLY when it is provided and needed for this turn
+- If recent_message_history / last_shared_listings are empty, do NOT invent or resume old chat topics
 - Do not repeat last_assistant_message verbatim
 - Ask exactly ONE qualification question per turn when qualifying
 
@@ -1056,6 +1057,65 @@ def soft_reset_conversation_focus(session: dict) -> None:
     # endregion
 
 
+def looks_like_history_resume_request(query: str) -> bool:
+    q = query.lower()
+    phrases = (
+        "what were we talking",
+        "what we were talking",
+        "where were we",
+        "continue where",
+        "pick up where",
+        "as we discussed",
+        "like before",
+        "same as before",
+        "same as last",
+        "from earlier",
+        "from before",
+        "previous listing",
+        "previous options",
+        "the one you sent",
+        "the listings you sent",
+        "that listing",
+        "that unit",
+        "those listings",
+        "the last one",
+    )
+    return any(phrase in q for phrase in phrases)
+
+
+def needs_prior_conversation_context(query: str, session: dict, drafts: Optional[List[dict]] = None) -> bool:
+    """Only pull prior chat/listing memory when the current message depends on it."""
+    drafts = drafts or []
+    if is_fresh_day_greeting(query, session):
+        return False
+    if looks_like_greeting(query) or looks_like_small_talk(query):
+        return False
+    if looks_like_history_resume_request(query):
+        return True
+    if looks_like_listing_followup_question(query):
+        return True
+    if looks_like_listing_detail_request(query):
+        return True
+    if resolve_listing_reference(query, session, drafts):
+        return True
+    if looks_like_booking_request(query) or looks_like_booking_confirmation(query, session):
+        return True
+    if user_asking_booking_options(query, session):
+        return True
+    if looks_like_more_listings_request(query):
+        return True
+    if session.get("pending_booking_offer") and looks_like_affirmative(query):
+        return True
+    # Pronouns that usually refer to a previously shared listing.
+    q = query.lower()
+    if re.search(r"\b(it|that|this|those|them)\b", q) and (
+        compact(session.get("selected_listing_key")) or session.get("last_shared_listing_keys")
+    ):
+        if looks_like_listing_followup_question(query) or "?" in q:
+            return True
+    return False
+
+
 def looks_like_small_talk(query: str) -> bool:
     q = query.lower().strip()
     if looks_like_greeting(query):
@@ -1525,21 +1585,20 @@ def qualified_conversational_reply(session: dict, agent_name: str, query: str) -
     if looks_like_greeting(query) or looks_like_small_talk(query):
         if is_fresh_day_greeting(query, session):
             soft_reset_conversation_focus(session)
-            return (
-                f"Hi! I'm {agent_name}'s assistant at Durham New Homes. "
-                "What area, budget, or unit type are you looking for today?"
-            )
-        if compact(session.get("selected_listing_key")):
-            return (
-                f"Hi! I'm still here if you have questions about that unit or want to book a viewing."
-            )
-        if session.get("last_shared_listing_keys"):
-            return (
-                "Hi! Want to ask about one of the listings I shared, refine your search, or book a viewing?"
-            )
-        return f"Hi! I'm {agent_name}'s assistant — tell me what you're looking for and I'll help."
+        # Greetings stay generic — prior listings are only used when the user asks about them.
+        return (
+            f"Hi! I'm {agent_name}'s assistant at Durham New Homes. "
+            "What area, budget, or unit type are you looking for today?"
+        )
     if "how are you" in query.lower():
         return "Doing well, thanks! What can I help you with on your rental search?"
+    if looks_like_history_resume_request(query):
+        if session.get("last_shared_listing_keys") or compact(session.get("selected_listing_key")):
+            return (
+                "Happy to pick that back up — want details on a listing I shared, "
+                "a new search, or help booking a viewing?"
+            )
+        return "Happy to help — tell me the area, budget, or unit type you want to look at."
     return "Happy to help — want to refine your search or ask about a specific listing?"
 
 
@@ -4035,12 +4094,30 @@ def compute_conversation_directive(
 
     listing_data = []
     last_shared_payload = []
-    recent_history = recent_message_history(session)
-    if session.get("qualified") and not is_fresh_day_greeting(query, session):
+    include_history = needs_prior_conversation_context(query, session, drafts)
+    # Qualification turns still need the last question for continuity.
+    include_last_assistant = include_history or bool(session.get("active") or session.get("awaiting_opt_in"))
+    recent_history = recent_message_history(session) if include_history else []
+    # region agent log
+    _agent_debug_log(
+        "messenger_automation.py:compute_conversation_directive",
+        "context_gate",
+        {
+            "include_history": include_history,
+            "include_last_assistant": include_last_assistant,
+            "fresh_greeting": is_fresh_day_greeting(query, session),
+            "query_preview": query[:80],
+            "qualified": bool(session.get("qualified")),
+        },
+        hypothesis_id="H",
+        run_id="post-fix",
+    )
+    # endregion
+    if session.get("qualified") and include_history:
         focus = resolve_listing_reference(query, session, drafts)
         if focus:
             listing_data = [listing_context(focus)]
-        else:
+        elif looks_like_listing_followup_question(query) or looks_like_listing_detail_request(query):
             listing_data = [listing_context(d) for d in listings_from_session(session, drafts)[:3]]
         last_shared_payload = [
             {
@@ -4051,8 +4128,6 @@ def compute_conversation_directive(
             }
             for index, listing in enumerate(listings_from_session(session, drafts))
         ]
-    elif is_fresh_day_greeting(query, session):
-        recent_history = []
 
     return {
         "ai_stage": ai_stage,
@@ -4067,8 +4142,8 @@ def compute_conversation_directive(
         "calendly_url": calendly_url if allow_booking else "",
         "last_shared_listings": last_shared_payload,
         "listing_data": listing_data,
-        "selected_listing_key": compact(session.get("selected_listing_key")),
-        "last_assistant_message": "" if is_fresh_day_greeting(query, session) else compact(session.get("last_prompt")),
+        "selected_listing_key": compact(session.get("selected_listing_key")) if include_history else "",
+        "last_assistant_message": compact(session.get("last_prompt")) if include_last_assistant else "",
         "recent_message_history": recent_history,
         "agent_name": agent_name,
     }

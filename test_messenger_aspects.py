@@ -315,6 +315,22 @@ class AspectTest:
             "last_sent_at": int(__import__("time").time()) - 60,
         }
         self.check("recent_greeting_not_fresh", not bot.is_fresh_day_greeting("Hey", recent_session))
+        self.check(
+            "greeting_skips_prior_context",
+            not bot.needs_prior_conversation_context("Hey", recent_session),
+        )
+        self.check(
+            "new_search_skips_prior_context",
+            not bot.needs_prior_conversation_context("2 bed Toronto under 2500", recent_session),
+        )
+        self.check(
+            "pet_followup_needs_prior_context",
+            bot.needs_prior_conversation_context("Ok cool, does it allow pets?", recent_session),
+        )
+        self.check(
+            "resume_needs_prior_context",
+            bot.needs_prior_conversation_context("What were we talking about?", recent_session),
+        )
 
     def run_booking_tests(self) -> None:
         sender = "booking-user"
