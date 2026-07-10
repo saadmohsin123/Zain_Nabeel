@@ -243,6 +243,41 @@ def resolve_use_ai(config: "MessengerConfig", explicit: Optional[bool] = None) -
     return bool(config.openai_api_key)
 
 
+# region agent log
+_AGENT_DEBUG_LOG_PATH = Path(__file__).resolve().parent / ".cursor" / "debug-879fd5.log"
+_AGENT_DEBUG_SESSION_ID = "879fd5"
+
+
+def _agent_debug_log(
+    location: str,
+    message: str,
+    data: Optional[dict] = None,
+    *,
+    hypothesis_id: str = "",
+    run_id: str = "pre-fix",
+) -> None:
+    payload = {
+        "sessionId": _AGENT_DEBUG_SESSION_ID,
+        "timestamp": int(time.time() * 1000),
+        "location": location,
+        "message": message,
+        "data": data or {},
+        "hypothesisId": hypothesis_id,
+        "runId": run_id,
+    }
+    line = json.dumps(payload, ensure_ascii=False)
+    print(f"AGENT_DEBUG {line}")
+    try:
+        _AGENT_DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _AGENT_DEBUG_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except Exception:
+        pass
+
+
+# endregion
+
+
 def resolve_page_access_token(user_access_token: str, page_id: str) -> str:
     resp = requests.get(
         f"{GRAPH_BASE}/me/accounts",
@@ -475,6 +510,14 @@ def rank_drafts_with_note(
                 f"I don't have active listings in {constraints['out_of_area'].title()} right now — "
                 "I can help across the Greater Toronto and Durham areas."
             )
+        # region agent log
+        _agent_debug_log(
+            "messenger_automation.py:rank_drafts_with_note",
+            "no_matches",
+            {"query": query[:120], "constraints": constraints, "note": note},
+            hypothesis_id="C",
+        )
+        # endregion
         return [], note
 
     if constraints:
@@ -536,7 +579,21 @@ def rank_drafts_with_note(
         return candidate_drafts[:limit], note
 
     scored.sort(key=lambda item: (-item[0], draft_listing_price(item[1]) or 10**9))
-    return [draft for _, draft in scored[:limit]], note
+    results = [draft for _, draft in scored[:limit]]
+    # region agent log
+    _agent_debug_log(
+        "messenger_automation.py:rank_drafts_with_note",
+        "matches_found",
+        {
+            "query": query[:120],
+            "constraints": constraints,
+            "match_count": len(results),
+            "note": note[:120] if note else "",
+        },
+        hypothesis_id="C",
+    )
+    # endregion
+    return results, note
 
 
 def summarize_draft(draft: dict) -> str:
@@ -879,9 +936,25 @@ def deliver_reply(
 ) -> bool:
     reply = compact(reply)
     if not reply:
+        # region agent log
+        _agent_debug_log(
+            "messenger_automation.py:deliver_reply",
+            "empty_reply",
+            {"sender_id": sender_id},
+            hypothesis_id="B",
+        )
+        # endregion
         return False
     if session and should_skip_duplicate_outbound(session, reply):
         print(f"Skipping duplicate outbound to {sender_id}")
+        # region agent log
+        _agent_debug_log(
+            "messenger_automation.py:deliver_reply",
+            "duplicate_outbound_skipped",
+            {"sender_id": sender_id, "reply_preview": reply[:80]},
+            hypothesis_id="E",
+        )
+        # endregion
         return False
     try:
         send_message(config.page_access_token, sender_id, reply)
@@ -890,9 +963,31 @@ def deliver_reply(
             sid = compact(sender_id)
             if sid and session_store.use_postgres_sessions():
                 session_store.save_session(sid, session)
+        # region agent log
+        _agent_debug_log(
+            "messenger_automation.py:deliver_reply",
+            "send_ok",
+            {"sender_id": sender_id, "reply_preview": reply[:80]},
+            hypothesis_id="D",
+        )
+        # endregion
         return True
     except Exception as exc:
+        error_body = ""
+        if hasattr(exc, "response") and exc.response is not None:
+            try:
+                error_body = exc.response.text[:300]
+            except Exception:
+                error_body = str(exc)
         print(f"Failed sending to {sender_id}: {exc}")
+        # region agent log
+        _agent_debug_log(
+            "messenger_automation.py:deliver_reply",
+            "send_failed",
+            {"sender_id": sender_id, "error": str(exc), "error_body": error_body},
+            hypothesis_id="D",
+        )
+        # endregion
         return False
 
 
@@ -5262,7 +5357,21 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
 
                 print(f"Webhook inbound from {sender_id}: {text[:120]}")
 
-                if not claim_inbound_message(message_id, self.config.poll_state_path):
+                claimed = claim_inbound_message(message_id, self.config.poll_state_path)
+                # region agent log
+                _agent_debug_log(
+                    "messenger_automation.py:process_webhook",
+                    "inbound",
+                    {
+                        "sender_id": sender_id,
+                        "message_id": message_id,
+                        "text_preview": text[:80],
+                        "claimed": claimed,
+                    },
+                    hypothesis_id="A",
+                )
+                # endregion
+                if not claimed:
                     print(f"Skipping duplicate webhook message {message_id}")
                     continue
 
@@ -5286,19 +5395,56 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                     )
                 except Exception as exc:
                     print(f"build_reply crashed for {sender_id}: {exc}")
+                    # region agent log
+                    _agent_debug_log(
+                        "messenger_automation.py:process_webhook",
+                        "build_reply_crashed",
+                        {"sender_id": sender_id, "error": str(exc)},
+                        hypothesis_id="B",
+                    )
+                    # endregion
                     reply = (
                         "Sorry about that — I'm here to help find rentals for your family. "
                         "What city or area are you looking in, and how many bedrooms do you need?"
                     )
+                # region agent log
+                _agent_debug_log(
+                    "messenger_automation.py:process_webhook",
+                    "reply_built",
+                    {
+                        "sender_id": sender_id,
+                        "reply_len": len(compact(reply)),
+                        "reply_preview": compact(reply)[:80],
+                    },
+                    hypothesis_id="B",
+                )
+                # endregion
                 if not compact(reply):
                     print(f"Empty reply for {sender_id}: {text[:80]}")
+                    # region agent log
+                    _agent_debug_log(
+                        "messenger_automation.py:process_webhook",
+                        "empty_reply",
+                        {"sender_id": sender_id, "text_preview": text[:80]},
+                        hypothesis_id="B",
+                    )
+                    # endregion
                     continue
                 session = (
                     session_store.load_session(sender_id)
                     if session_store.use_postgres_sessions()
                     else {}
                 )
-                if deliver_reply(self.config, sender_id, reply, session):
+                delivered = deliver_reply(self.config, sender_id, reply, session)
+                # region agent log
+                _agent_debug_log(
+                    "messenger_automation.py:process_webhook",
+                    "deliver_result",
+                    {"sender_id": sender_id, "delivered": delivered},
+                    hypothesis_id="D",
+                )
+                # endregion
+                if delivered:
                     print(f"Replied to {sender_id}: {text[:80]}")
 
 
