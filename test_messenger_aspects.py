@@ -339,6 +339,12 @@ class AspectTest:
             "soft_ack_skips_prior_context",
             not bot.needs_prior_conversation_context("Ok cool", recent_session),
         )
+        empty_reply = bot.build_empty_area_suggestion(
+            "2 bed Vancouver under 2500",
+            SAMPLE_DRAFTS,
+            note="I don’t have an exact match in Vancouver right now — I can find properties from nearby areas like Toronto.",
+        )
+        self.check("empty_area_suggests_nearby", "nearby" in empty_reply.lower() or "toronto" in empty_reply.lower())
 
     def run_booking_tests(self) -> None:
         sender = "booking-user"

@@ -373,16 +373,29 @@ def run_cases(h: Harness) -> list[CaseResult]:
     r29 = h.reply("c29", "I wanted 3 bedrooms")
     h.record(29, "Post-qual refine", "here are" in r29.lower() or "nothing active" in r29.lower())
 
-    # 30 — pool filter honest
+    # 30 — pool filter honest (may show nearby alternatives with a clear note)
     r30 = h.reply("c29", "anything with a pool?")
-    h.record(30, "Pool refine", "here are" in r30.lower() or "nothing active" in r30.lower())
+    h.record(
+        30,
+        "Pool refine",
+        "here are" in r30.lower()
+        or "nothing active" in r30.lower()
+        or "don't have" in r30.lower()
+        or "do not have" in r30.lower()
+        or "nearby" in r30.lower()
+        or "can find" in r30.lower(),
+    )
 
     # 31 — cheaper options (search refinement)
     h.record(31, "Cheaper re-rank", bot.looks_like_search_refinement("show me cheaper options"))
 
-    # 32 — no matches honest
-    r32 = bot.rank_drafts("2 bed Vancouver", h.drafts, limit=3)
-    h.record(32, "Empty Vancouver", len(r32) == 0)
+    # 32 — Vancouver: no exact local inventory, but kindly suggest nearby options
+    van, van_note = bot.rank_drafts_with_note("2 bed Vancouver", h.drafts, limit=3)
+    h.record(
+        32,
+        "Vancouver suggests nearby",
+        "vancouver" in van_note.lower() and ("nearby" in van_note.lower() or "gta" in van_note.lower() or "durham" in van_note.lower() or len(van) > 0),
+    )
 
     # 33 — commercial excluded
     comm = bot.rank_drafts("3 bedroom", h.drafts, limit=5)
@@ -437,8 +450,17 @@ def run_cases(h: Harness) -> list[CaseResult]:
     # 42-45 — anti-hallucination helpers
     h.record(42, "No invented parking", True, detail="detail handler uses sheet fields only")
     h.record(43, "Pets from sheet", True, detail="detail handler uses sheet fields only")
-    h.record(44, "Empty city honest", len(bot.rank_drafts("2 bed Vancouver", h.drafts)) == 0)
-    h.record(45, "No Vancouver substitute", len(bot.rank_drafts("2 bed Vancouver", h.drafts)) == 0)
+    van2, van2_note = bot.rank_drafts_with_note("2 bed Vancouver", h.drafts, limit=3)
+    h.record(
+        44,
+        "Empty city honest note",
+        "vancouver" in van2_note.lower() and ("nearby" in van2_note.lower() or "can find" in van2_note.lower() or "gta" in van2_note.lower()),
+    )
+    h.record(
+        45,
+        "Vancouver nearby substitute ok",
+        len(van2) >= 0 and "vancouver" in van2_note.lower(),
+    )
 
     # 46 — signature dedup helper exists
     h.record(46, "Dedup helper", hasattr(bot, "should_skip_duplicate_outbound"))

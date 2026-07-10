@@ -489,9 +489,11 @@ def rank_drafts_with_note(
             )
 
     # Broaden: keep beds/type, drop city, keep a soft budget if present.
-    if not filtered and constraints.get("city"):
+    if not filtered and (constraints.get("city") or constraints.get("out_of_area")):
         soft = dict(constraints)
+        requested = compact(constraints.get("city") or constraints.get("out_of_area")).title()
         soft.pop("city", None)
+        soft.pop("out_of_area", None)
         if soft.get("max_price") is not None:
             soft["max_price"] = int(soft["max_price"] * 1.25)
         filtered = filter_candidates(soft)
@@ -500,13 +502,27 @@ def rank_drafts_with_note(
                 filtered,
                 key=lambda draft: draft_listing_price(draft) if draft_listing_price(draft) is not None else 10**9,
             )
+            alt_cities = []
+            for draft in filtered[:5]:
+                city = compact(draft.get("City"))
+                if city and city not in alt_cities:
+                    alt_cities.append(city)
+            alt_text = ", ".join(alt_cities[:3]) if alt_cities else "nearby GTA / Durham areas"
             note = (
-                "Nothing exact in that city for your criteria — "
-                "here are the closest options from nearby areas:"
+                f"I don’t have an exact match in {requested or 'that area'} right now — "
+                f"I can find properties from nearby areas like {alt_text}. "
+                f"Here are a few options:"
             )
 
     if not filtered and constraints:
-        if constraints.get("out_of_area"):
+        requested = compact(constraints.get("city") or constraints.get("out_of_area")).title()
+        if requested:
+            note = (
+                f"I don’t have active listings in {requested} that fit those details right now. "
+                "I can look in nearby GTA / Durham areas, or we can adjust the budget or bedrooms — "
+                "just tell me what you’d like to try."
+            )
+        elif constraints.get("out_of_area"):
             note = (
                 f"I don't have active listings in {constraints['out_of_area'].title()} right now — "
                 "I can help across the Greater Toronto and Durham areas."
@@ -3003,11 +3019,8 @@ def build_post_qualification_reply(
         intro += f"\n\nHere's what I collected:\n{summary}"
 
     if not matches:
-        return (
-            intro
-            + "\n\nI don't see any active listings that match closely enough right now. "
-            "If you want, I can help refine the area, budget, or unit type and keep an eye out for new options as they come up."
-        )
+        suggestion = build_empty_area_suggestion(search_query, drafts, note=note)
+        return intro + "\n\n" + suggestion
 
     lines = [intro, ""]
     if note:
@@ -3833,6 +3846,40 @@ def all_qualification_fields_complete(answers: dict) -> bool:
     return all(compact(answers.get(key)) for key in QUALIFICATION_FIELD_KEYS)
 
 
+def available_listing_cities(drafts: List[dict], limit: int = 5) -> List[str]:
+    cities: List[str] = []
+    for draft in customer_visible_drafts(drafts):
+        city = compact(draft.get("City"))
+        # Normalize "Toronto C01" -> "Toronto" for suggestions.
+        if city.lower().startswith("toronto"):
+            city = "Toronto"
+        if city and city not in cities:
+            cities.append(city)
+        if len(cities) >= limit:
+            break
+    return cities
+
+
+def build_empty_area_suggestion(search_query: str, drafts: List[dict], note: str = "") -> str:
+    note = compact(note)
+    if note:
+        return note
+    constraints = extract_search_constraints(search_query)
+    requested = compact(constraints.get("city") or constraints.get("out_of_area")).title()
+    alts = available_listing_cities(drafts)
+    alt_text = ", ".join(alts[:4]) if alts else "Toronto, Mississauga, Markham, or Durham"
+    if requested:
+        return (
+            f"I don’t have active listings in {requested} that fit that search right now. "
+            f"I can find properties from nearby areas like {alt_text} — "
+            "want me to show a few of those, or should we adjust budget/bedrooms?"
+        )
+    return (
+        f"I don’t see an exact match for that search right now. "
+        f"I can look in areas like {alt_text}, or we can tweak the budget or bedrooms — what would you like to try?"
+    )
+
+
 def build_qualified_listing_reply(
     session: dict,
     search_query: str,
@@ -3852,16 +3899,23 @@ def build_qualified_listing_reply(
     if show_more and not matches and exclude:
         return (
             "Those are all the active options I have for that search right now. "
-            "Tell me if you want to change the city, budget, or bedrooms."
+            "I can look in a nearby city, or we can adjust budget/bedrooms — just say what you’d prefer."
         )
     session["last_shared_listing_keys"] = list(dict.fromkeys(
         exclude + [compact(match.get("ListingKey")) for match in matches if compact(match.get("ListingKey"))]
     ))
     if not matches:
-        return (
-            "I looked again but nothing active matches that right now. "
-            "Tell me the city, budget, or unit type and I'll narrow it down."
+        suggestion = build_empty_area_suggestion(search_query, drafts, note=note)
+        # region agent log
+        _agent_debug_log(
+            "messenger_automation.py:build_qualified_listing_reply",
+            "empty_area_suggestion",
+            {"query": search_query[:120], "suggestion_preview": suggestion[:160]},
+            hypothesis_id="L",
+            run_id="post-fix",
         )
+        # endregion
+        return suggestion
     lines = []
     if note:
         lines.append(note)
@@ -4049,7 +4103,9 @@ def compute_conversation_directive(
             elif wants_listing_refresh(query) or wants_listing_help(query) or looks_like_more_listings_request(query) or looks_like_search_refinement(query):
                 directive = (
                     "User wants to see or refine listings. Acknowledge naturally; "
-                    "listing_block will contain accurate inventory to share."
+                    "listing_block will contain accurate inventory to share. "
+                    "If listing_block explains no exact city match and shows nearby options, "
+                    "keep that helpful tone and offer to search another area."
                 )
             elif looks_like_greeting(query) or looks_like_small_talk(query):
                 directive = (
