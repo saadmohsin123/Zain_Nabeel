@@ -1005,6 +1005,57 @@ def looks_like_greeting(query: str) -> bool:
     return q in greetings
 
 
+FRESH_DAY_IDLE_SECONDS = 12 * 3600
+
+
+def session_idle_seconds(session: dict) -> int:
+    """Seconds since last bot activity (ignores the current inbound turn)."""
+    last = int(session.get("last_sent_at") or 0)
+    if not last:
+        history = session.get("message_history")
+        if isinstance(history, list):
+            for item in reversed(history):
+                if not isinstance(item, dict):
+                    continue
+                if compact(item.get("role")) != "assistant":
+                    continue
+                try:
+                    last = int(item.get("at") or 0)
+                except (TypeError, ValueError):
+                    last = 0
+                if last:
+                    break
+    if not last:
+        return 10**9
+    return max(0, int(time.time()) - last)
+
+
+def is_fresh_day_greeting(query: str, session: dict) -> bool:
+    """True when a simple greeting arrives after a long idle gap (e.g. next day)."""
+    if not (looks_like_greeting(query) or looks_like_small_talk(query)):
+        return False
+    if wants_listing_help(query) or looks_like_search_refinement(query):
+        return False
+    if looks_like_booking_request(query) or looks_like_listing_detail_request(query):
+        return False
+    return session_idle_seconds(session) >= FRESH_DAY_IDLE_SECONDS
+
+
+def soft_reset_conversation_focus(session: dict) -> None:
+    """Keep qualification, but stop leading with yesterday's listing focus."""
+    session["selected_listing_key"] = ""
+    session["pending_booking_offer"] = False
+    session["last_shared_listing_keys"] = []
+    # region agent log
+    _agent_debug_log(
+        "messenger_automation.py:soft_reset_conversation_focus",
+        "fresh_day_focus_cleared",
+        {"idle_seconds": session_idle_seconds(session)},
+        hypothesis_id="F",
+    )
+    # endregion
+
+
 def looks_like_small_talk(query: str) -> bool:
     q = query.lower().strip()
     if looks_like_greeting(query):
@@ -1471,7 +1522,13 @@ def draft_matches_constraints(draft: dict, constraints: dict) -> bool:
 
 
 def qualified_conversational_reply(session: dict, agent_name: str, query: str) -> str:
-    if looks_like_greeting(query):
+    if looks_like_greeting(query) or looks_like_small_talk(query):
+        if is_fresh_day_greeting(query, session):
+            soft_reset_conversation_focus(session)
+            return (
+                f"Hi! I'm {agent_name}'s assistant at Durham New Homes. "
+                "What area, budget, or unit type are you looking for today?"
+            )
         if compact(session.get("selected_listing_key")):
             return (
                 f"Hi! I'm still here if you have questions about that unit or want to book a viewing."
@@ -3844,37 +3901,68 @@ def compute_conversation_directive(
     if session.get("qualified"):
         ai_stage = "QUALIFIED"
         allow_listings = True
-        allow_booking = bool(
-            calendly_url
-            and (
-                looks_like_booking_confirmation(query, session)
-                or looks_like_booking_request(query)
-            )
-            and bool(compact(session.get("selected_listing_key")) or session.get("last_shared_listing_keys"))
+        fresh_greeting = is_fresh_day_greeting(query, session)
+        # region agent log
+        _agent_debug_log(
+            "messenger_automation.py:compute_conversation_directive",
+            "qualified_turn",
+            {
+                "fresh_greeting": fresh_greeting,
+                "idle_seconds": session_idle_seconds(session),
+                "is_greeting": looks_like_greeting(query) or looks_like_small_talk(query),
+                "last_shared_count": len(session.get("last_shared_listing_keys") or []),
+                "query_preview": query[:80],
+            },
+            hypothesis_id="F",
         )
-        if allow_booking:
+        # endregion
+        if fresh_greeting:
+            soft_reset_conversation_focus(session)
+            allow_listings = False
+            allow_booking = False
             directive = (
-                "User wants to book a viewing. Confirm briefly and tell them you'll share the booking link. "
-                "Do not invent times."
-            )
-        elif (
-            looks_like_listing_followup_question(query)
-            or looks_like_listing_detail_request(query)
-            or resolve_listing_reference(query, session, drafts)
-        ):
-            directive = (
-                "User is asking about a specific listing from last_shared_listings. "
-                "Answer using listing_data only (including PetsAllowed when they ask about pets). "
-                "Do NOT send a booking link unless they explicitly ask to book. "
-                "End by asking if they want to book a viewing."
-            )
-        elif wants_listing_refresh(query) or wants_listing_help(query) or looks_like_more_listings_request(query) or looks_like_search_refinement(query):
-            directive = (
-                "User wants to see or refine listings. Acknowledge naturally; "
-                "listing_block will contain accurate inventory to share."
+                f"This is their first message after a long gap (new day). "
+                f"Greet warmly as {agent_name}'s assistant at Durham New Homes. "
+                "Keep it generic — do NOT mention previous listings, cities, prices, or past chat details. "
+                "Invite them to share what they are looking for today (area, budget, or unit type)."
             )
         else:
-            directive = "Help with their rental question using listing_data. Stay concise."
+            allow_booking = bool(
+                calendly_url
+                and (
+                    looks_like_booking_confirmation(query, session)
+                    or looks_like_booking_request(query)
+                )
+                and bool(compact(session.get("selected_listing_key")) or session.get("last_shared_listing_keys"))
+            )
+            if allow_booking:
+                directive = (
+                    "User wants to book a viewing. Confirm briefly and tell them you'll share the booking link. "
+                    "Do not invent times."
+                )
+            elif (
+                looks_like_listing_followup_question(query)
+                or looks_like_listing_detail_request(query)
+                or resolve_listing_reference(query, session, drafts)
+            ):
+                directive = (
+                    "User is asking about a specific listing from last_shared_listings. "
+                    "Answer using listing_data only (including PetsAllowed when they ask about pets). "
+                    "Do NOT send a booking link unless they explicitly ask to book. "
+                    "End by asking if they want to book a viewing."
+                )
+            elif wants_listing_refresh(query) or wants_listing_help(query) or looks_like_more_listings_request(query) or looks_like_search_refinement(query):
+                directive = (
+                    "User wants to see or refine listings. Acknowledge naturally; "
+                    "listing_block will contain accurate inventory to share."
+                )
+            elif looks_like_greeting(query) or looks_like_small_talk(query):
+                directive = (
+                    "Short friendly greeting. Do not dump listing details unless they ask. "
+                    "Offer to refine search or answer questions about recent options."
+                )
+            else:
+                directive = "Help with their rental question using listing_data. Stay concise."
 
     elif session.get("active"):
         ai_stage = "QUALIFYING"
@@ -3946,12 +4034,25 @@ def compute_conversation_directive(
         directive = "Helpful short reply. Invite them to describe the rental they are looking for."
 
     listing_data = []
-    if session.get("qualified"):
+    last_shared_payload = []
+    recent_history = recent_message_history(session)
+    if session.get("qualified") and not is_fresh_day_greeting(query, session):
         focus = resolve_listing_reference(query, session, drafts)
         if focus:
             listing_data = [listing_context(focus)]
         else:
             listing_data = [listing_context(d) for d in listings_from_session(session, drafts)[:3]]
+        last_shared_payload = [
+            {
+                "list_position": index + 1,
+                "listing_key": compact(listing.get("ListingKey")),
+                "summary": summarize_shared_listing(listing),
+                "data": listing_context(listing),
+            }
+            for index, listing in enumerate(listings_from_session(session, drafts))
+        ]
+    elif is_fresh_day_greeting(query, session):
+        recent_history = []
 
     return {
         "ai_stage": ai_stage,
@@ -3964,19 +4065,11 @@ def compute_conversation_directive(
         "allow_booking": allow_booking,
         "allow_listings": allow_listings,
         "calendly_url": calendly_url if allow_booking else "",
-        "last_shared_listings": [
-            {
-                "list_position": index + 1,
-                "listing_key": compact(listing.get("ListingKey")),
-                "summary": summarize_shared_listing(listing),
-                "data": listing_context(listing),
-            }
-            for index, listing in enumerate(listings_from_session(session, drafts))
-        ],
+        "last_shared_listings": last_shared_payload,
         "listing_data": listing_data,
         "selected_listing_key": compact(session.get("selected_listing_key")),
-        "last_assistant_message": compact(session.get("last_prompt")),
-        "recent_message_history": recent_message_history(session),
+        "last_assistant_message": "" if is_fresh_day_greeting(query, session) else compact(session.get("last_prompt")),
+        "recent_message_history": recent_history,
         "agent_name": agent_name,
     }
 

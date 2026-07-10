@@ -286,8 +286,35 @@ class AspectTest:
             tight_drafts,
             limit=3,
         )
-        self.check("hard_budget_still_shows_nearest", any(d.get("ListingKey") == "M1809" for d in hard_empty))
-        self.check("hard_budget_nearest_note", "closest" in hard_note.lower() or "budget" in hard_note.lower())
+        self.check(
+            "hard_budget_still_shows_nearest",
+            any(d.get("ListingKey") == "M1809" for d in hard_empty),
+        )
+        self.check(
+            "hard_budget_nearest_note",
+            "closest" in hard_note.lower() or "budget" in hard_note.lower(),
+        )
+
+        idle_session = {
+            "qualified": True,
+            "last_shared_listing_keys": ["N12664602"],
+            "selected_listing_key": "N12664602",
+            "last_sent_at": int(__import__("time").time()) - (13 * 3600),
+            "last_prompt": "Here is the Newmarket listing for $3400",
+        }
+        self.check("fresh_day_greeting_detected", bot.is_fresh_day_greeting("Hey", idle_session))
+        fresh_reply = bot.qualified_conversational_reply(idle_session, "Nabeel", "Hey")
+        self.check(
+            "fresh_day_greeting_generic",
+            "newmarket" not in fresh_reply.lower() and "3400" not in fresh_reply and "listing" not in fresh_reply.lower(),
+        )
+        self.check("fresh_day_clears_listing_focus", not idle_session.get("last_shared_listing_keys"))
+        recent_session = {
+            "qualified": True,
+            "last_shared_listing_keys": ["N12664602"],
+            "last_sent_at": int(__import__("time").time()) - 60,
+        }
+        self.check("recent_greeting_not_fresh", not bot.is_fresh_day_greeting("Hey", recent_session))
 
     def run_booking_tests(self) -> None:
         sender = "booking-user"
