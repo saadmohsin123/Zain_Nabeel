@@ -308,7 +308,10 @@ class AspectTest:
             "fresh_day_greeting_generic",
             "newmarket" not in fresh_reply.lower() and "3400" not in fresh_reply and "listing" not in fresh_reply.lower(),
         )
-        self.check("fresh_day_clears_listing_focus", not idle_session.get("last_shared_listing_keys"))
+        self.check(
+            "fresh_day_keeps_shared_listings",
+            idle_session.get("last_shared_listing_keys") == ["N12664602"],
+        )
         recent_session = {
             "qualified": True,
             "last_shared_listing_keys": ["N12664602"],
@@ -330,6 +333,11 @@ class AspectTest:
         self.check(
             "resume_needs_prior_context",
             bot.needs_prior_conversation_context("What were we talking about?", recent_session),
+        )
+        self.check("soft_ack_detected", bot.looks_like_soft_acknowledgment("Ok cool"))
+        self.check(
+            "soft_ack_skips_prior_context",
+            not bot.needs_prior_conversation_context("Ok cool", recent_session),
         )
 
     def run_booking_tests(self) -> None:

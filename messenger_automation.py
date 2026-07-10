@@ -1043,18 +1043,52 @@ def is_fresh_day_greeting(query: str, session: dict) -> bool:
 
 
 def soft_reset_conversation_focus(session: dict) -> None:
-    """Keep qualification, but stop leading with yesterday's listing focus."""
+    """Keep qualification and prior shared listings; just stop leading with a selected unit."""
     session["selected_listing_key"] = ""
     session["pending_booking_offer"] = False
-    session["last_shared_listing_keys"] = []
     # region agent log
     _agent_debug_log(
         "messenger_automation.py:soft_reset_conversation_focus",
         "fresh_day_focus_cleared",
-        {"idle_seconds": session_idle_seconds(session)},
-        hypothesis_id="F",
+        {
+            "idle_seconds": session_idle_seconds(session),
+            "kept_shared_count": len(session.get("last_shared_listing_keys") or []),
+        },
+        hypothesis_id="J",
+        run_id="post-fix",
     )
     # endregion
+
+
+def looks_like_soft_acknowledgment(query: str) -> bool:
+    """Short acknowledgments that are not a search, booking, or listing follow-up."""
+    q = query.lower().strip()
+    if looks_like_booking_request(query) or wants_listing_help(query) or looks_like_search_refinement(query):
+        return False
+    if looks_like_listing_followup_question(query) or looks_like_listing_detail_request(query):
+        return False
+    if looks_like_history_resume_request(query):
+        return False
+    acknowledgments = {
+        "ok",
+        "okay",
+        "ok cool",
+        "okay cool",
+        "cool",
+        "great",
+        "nice",
+        "thanks",
+        "thank you",
+        "sounds good",
+        "got it",
+        "alright",
+        "all right",
+        "perfect",
+        "sure",
+    }
+    if q in acknowledgments:
+        return True
+    return bool(re.fullmatch(r"(ok|okay|cool|great|nice|sure|perfect)([,.!]|\s)+(cool|thanks|thank you)?[.!]*", q))
 
 
 def looks_like_history_resume_request(query: str) -> bool:
@@ -1089,6 +1123,8 @@ def needs_prior_conversation_context(query: str, session: dict, drafts: Optional
     if is_fresh_day_greeting(query, session):
         return False
     if looks_like_greeting(query) or looks_like_small_talk(query):
+        return False
+    if looks_like_soft_acknowledgment(query):
         return False
     if looks_like_history_resume_request(query):
         return True
@@ -4018,10 +4054,20 @@ def compute_conversation_directive(
             elif looks_like_greeting(query) or looks_like_small_talk(query):
                 directive = (
                     "Short friendly greeting. Do not dump listing details unless they ask. "
-                    "Offer to refine search or answer questions about recent options."
+                    "Ask what area, budget, or unit type they want today."
+                )
+            elif looks_like_soft_acknowledgment(query):
+                directive = (
+                    "They gave a short acknowledgment (like 'ok cool'), not a search request. "
+                    "Do NOT say listings are unavailable or invent inventory status. "
+                    "Briefly acknowledge and ask for area, budget, or bedrooms so you can search the sheet."
                 )
             else:
-                directive = "Help with their rental question using listing_data. Stay concise."
+                directive = (
+                    "Help with their rental question. "
+                    "If listing_data/listing_block is empty, ask for area/budget/bedrooms — "
+                    "do NOT claim there are no listings."
+                )
 
     elif session.get("active"):
         ai_stage = "QUALIFYING"
@@ -4339,6 +4385,61 @@ def _finish_ai_turn_impl(
 
     reply = sanitize_bot_reply(compact(result.get("reply")))
     answers = session.get("answers", {})
+
+    # region agent log
+    _agent_debug_log(
+        "messenger_automation.py:_finish_ai_turn_impl",
+        "ai_reply_check",
+        {
+            "query_preview": query[:80],
+            "has_listing_block": bool(listing_block),
+            "soft_ack": looks_like_soft_acknowledgment(query),
+            "reply_claims_empty": bool(
+                re.search(
+                    r"don.?t see any available|no available listings|nothing available|no listings",
+                    reply.lower(),
+                )
+            ),
+            "reply_preview": reply[:120],
+        },
+        hypothesis_id="K",
+        run_id="post-fix",
+    )
+    # endregion
+
+    # Never let the model invent "no listings" when we did not run a sheet search this turn.
+    if (
+        reply
+        and not listing_block
+        and (
+            looks_like_soft_acknowledgment(query)
+            or looks_like_greeting(query)
+            or looks_like_small_talk(query)
+            or not (
+                wants_listing_help(query)
+                or looks_like_search_refinement(query)
+                or looks_like_more_listings_request(query)
+                or wants_listing_refresh(query)
+            )
+        )
+        and re.search(
+            r"don.?t see any available|no available listings|nothing available|no listings that fit|aren.?t any available",
+            reply.lower(),
+        )
+    ):
+        reply = (
+            "Sounds good — tell me the area, budget, and how many bedrooms you want, "
+            "and I’ll pull matching options from our current listings."
+        )
+        # region agent log
+        _agent_debug_log(
+            "messenger_automation.py:_finish_ai_turn_impl",
+            "rewrote_false_empty_inventory",
+            {"query_preview": query[:80]},
+            hypothesis_id="K",
+            run_id="post-fix",
+        )
+        # endregion
 
     if reply and reply_reasks_collected_fields(reply, answers):
         missing_key = first_missing_qualification_key(answers)
