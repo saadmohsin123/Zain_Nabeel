@@ -60,7 +60,6 @@ import requests
 
 import session_store
 
-
 GRAPH_BASE = "https://graph.facebook.com/v20.0"
 OPENAI_RESPONSES_API = "https://api.openai.com/v1/responses"
 DEFAULT_SHEET_GID = "0"
@@ -217,18 +216,15 @@ occupation, resident_status, working_with_agent (Yes/No only), phone_number
 === WHEN fields should be empty ===
 Set fields to {} for reply-only turns, or when nothing new was stated."""
 
-
 def must_env(name: str, default: Optional[str] = None) -> str:
     value = os.getenv(name, default)
     if value in (None, ""):
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
 
-
 def optional_env(name: str, default: str = "") -> str:
     value = os.getenv(name, default)
     return "" if value is None else value
-
 
 def env_flag(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -236,48 +232,11 @@ def env_flag(name: str, default: bool = False) -> bool:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
-
 def resolve_use_ai(config: "MessengerConfig", explicit: Optional[bool] = None) -> bool:
     """OpenAI is used whenever an API key is present unless explicitly overridden."""
     if explicit is not None:
         return explicit
     return bool(config.openai_api_key)
-
-
-# region agent log
-_AGENT_DEBUG_LOG_PATH = Path(__file__).resolve().parent / ".cursor" / "debug-879fd5.log"
-_AGENT_DEBUG_SESSION_ID = "879fd5"
-
-
-def _agent_debug_log(
-    location: str,
-    message: str,
-    data: Optional[dict] = None,
-    *,
-    hypothesis_id: str = "",
-    run_id: str = "pre-fix",
-) -> None:
-    payload = {
-        "sessionId": _AGENT_DEBUG_SESSION_ID,
-        "timestamp": int(time.time() * 1000),
-        "location": location,
-        "message": message,
-        "data": data or {},
-        "hypothesisId": hypothesis_id,
-        "runId": run_id,
-    }
-    line = json.dumps(payload, ensure_ascii=False)
-    print(f"AGENT_DEBUG {line}")
-    try:
-        _AGENT_DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with _AGENT_DEBUG_LOG_PATH.open("a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
-    except Exception:
-        pass
-
-
-# endregion
-
 
 def resolve_page_access_token(user_access_token: str, page_id: str) -> str:
     resp = requests.get(
@@ -294,18 +253,15 @@ def resolve_page_access_token(user_access_token: str, page_id: str) -> str:
                 return page_token
     raise RuntimeError(f"Could not derive a page access token for META_PAGE_ID={page_id}")
 
-
 def load_drafts(path: Path) -> List[dict]:
     if not path.exists():
         return []
     payload = json.loads(path.read_text(encoding="utf-8"))
     return payload if isinstance(payload, list) else []
 
-
 def parse_spreadsheet_id(listing_doc_url: str) -> str:
     match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", listing_doc_url)
     return match.group(1) if match else ""
-
 
 def parse_sheet_gid(listing_doc_url: str) -> str:
     parsed = urlparse(listing_doc_url)
@@ -317,14 +273,12 @@ def parse_sheet_gid(listing_doc_url: str) -> str:
     gid = compact(fragment_params.get("gid", [""])[0])
     return gid or DEFAULT_SHEET_GID
 
-
 def build_sheet_csv_url(listing_doc_url: str) -> str:
     spreadsheet_id = parse_spreadsheet_id(listing_doc_url)
     if not spreadsheet_id:
         return ""
     gid = parse_sheet_gid(listing_doc_url)
     return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?format=csv&gid={gid}"
-
 
 def fetch_sheet_drafts(csv_url: str) -> List[dict]:
     resp = requests.get(csv_url, timeout=30)
@@ -337,14 +291,12 @@ def fetch_sheet_drafts(csv_url: str) -> List[dict]:
             drafts.append(normalized)
     return drafts
 
-
 def compact(value) -> str:
     if value in (None, "", []):
         return ""
     if isinstance(value, list):
         return ", ".join(compact(v) for v in value if compact(v))
     return str(value).strip()
-
 
 def parse_graph_time(value: str) -> Optional[int]:
     value = compact(value)
@@ -355,10 +307,8 @@ def parse_graph_time(value: str) -> Optional[int]:
     except Exception:
         return None
 
-
 def tokenize(text: str) -> List[str]:
     return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t and t not in QUERY_STOPWORDS]
-
 
 def draft_text(draft: dict) -> str:
     bits = [
@@ -376,10 +326,8 @@ def draft_text(draft: dict) -> str:
     ]
     return " ".join(bits).lower()
 
-
 def normalize_status(value: str) -> str:
     return compact(value).strip().lower()
-
 
 def is_rental_listing(draft: dict) -> bool:
     transaction_type = normalize_status(compact(draft.get("TransactionType")))
@@ -390,7 +338,6 @@ def is_rental_listing(draft: dict) -> bool:
         "rent",
     }
     return transaction_type in allowed
-
 
 def is_listing_ready(draft: dict) -> bool:
     marketplace_status = normalize_status(compact(draft.get("MarketplaceStatus")))
@@ -413,15 +360,12 @@ def is_listing_ready(draft: dict) -> bool:
         return False
     return is_rental_listing(draft)
 
-
 def customer_visible_drafts(drafts: List[dict]) -> List[dict]:
     return [draft for draft in drafts if is_listing_ready(draft)]
-
 
 def rank_drafts(query: str, drafts: List[dict], limit: int = 3) -> List[dict]:
     matches, _ = rank_drafts_with_note(query, drafts, limit=limit)
     return matches
-
 
 def rank_drafts_with_note(
     query: str,
@@ -527,14 +471,6 @@ def rank_drafts_with_note(
                 f"I don't have active listings in {constraints['out_of_area'].title()} right now — "
                 "I can help across the Greater Toronto and Durham areas."
             )
-        # region agent log
-        _agent_debug_log(
-            "messenger_automation.py:rank_drafts_with_note",
-            "no_matches",
-            {"query": query[:120], "constraints": constraints, "note": note},
-            hypothesis_id="C",
-        )
-        # endregion
         return [], note
 
     if constraints:
@@ -597,21 +533,7 @@ def rank_drafts_with_note(
 
     scored.sort(key=lambda item: (-item[0], draft_listing_price(item[1]) or 10**9))
     results = [draft for _, draft in scored[:limit]]
-    # region agent log
-    _agent_debug_log(
-        "messenger_automation.py:rank_drafts_with_note",
-        "matches_found",
-        {
-            "query": query[:120],
-            "constraints": constraints,
-            "match_count": len(results),
-            "note": note[:120] if note else "",
-        },
-        hypothesis_id="C",
-    )
-    # endregion
     return results, note
-
 
 def summarize_draft(draft: dict) -> str:
     title = compact(draft.get("MarketplaceTitle")) or compact(draft.get("Address")) or "Listing"
@@ -626,7 +548,6 @@ def summarize_draft(draft: dict) -> str:
     if city:
         parts.append(f"City: {city}")
     return " | ".join(parts)
-
 
 def listing_context(draft: dict) -> dict:
     fields = [
@@ -654,7 +575,6 @@ def listing_context(draft: dict) -> dict:
     ]
     return {field: draft.get(field) for field in fields if draft.get(field) not in (None, "", [])}
 
-
 def looks_like_booking_request(query: str) -> bool:
     if wants_listing_help(query) or looks_like_search_refinement(query):
         return False
@@ -673,7 +593,6 @@ def looks_like_booking_request(query: str) -> bool:
         r"\bavailability\b",
     )
     return any(re.search(pattern, q) for pattern in phrase_patterns)
-
 
 def looks_like_more_listings_request(query: str) -> bool:
     q = normalize_whitespace(query).lower()
@@ -700,10 +619,8 @@ def looks_like_more_listings_request(query: str) -> bool:
     )
     return any(phrase in q for phrase in phrases)
 
-
 def shortlist_for_booking(matches: List[dict]) -> List[dict]:
     return [draft for draft in matches if is_listing_ready(draft)]
-
 
 def append_message_history(session: dict, role: str, text: str) -> None:
     text = compact(text)
@@ -715,7 +632,6 @@ def append_message_history(session: dict, role: str, text: str) -> None:
     history.append({"role": role, "text": text, "at": int(time.time())})
     session["message_history"] = history[-MAX_MESSAGE_HISTORY:]
 
-
 def recent_message_history(session: dict, limit: int = 12) -> List[dict]:
     history = session.get("message_history")
     if not isinstance(history, list):
@@ -725,7 +641,6 @@ def recent_message_history(session: dict, limit: int = 12) -> List[dict]:
         for item in history[-limit:]
         if isinstance(item, dict) and compact(item.get("text"))
     ]
-
 
 def looks_like_listing_followup_question(query: str) -> bool:
     q = query.lower()
@@ -782,7 +697,6 @@ def looks_like_listing_followup_question(query: str) -> bool:
         return True
     return False
 
-
 def looks_like_affirmative(query: str) -> bool:
     q = query.lower().strip()
     affirmatives = {
@@ -808,7 +722,6 @@ def looks_like_affirmative(query: str) -> bool:
         return True
     return False
 
-
 def looks_like_opt_in_acceptance(query: str, session: dict) -> bool:
     if not looks_like_affirmative(query):
         return False
@@ -827,7 +740,6 @@ def looks_like_opt_in_acceptance(query: str, session: dict) -> bool:
         "listing help",
     )
     return any(hint in last for hint in hints)
-
 
 def parse_household_from_text(text: str) -> Dict[str, str]:
     lowered = normalize_whitespace(text).lower()
@@ -849,7 +761,6 @@ def parse_household_from_text(text: str) -> Dict[str, str]:
             answers["people_on_lease"] = answers["adults_in_unit"]
             answers.setdefault("kids_in_unit", "0")
     return answers
-
 
 def wants_listing_help(query: str) -> bool:
     q = query.lower()
@@ -903,7 +814,6 @@ def search_preferences_changed(old_query: str, new_query: str) -> bool:
             return True
     return False
 
-
 def restart_qualification_for_search(session: dict, query: str, agent_name: str) -> str:
     summary = describe_search_preferences(query)
     session["search_query"] = compact(query)
@@ -921,7 +831,6 @@ def restart_qualification_for_search(session: dict, query: str, agent_name: str)
     first = QUALIFICATION_STEPS[0]["prompt"]
     return f"{intro} I'll ask a few quick questions first.\n\n{first}"
 
-
 def handle_active_search_update(session: dict, query: str, agent_name: str) -> Optional[str]:
     if not session.get("active") or session.get("qualified"):
         return None
@@ -931,7 +840,6 @@ def handle_active_search_update(session: dict, query: str, agent_name: str) -> O
         return None
     return restart_qualification_for_search(session, query, agent_name)
 
-
 def should_skip_duplicate_outbound(session: dict, reply: str) -> bool:
     last_sent = compact(session.get("last_sent_reply"))
     if not last_sent or not replies_are_similar(reply, last_sent):
@@ -939,11 +847,9 @@ def should_skip_duplicate_outbound(session: dict, reply: str) -> bool:
     last_at = int(session.get("last_sent_at") or 0)
     return last_at and int(time.time()) - last_at < 180
 
-
 def record_outbound_send(session: dict, reply: str) -> None:
     session["last_sent_reply"] = compact(reply)
     session["last_sent_at"] = int(time.time())
-
 
 def deliver_reply(
     config,
@@ -953,25 +859,9 @@ def deliver_reply(
 ) -> bool:
     reply = compact(reply)
     if not reply:
-        # region agent log
-        _agent_debug_log(
-            "messenger_automation.py:deliver_reply",
-            "empty_reply",
-            {"sender_id": sender_id},
-            hypothesis_id="B",
-        )
-        # endregion
         return False
     if session and should_skip_duplicate_outbound(session, reply):
         print(f"Skipping duplicate outbound to {sender_id}")
-        # region agent log
-        _agent_debug_log(
-            "messenger_automation.py:deliver_reply",
-            "duplicate_outbound_skipped",
-            {"sender_id": sender_id, "reply_preview": reply[:80]},
-            hypothesis_id="E",
-        )
-        # endregion
         return False
     try:
         send_message(config.page_access_token, sender_id, reply)
@@ -980,33 +870,10 @@ def deliver_reply(
             sid = compact(sender_id)
             if sid and session_store.use_postgres_sessions():
                 session_store.save_session(sid, session)
-        # region agent log
-        _agent_debug_log(
-            "messenger_automation.py:deliver_reply",
-            "send_ok",
-            {"sender_id": sender_id, "reply_preview": reply[:80]},
-            hypothesis_id="D",
-        )
-        # endregion
         return True
     except Exception as exc:
-        error_body = ""
-        if hasattr(exc, "response") and exc.response is not None:
-            try:
-                error_body = exc.response.text[:300]
-            except Exception:
-                error_body = str(exc)
         print(f"Failed sending to {sender_id}: {exc}")
-        # region agent log
-        _agent_debug_log(
-            "messenger_automation.py:deliver_reply",
-            "send_failed",
-            {"sender_id": sender_id, "error": str(exc), "error_body": error_body},
-            hypothesis_id="D",
-        )
-        # endregion
         return False
-
 
 def looks_like_greeting(query: str) -> bool:
     q = query.lower().strip()
@@ -1021,9 +888,7 @@ def looks_like_greeting(query: str) -> bool:
     }
     return q in greetings
 
-
 FRESH_DAY_IDLE_SECONDS = 12 * 3600
-
 
 def session_idle_seconds(session: dict) -> int:
     """Seconds since last bot activity (ignores the current inbound turn)."""
@@ -1046,7 +911,6 @@ def session_idle_seconds(session: dict) -> int:
         return 10**9
     return max(0, int(time.time()) - last)
 
-
 def is_fresh_day_greeting(query: str, session: dict) -> bool:
     """True when a simple greeting arrives after a long idle gap (e.g. next day)."""
     if not (looks_like_greeting(query) or looks_like_small_talk(query)):
@@ -1057,24 +921,10 @@ def is_fresh_day_greeting(query: str, session: dict) -> bool:
         return False
     return session_idle_seconds(session) >= FRESH_DAY_IDLE_SECONDS
 
-
 def soft_reset_conversation_focus(session: dict) -> None:
     """Keep qualification and prior shared listings; just stop leading with a selected unit."""
     session["selected_listing_key"] = ""
     session["pending_booking_offer"] = False
-    # region agent log
-    _agent_debug_log(
-        "messenger_automation.py:soft_reset_conversation_focus",
-        "fresh_day_focus_cleared",
-        {
-            "idle_seconds": session_idle_seconds(session),
-            "kept_shared_count": len(session.get("last_shared_listing_keys") or []),
-        },
-        hypothesis_id="J",
-        run_id="post-fix",
-    )
-    # endregion
-
 
 def looks_like_soft_acknowledgment(query: str) -> bool:
     """Short acknowledgments that are not a search, booking, or listing follow-up."""
@@ -1106,7 +956,6 @@ def looks_like_soft_acknowledgment(query: str) -> bool:
         return True
     return bool(re.fullmatch(r"(ok|okay|cool|great|nice|sure|perfect)([,.!]|\s)+(cool|thanks|thank you)?[.!]*", q))
 
-
 def looks_like_history_resume_request(query: str) -> bool:
     q = query.lower()
     phrases = (
@@ -1131,7 +980,6 @@ def looks_like_history_resume_request(query: str) -> bool:
         "the last one",
     )
     return any(phrase in q for phrase in phrases)
-
 
 def needs_prior_conversation_context(query: str, session: dict, drafts: Optional[List[dict]] = None) -> bool:
     """Only pull prior chat/listing memory when the current message depends on it."""
@@ -1167,7 +1015,6 @@ def needs_prior_conversation_context(query: str, session: dict, drafts: Optional
             return True
     return False
 
-
 def looks_like_small_talk(query: str) -> bool:
     q = query.lower().strip()
     if looks_like_greeting(query):
@@ -1185,7 +1032,6 @@ def looks_like_small_talk(query: str) -> bool:
         "thanks",
     )
     return any(phrase in q for phrase in phrases)
-
 
 STATIC_OPT_IN_NUDGE = "Whenever you're ready, just reply yes and I'll ask a few quick questions."
 OUTBOUND_PROFANITY_MARKERS = (
@@ -1206,13 +1052,11 @@ OUTBOUND_PROFANITY_MARKERS = (
     "bkl",
 )
 
-
 def contains_profanity(text: str) -> bool:
     lowered = normalize_whitespace(text).lower()
     if not lowered:
         return False
     return any(marker in lowered for marker in OUTBOUND_PROFANITY_MARKERS)
-
 
 def sanitize_bot_reply(reply: str) -> str:
     cleaned = compact(reply)
@@ -1220,11 +1064,9 @@ def sanitize_bot_reply(reply: str) -> str:
         return cleaned
     return "I'm here to help with rentals. Tell me the area, budget, or unit type you're looking for."
 
-
 def has_partial_qualification(session: dict) -> bool:
     answers = session.get("answers", {}) if isinstance(session.get("answers"), dict) else {}
     return any(compact(answers.get(key)) for key in QUALIFICATION_FIELD_KEYS)
-
 
 def should_offer_search_opt_in(session: dict, query: str, calendly_url: str = "") -> bool:
     if session.get("qualified") or session.get("active") or session.get("messaging_paused"):
@@ -1233,14 +1075,12 @@ def should_offer_search_opt_in(session: dict, query: str, calendly_url: str = ""
         return False
     return wants_listing_help(query) or should_start_qualification(query, calendly_url)
 
-
 def profanity_safe_qualification_reply(session: dict) -> str:
     answers = session.setdefault("answers", {})
     missing = first_missing_qualification_key(answers)
     if missing:
         return build_missing_field_prompt([missing], answers)
     return "I'm here to help with your rental search."
-
 
 def looks_like_messaging_opt_out(query: str) -> bool:
     lowered = normalize_whitespace(query).lower()
@@ -1262,7 +1102,6 @@ def looks_like_messaging_opt_out(query: str) -> bool:
     if any(phrase in lowered for phrase in phrases):
         return True
     return lowered in {"stop", "shut up", "shutup"}
-
 
 def handle_messaging_controls(session: dict, query: str) -> Optional[str]:
     if looks_like_messaging_opt_out(query):
@@ -1288,7 +1127,6 @@ def handle_messaging_controls(session: dict, query: str) -> Optional[str]:
 
     return None
 
-
 def replies_are_similar(left: str, right: str) -> bool:
     left_norm = re.sub(r"\s+", " ", compact(left).lower())
     right_norm = re.sub(r"\s+", " ", compact(right).lower())
@@ -1296,13 +1134,11 @@ def replies_are_similar(left: str, right: str) -> bool:
         return False
     return left_norm == right_norm or left_norm in right_norm or right_norm in left_norm
 
-
 def qualification_objection_reply(answers: dict, missing_key: str) -> str:
     return (
         "Fair question — we only ask so we can match you with the right rentals. "
         + build_missing_field_prompt([missing_key], answers)
     )
-
 
 def looks_like_user_pushback(text: str) -> bool:
     lowered = normalize_whitespace(text).lower()
@@ -1326,7 +1162,6 @@ def looks_like_user_pushback(text: str) -> bool:
     )
     return any(phrase in lowered for phrase in phrases)
 
-
 def looks_like_qualification_objection(text: str) -> bool:
     if looks_like_user_pushback(text):
         return True
@@ -1335,14 +1170,12 @@ def looks_like_qualification_objection(text: str) -> bool:
         return True
     return False
 
-
 def looks_like_correction(text: str) -> bool:
     lowered = normalize_whitespace(text).lower()
     return any(
         phrase in lowered
         for phrase in ("actually", "i meant", "correction", "sorry", "wait", "not a ", "not the ")
     )
-
 
 def looks_like_search_refinement(query: str) -> bool:
     q = query.lower()
@@ -1392,7 +1225,6 @@ def looks_like_search_refinement(query: str) -> bool:
         return True
     return any(re.search(rf"\b{re.escape(city)}\b", q) for city in SEARCH_CITIES)
 
-
 def extract_search_constraints(query: str) -> dict:
     normalized = normalize_whitespace(query).lower()
     constraints: dict = {}
@@ -1434,7 +1266,6 @@ def extract_search_constraints(query: str) -> dict:
 
     return constraints
 
-
 def extract_max_price_from_query(normalized: str) -> Optional[int]:
     flexible = re.search(r"(?:around|about|budget(?:\s+is|\s+of|\s+it)?)\s*\$?\s*([\d,]{3,7})", normalized)
     if flexible:
@@ -1464,7 +1295,6 @@ def extract_max_price_from_query(normalized: str) -> Optional[int]:
             return value
     return None
 
-
 def looks_like_broaden_request(query: str) -> bool:
     q = query.lower()
     if looks_like_booking_request(query):
@@ -1488,7 +1318,6 @@ def looks_like_broaden_request(query: str) -> bool:
     )
     return any(phrase in q for phrase in phrases)
 
-
 def draft_listing_price(draft: dict) -> Optional[int]:
     price = draft.get("MarketplacePrice")
     if isinstance(price, (int, float)) and price > 0:
@@ -1498,7 +1327,6 @@ def draft_listing_price(draft: dict) -> Optional[int]:
     if match:
         return int(match.group(1))
     return None
-
 
 def draft_matches_city(draft: dict, city: str) -> bool:
     city = compact(city).lower()
@@ -1512,7 +1340,6 @@ def draft_matches_city(draft: dict, city: str) -> bool:
         ]
     ).lower()
     return city in haystack
-
 
 def merge_search_queries(session: dict, query: str) -> str:
     base = compact(session.get("search_query"))
@@ -1552,7 +1379,6 @@ def merge_search_queries(session: dict, query: str) -> str:
         parts.append(f"under {base_constraints['max_price']}")
     return " ".join(parts)
 
-
 def draft_bedroom_count(draft: dict) -> Optional[int]:
     total = compact(draft.get("BedroomsTotal"))
     if total.isdigit():
@@ -1561,12 +1387,10 @@ def draft_bedroom_count(draft: dict) -> Optional[int]:
     match = re.search(r"(\d+)\s*bed", title)
     return int(match.group(1)) if match else None
 
-
 def draft_is_commercial(draft: dict) -> bool:
     haystack = draft_text(draft)
     property_type = normalize_status(compact(draft.get("PropertyType")))
     return "commercial" in haystack or property_type == "commercial"
-
 
 def draft_is_condo(draft: dict) -> bool:
     property_type = normalize_status(compact(draft.get("PropertyType")))
@@ -1575,13 +1399,11 @@ def draft_is_condo(draft: dict) -> bool:
         return True
     return "condo" in title
 
-
 def draft_allows_pets(draft: dict) -> bool:
     pets = str(draft.get("PetsAllowed") or "").lower()
     if not pets or pets in {"[]", "no", '["no"]'}:
         return False
     return "yes" in pets
-
 
 def draft_has_gated_security(draft: dict) -> bool:
     hay = f"{draft_text(draft)} {compact(draft.get('Amenities')).lower()}"
@@ -1597,7 +1419,6 @@ def draft_has_gated_security(draft: dict) -> bool:
         "building security",
     )
     return any(marker in hay for marker in markers)
-
 
 def draft_matches_constraints(draft: dict, constraints: dict) -> bool:
     if constraints.get("out_of_area"):
@@ -1632,7 +1453,6 @@ def draft_matches_constraints(draft: dict, constraints: dict) -> bool:
             return False
     return True
 
-
 def qualified_conversational_reply(session: dict, agent_name: str, query: str) -> str:
     if looks_like_greeting(query) or looks_like_small_talk(query):
         if is_fresh_day_greeting(query, session):
@@ -1653,7 +1473,6 @@ def qualified_conversational_reply(session: dict, agent_name: str, query: str) -
         return "Happy to help — tell me the area, budget, or unit type you want to look at."
     return "Happy to help — want to refine your search or ask about a specific listing?"
 
-
 def guard_against_repeat_reply(reply: str, session: dict, answers: Optional[dict] = None) -> str:
     last = compact(session.get("last_prompt"))
     if not reply or not replies_are_similar(reply, last):
@@ -1666,7 +1485,6 @@ def guard_against_repeat_reply(reply: str, session: dict, answers: Optional[dict
             return alt
     return reply
 
-
 def reset_stale_opt_in_session(session: dict, query: str) -> bool:
     if not session.get("awaiting_opt_in") or session.get("active") or session.get("qualified"):
         return False
@@ -1678,7 +1496,6 @@ def reset_stale_opt_in_session(session: dict, query: str) -> bool:
     session["search_query"] = ""
     session["last_prompt"] = ""
     return True
-
 
 def local_conversational_fallback(
     stage: str,
@@ -1713,7 +1530,6 @@ def local_conversational_fallback(
 
     return "I can help with rentals. What area or unit type are you looking for?"
 
-
 def save_session_reply(
     lead_state_path: Path,
     state: dict,
@@ -1737,7 +1553,6 @@ def save_session_reply(
     persist_lead_state(lead_state_path, state)
     return reply
 
-
 def ai_conversational_fallback(
     api_key: str,
     model: str,
@@ -1759,7 +1574,6 @@ def ai_conversational_fallback(
         search_query=search_query,
         last_assistant_message=last_assistant_message,
     )
-
 
 def infer_household_defaults(answers: dict, query: str = "") -> None:
     lowered = normalize_whitespace(query).lower()
@@ -1783,7 +1597,6 @@ def infer_household_defaults(answers: dict, query: str = "") -> None:
         answers["people_on_lease"] = str(int(adults) + int(kids))
     validate_household_counts(answers)
 
-
 def build_next_qualification_reply(
     session: dict,
     answers: dict,
@@ -1799,7 +1612,6 @@ def build_next_qualification_reply(
         return build_post_qualification_reply(session, drafts, listing_doc_url)
     return build_missing_field_prompt([missing_key], answers)
 
-
 def qualification_greeting_nudge(session: dict, query: str) -> Optional[str]:
     if not session.get("active") or session.get("qualified"):
         return None
@@ -1814,7 +1626,6 @@ def qualification_greeting_nudge(session: dict, query: str) -> Optional[str]:
         return f"Hey! Still here — {prompt[0].lower() + prompt[1:] if prompt else prompt}"
     return prompt
 
-
 def qualified_helpful_fallback(session: dict, query: str, agent_name: str) -> str:
     if wants_listing_help(query) or looks_like_search_refinement(query) or looks_like_more_listings_request(query):
         return (
@@ -1827,7 +1638,6 @@ def qualified_helpful_fallback(session: dict, query: str, agent_name: str) -> st
         "Happy to help — tell me the area, bedrooms, or budget you'd like to refine, "
         "ask about a listing, or say if you want to book a viewing."
     )
-
 
 def ensure_outbound_reply(
     reply: str,
@@ -1857,7 +1667,6 @@ def ensure_outbound_reply(
         "Tell me the area, budget, or type of place you're looking for."
     )
 
-
 def apply_qualification_turn(
     session: dict,
     query: str,
@@ -1885,7 +1694,6 @@ def apply_qualification_turn(
         session.get("answers", {}),
     )
 
-
 def qualification_turn_reply(
     session: dict,
     query: str,
@@ -1905,7 +1713,6 @@ def qualification_turn_reply(
         openai_api_key,
         openai_model,
     )
-
 
 def finalize_conversation_reply(
     reply: str,
@@ -1979,7 +1786,6 @@ def build_search_opt_in_reply(session: dict, query: str, agent_name: str) -> str
     session["active"] = False
     return qualification_opt_in_prompt(agent_name, describe_search_preferences(query))
 
-
 def build_awaiting_opt_in_reply(session: dict, query: str, agent_name: str) -> str:
     if wants_listing_help(query):
         session["search_query"] = compact(query)
@@ -1995,7 +1801,6 @@ def build_awaiting_opt_in_reply(session: dict, query: str, agent_name: str) -> s
         search_query=compact(session.get("search_query")),
     )
 
-
 def qualification_opt_in_prompt(agent_name: str, search_summary: str = "") -> str:
     context = f"Got it — you're looking for {search_summary}.\n\n" if search_summary else ""
     return (
@@ -2005,7 +1810,6 @@ def qualification_opt_in_prompt(agent_name: str, search_summary: str = "") -> st
         "Would you like me to send you a list of the best active options? "
         "Just say yes and I'll ask a few quick questions first."
     )
-
 
 def atomic_write_json(path: Path, payload: dict | list) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2027,7 +1831,6 @@ def atomic_write_json(path: Path, payload: dict | list) -> None:
                 pass
         raise
 
-
 def with_lead_session(sender_id: str, lead_state_path: Path, fn):
     if session_store.use_postgres_sessions():
         session_store.ensure_schema()
@@ -2046,7 +1849,6 @@ def with_lead_session(sender_id: str, lead_state_path: Path, fn):
         session = get_lead_session(state, sender_id)
         return fn(session, state)
 
-
 def with_poll_state(poll_state_path: Path, fn):
     if session_store.use_postgres_sessions():
         with _POLL_STATE_LOCK:
@@ -2060,7 +1862,6 @@ def with_poll_state(poll_state_path: Path, fn):
         result = fn(seen)
         save_seen_message_ids(poll_state_path, seen)
         return result
-
 
 def claim_inbound_message(message_id: str, poll_state_path: Path) -> bool:
     message_id = compact(message_id)
@@ -2083,7 +1884,6 @@ def claim_inbound_message(message_id: str, poll_state_path: Path) -> bool:
     with_poll_state(poll_state_path, _claim)
     return claimed
 
-
 def load_lead_state(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -2093,10 +1893,8 @@ def load_lead_state(path: Path) -> dict:
         return {}
     return payload if isinstance(payload, dict) else {}
 
-
 def save_lead_state(path: Path, payload: dict):
     atomic_write_json(path, payload)
-
 
 def persist_lead_state(path: Path, state: dict, sender_id: str = "") -> None:
     sid = sender_id or session_store.current_sender_id()
@@ -2106,7 +1904,6 @@ def persist_lead_state(path: Path, state: dict, sender_id: str = "") -> None:
             session_store.save_session(sid, session)
         return
     save_lead_state(path, state)
-
 
 def get_lead_session(state: dict, sender_id: str) -> dict:
     sessions = state.setdefault("sessions", {})
@@ -2130,7 +1927,6 @@ def get_lead_session(state: dict, sender_id: str) -> dict:
         },
     )
 
-
 def format_lead_summary(answers: dict) -> str:
     labels = {
         "move_in_date": "Move-in date",
@@ -2150,7 +1946,6 @@ def format_lead_summary(answers: dict) -> str:
         if value:
             lines.append(f"{labels[key]}: {value}")
     return "\n".join(lines)
-
 
 def describe_search_preferences(query: str) -> str:
     normalized = query.lower().replace("torronto", "toronto")
@@ -2186,14 +1981,11 @@ def describe_search_preferences(query: str) -> str:
         parts.append("lowest price first")
     return " ".join(parts).strip()
 
-
 def begin_qualification_flow(agent_name: str) -> str:
     return qualification_opt_in_prompt(agent_name)
 
-
 def normalize_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", compact(text)).strip()
-
 
 def parse_int_from_text(text: str) -> str:
     normalized = normalize_whitespace(text).lower()
@@ -2206,13 +1998,11 @@ def parse_int_from_text(text: str) -> str:
     match = re.search(r"\b(\d+)\b", normalized)
     return match.group(1) if match else ""
 
-
 def extract_phone_number(text: str) -> str:
     digits = re.sub(r"\D", "", compact(text))
     if len(digits) >= 10:
         return digits[-10:]
     return ""
-
 
 def extract_income_value(text: str) -> str:
     normalized = normalize_whitespace(text)
@@ -2228,7 +2018,6 @@ def extract_income_value(text: str) -> str:
     if lowered.isdigit():
         return normalized
     return ""
-
 
 def extract_resident_status(text: str) -> str:
     lowered = normalize_whitespace(text).lower()
@@ -2260,7 +2049,6 @@ def extract_resident_status(text: str) -> str:
         return "Permanent Resident"
     return ""
 
-
 def scrub_agent_phrases(text: str) -> str:
     scrubbed = normalize_whitespace(text)
     patterns = [
@@ -2274,7 +2062,6 @@ def scrub_agent_phrases(text: str) -> str:
     for pattern in patterns:
         scrubbed = re.sub(pattern, "", scrubbed, flags=re.I).strip(" ,.-")
     return scrubbed
-
 
 def extract_agent_answer(text: str) -> str:
     lowered = normalize_whitespace(text).lower()
@@ -2304,7 +2091,6 @@ def extract_agent_answer(text: str) -> str:
         return "No"
     return ""
 
-
 def parse_resident_and_agent(text: str) -> Dict[str, str]:
     answers: Dict[str, str] = {}
     agent_answer = extract_agent_answer(text)
@@ -2315,7 +2101,6 @@ def parse_resident_and_agent(text: str) -> Dict[str, str]:
     if agent_answer in ("Yes", "No"):
         answers["working_with_agent"] = agent_answer
     return answers
-
 
 def parse_people_count(text: str) -> str:
     lowered = normalize_whitespace(text).lower()
@@ -2334,7 +2119,6 @@ def parse_people_count(text: str) -> str:
     if match:
         return match.group(1)
     return parse_int_from_text(text)
-
 
 def qualification_in_progress(session: dict) -> bool:
     if session.get("qualified"):
@@ -2361,7 +2145,6 @@ def qualification_in_progress(session: dict) -> bool:
         return True
     return False
 
-
 def begin_structured_qualification(
     session: dict,
     query: str,
@@ -2377,7 +2160,6 @@ def begin_structured_qualification(
         session["search_query"] = compact(search_query)
     elif wants_listing_help(query):
         session["search_query"] = compact(query)
-
 
 def run_structured_qualification(
     session: dict,
@@ -2400,7 +2182,6 @@ def run_structured_qualification(
     )
     return save_session_reply(lead_state_path, state, session, qual_reply)
 
-
 def is_plausible_occupation(text: str) -> bool:
     cleaned = normalize_whitespace(text)
     if not cleaned:
@@ -2420,9 +2201,7 @@ def is_plausible_occupation(text: str) -> bool:
         return False
     return True
 
-
 COUNT_FIELDS = {"people_on_lease", "adults_in_unit", "kids_in_unit"}
-
 
 def extract_move_in_date(text: str) -> str:
     normalized = normalize_whitespace(text)
@@ -2445,7 +2224,6 @@ def extract_move_in_date(text: str) -> str:
             return match.group(0)
     return ""
 
-
 def looks_like_date_only_answer(text: str) -> bool:
     normalized = normalize_whitespace(text)
     if not normalized or not extract_move_in_date(normalized):
@@ -2456,7 +2234,6 @@ def looks_like_date_only_answer(text: str) -> bool:
     if re.search(r"\b(?:people|person|adult|adults|tenant|tenants|kid|kids|child|children|lease)\b", lowered):
         return False
     return True
-
 
 def parse_missing_fields(missing_keys: List[str], query: str) -> Dict[str, str]:
     if not missing_keys:
@@ -2531,7 +2308,6 @@ def parse_missing_fields(missing_keys: List[str], query: str) -> Dict[str, str]:
 
     return {k: v for k, v in answers.items() if compact(v)}
 
-
 def build_missing_field_prompt(keys: List[str], answers: Optional[dict] = None) -> str:
     answers = answers or {}
     if not keys:
@@ -2563,7 +2339,6 @@ def build_missing_field_prompt(keys: List[str], answers: Optional[dict] = None) 
         return "Last one — what's the best phone number to reach you on?"
     by_key = {step["key"]: step["prompt"] for step in QUALIFICATION_STEPS}
     return by_key.get(key, "Could you share that detail?")
-
 
 def parse_batch_answers(batch_index: int, query: str) -> Dict[str, str]:
     text = compact(query)
@@ -2706,11 +2481,9 @@ def summarize_shared_listing(draft: dict) -> str:
     detail_suffix = f" ({', '.join(details)})" if details else ""
     return f"{title}{detail_suffix}"
 
-
 def listings_from_session(session: dict, drafts: List[dict]) -> List[dict]:
     by_key = {compact(draft.get("ListingKey")): draft for draft in drafts if compact(draft.get("ListingKey"))}
     return [by_key[key] for key in session.get("last_shared_listing_keys", []) if key in by_key]
-
 
 def draft_by_listing_key(drafts: List[dict], listing_key: str) -> Optional[dict]:
     listing_key = compact(listing_key)
@@ -2720,7 +2493,6 @@ def draft_by_listing_key(drafts: List[dict], listing_key: str) -> Optional[dict]
         if compact(draft.get("ListingKey")) == listing_key:
             return draft
     return None
-
 
 def resolve_listing_reference(query: str, session: dict, drafts: List[dict]) -> Optional[dict]:
     shared = listings_from_session(session, drafts)
@@ -2785,7 +2557,6 @@ def resolve_listing_reference(query: str, session: dict, drafts: List[dict]) -> 
 
     return None
 
-
 def looks_like_listing_detail_request(query: str) -> bool:
     q = query.lower()
     phrases = (
@@ -2813,7 +2584,6 @@ def looks_like_listing_detail_request(query: str) -> bool:
     )
     return any(phrase in q for phrase in phrases) or bool(re.search(r"\$\s*\d{3,5}", q))
 
-
 def looks_like_booking_confirmation(query: str, session: dict) -> bool:
     if looks_like_listing_followup_question(query):
         return False
@@ -2829,13 +2599,11 @@ def looks_like_booking_confirmation(query: str, session: dict) -> bool:
         phrase in last for phrase in ("viewing", "book a", "schedule", "booking", "move forward", "next step")
     )
 
-
 def user_asking_booking_options(query: str, session: dict) -> bool:
     q = query.lower()
     if "options" not in q:
         return False
     return bool(compact(session.get("selected_listing_key"))) or bool(session.get("pending_booking_offer"))
-
 
 def validate_household_counts(answers: dict) -> None:
     people = compact(answers.get("people_on_lease"))
@@ -2850,7 +2618,6 @@ def validate_household_counts(answers: dict) -> None:
         overflow = int(adults) + int(kids) - int(people)
         if overflow > 0:
             answers["kids_in_unit"] = str(max(0, int(kids) - overflow))
-
 
 def build_calendly_booking_reply(
     session: dict,
@@ -2872,7 +2639,6 @@ def build_calendly_booking_reply(
         "Add the address or ListingKey for the unit you want in the notes."
     )
 
-
 def format_listing_detail_short(draft: dict, position: Optional[int] = None) -> str:
     ctx = listing_context(draft)
     prefix = f"That's option {position} from the list — " if position else ""
@@ -2885,7 +2651,6 @@ def format_listing_detail_short(draft: dict, position: Optional[int] = None) -> 
     bits.append("Want to book a viewing?")
     return " ".join(bits)
 
-
 def generate_listing_detail_reply(
     query: str,
     listing: dict,
@@ -2895,7 +2660,6 @@ def generate_listing_detail_reply(
     position: Optional[int] = None,
 ) -> str:
     return format_listing_detail_short(listing, position=position)
-
 
 def handle_qualified_listing_interest(
     session: dict,
@@ -2977,7 +2741,6 @@ def handle_qualified_listing_interest(
 
     return None
 
-
 def prepare_post_qualification_listings(session: dict, drafts: List[dict]) -> str:
     """Build factual post-qual listing content for AI to phrase naturally."""
     validate_household_counts(session.setdefault("answers", {}))
@@ -2999,7 +2762,6 @@ def prepare_post_qualification_listings(session: dict, drafts: List[dict]) -> st
     else:
         lines.append("No active listings closely match the search right now.")
     return "\n".join(lines)
-
 
 def build_post_qualification_reply(
     session: dict,
@@ -3034,7 +2796,6 @@ def build_post_qualification_reply(
         "If one stands out, send me the address or ListingKey and I'll help you move forward with the next step."
     )
     return "\n".join(lines)
-
 
 def handle_post_qualification_booking(
     session: dict,
@@ -3100,7 +2861,6 @@ def handle_post_qualification_booking(
         "and I’ll share the booking link."
     )
 
-
 def wants_listing_refresh(query: str) -> bool:
     q = query.lower()
     if looks_like_booking_request(query):
@@ -3126,7 +2886,6 @@ def wants_listing_refresh(query: str) -> bool:
     if looks_like_broaden_request(query):
         return True
     return "listings" in q and any(token in q for token in ("ontario", "toronto", "in ", "area", "city"))
-
 
 def handle_qualified_listing_search(
     session: dict,
@@ -3183,7 +2942,6 @@ def handle_qualified_listing_search(
     listing_reply = build_qualified_listing_reply(session, search_query, drafts)
     return listing_reply
 
-
 def should_start_qualification(query: str, calendly_url: str) -> bool:
     q = query.lower()
     if wants_listing_help(query):
@@ -3193,7 +2951,6 @@ def should_start_qualification(query: str, calendly_url: str) -> bool:
     if "help me" in q and ("find" in q or "search" in q):
         return True
     return False
-
 
 def maybe_handle_qualification(
     sender_id: str,
@@ -3223,7 +2980,6 @@ def maybe_handle_qualification(
         )
 
     return with_lead_session(sender_id, lead_state_path, _handle)
-
 
 def _maybe_handle_qualification_locked(
     session: dict,
@@ -3396,13 +3152,11 @@ def _maybe_handle_qualification_locked(
 
     return None
 
-
 def build_openai_headers(api_key: str) -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-
 
 def extract_response_text(response_json: dict) -> str:
     output_text = compact(response_json.get("output_text"))
@@ -3416,7 +3170,6 @@ def extract_response_text(response_json: dict) -> str:
             if text:
                 chunks.append(text)
     return "\n".join(chunk for chunk in chunks if chunk).strip()
-
 
 def parse_json_object(text: str) -> dict:
     text = compact(text)
@@ -3434,7 +3187,6 @@ def parse_json_object(text: str) -> dict:
             return payload if isinstance(payload, dict) else {}
         except Exception:
             return {}
-
 
 def call_openai_json(api_key: str, model: str, system_prompt: str, user_payload: dict, max_tokens: int = 400) -> dict:
     payload = {
@@ -3457,7 +3209,6 @@ def call_openai_json(api_key: str, model: str, system_prompt: str, user_payload:
     resp.raise_for_status()
     return parse_json_object(extract_response_text(resp.json()))
 
-
 def normalize_qualification_value(key: str, value: str) -> str:
     value = compact(value)
     if not value:
@@ -3476,7 +3227,6 @@ def normalize_qualification_value(key: str, value: str) -> str:
         return extract_phone_number(value) or value
     return value
 
-
 def unfilled_qualification_fields(answers: dict) -> Dict[str, str]:
     unfilled: Dict[str, str] = {}
     for step in QUALIFICATION_STEPS:
@@ -3485,20 +3235,17 @@ def unfilled_qualification_fields(answers: dict) -> Dict[str, str]:
             unfilled[key] = step["prompt"]
     return unfilled
 
-
 def first_incomplete_batch_index(answers: dict) -> int:
     for index, batch in enumerate(QUALIFICATION_BATCHES):
         if any(not compact(answers.get(key)) for key in batch["keys"]):
             return index
     return len(QUALIFICATION_BATCHES)
 
-
 def first_missing_qualification_key(answers: dict) -> str:
     for key in QUALIFICATION_FIELD_KEYS:
         if not compact(answers.get(key)):
             return key
     return ""
-
 
 def is_plausible_field_value(key: str, value: str, query: str, existing_answers: Optional[dict] = None) -> bool:
     value = compact(value)
@@ -3559,9 +3306,7 @@ def is_plausible_field_value(key: str, value: str, query: str, existing_answers:
             return False
     return True
 
-
 OVERWRITABLE_QUALIFICATION_FIELDS = {"resident_status", "working_with_agent"}
-
 
 def merge_parsed_answers(
     answers: dict,
@@ -3582,7 +3327,6 @@ def merge_parsed_answers(
         if can_write:
             answers[key] = normalized
     validate_household_counts(answers)
-
 
 def ai_extract_qualification_fields(
     api_key: str,
@@ -3628,7 +3372,6 @@ def ai_extract_qualification_fields(
     }
     return cleaned, compact(result.get("follow_up"))
 
-
 def ai_interpret_opt_in_message(
     api_key: str,
     model: str,
@@ -3665,7 +3408,6 @@ def ai_interpret_opt_in_message(
     except Exception as exc:
         print(f"AI opt-in interpretation failed: {exc}")
         return {}
-
 
 def ai_generate_conversational_reply(
     api_key: str,
@@ -3730,7 +3472,6 @@ def ai_generate_conversational_reply(
         print(f"AI conversational reply failed: {exc}")
         return ""
 
-
 def ai_detect_search_intent(
     api_key: str,
     model: str,
@@ -3755,7 +3496,6 @@ def ai_detect_search_intent(
     except Exception as exc:
         print(f"AI search-intent detection failed: {exc}")
         return {}
-
 
 def ai_interpret_qualified_message(
     api_key: str,
@@ -3785,7 +3525,6 @@ def ai_interpret_qualified_message(
     except Exception as exc:
         print(f"AI qualified-message interpretation failed: {exc}")
         return {}
-
 
 def extract_qualification_from_message(
     batch_index: int,
@@ -3831,7 +3570,6 @@ def extract_qualification_from_message(
     merge_parsed_answers(normalized, parsed, query, allowed_keys=missing_in_batch)
     return normalized, follow_up_hint
 
-
 def conversation_stage(session: dict) -> str:
     if session.get("qualified"):
         return "qualified"
@@ -3841,10 +3579,8 @@ def conversation_stage(session: dict) -> str:
         return "awaiting_opt_in"
     return "new"
 
-
 def all_qualification_fields_complete(answers: dict) -> bool:
     return all(compact(answers.get(key)) for key in QUALIFICATION_FIELD_KEYS)
-
 
 def available_listing_cities(drafts: List[dict], limit: int = 5) -> List[str]:
     cities: List[str] = []
@@ -3858,7 +3594,6 @@ def available_listing_cities(drafts: List[dict], limit: int = 5) -> List[str]:
         if len(cities) >= limit:
             break
     return cities
-
 
 def build_empty_area_suggestion(search_query: str, drafts: List[dict], note: str = "") -> str:
     note = compact(note)
@@ -3878,7 +3613,6 @@ def build_empty_area_suggestion(search_query: str, drafts: List[dict], note: str
         f"I don’t see an exact match for that search right now. "
         f"I can look in areas like {alt_text}, or we can tweak the budget or bedrooms — what would you like to try?"
     )
-
 
 def build_qualified_listing_reply(
     session: dict,
@@ -3906,15 +3640,6 @@ def build_qualified_listing_reply(
     ))
     if not matches:
         suggestion = build_empty_area_suggestion(search_query, drafts, note=note)
-        # region agent log
-        _agent_debug_log(
-            "messenger_automation.py:build_qualified_listing_reply",
-            "empty_area_suggestion",
-            {"query": search_query[:120], "suggestion_preview": suggestion[:160]},
-            hypothesis_id="L",
-            run_id="post-fix",
-        )
-        # endregion
         return suggestion
     lines = []
     if note:
@@ -3928,7 +3653,6 @@ def build_qualified_listing_reply(
     lines.append("")
     lines.append("Like one? Send the address or ListingKey and I'll help with next steps.")
     return "\n".join(lines)
-
 
 def extract_all_qualification_fields(
     session: dict,
@@ -4010,7 +3734,6 @@ def extract_all_qualification_fields(
 
     session["batch"] = first_incomplete_batch_index(answers)
 
-
 def extract_qualification_only(
     session: dict,
     query: str,
@@ -4018,7 +3741,6 @@ def extract_qualification_only(
     openai_model: str,
 ) -> None:
     extract_all_qualification_fields(session, query, openai_api_key, openai_model)
-
 
 def compute_conversation_directive(
     session: dict,
@@ -4051,20 +3773,6 @@ def compute_conversation_directive(
         ai_stage = "QUALIFIED"
         allow_listings = True
         fresh_greeting = is_fresh_day_greeting(query, session)
-        # region agent log
-        _agent_debug_log(
-            "messenger_automation.py:compute_conversation_directive",
-            "qualified_turn",
-            {
-                "fresh_greeting": fresh_greeting,
-                "idle_seconds": session_idle_seconds(session),
-                "is_greeting": looks_like_greeting(query) or looks_like_small_talk(query),
-                "last_shared_count": len(session.get("last_shared_listing_keys") or []),
-                "query_preview": query[:80],
-            },
-            hypothesis_id="F",
-        )
-        # endregion
         if fresh_greeting:
             soft_reset_conversation_focus(session)
             allow_listings = False
@@ -4200,21 +3908,6 @@ def compute_conversation_directive(
     # Qualification turns still need the last question for continuity.
     include_last_assistant = include_history or bool(session.get("active") or session.get("awaiting_opt_in"))
     recent_history = recent_message_history(session) if include_history else []
-    # region agent log
-    _agent_debug_log(
-        "messenger_automation.py:compute_conversation_directive",
-        "context_gate",
-        {
-            "include_history": include_history,
-            "include_last_assistant": include_last_assistant,
-            "fresh_greeting": is_fresh_day_greeting(query, session),
-            "query_preview": query[:80],
-            "qualified": bool(session.get("qualified")),
-        },
-        hypothesis_id="H",
-        run_id="post-fix",
-    )
-    # endregion
     if session.get("qualified") and include_history:
         focus = resolve_listing_reference(query, session, drafts)
         if focus:
@@ -4250,7 +3943,6 @@ def compute_conversation_directive(
         "agent_name": agent_name,
     }
 
-
 def ai_compose_turn(
     api_key: str,
     model: str,
@@ -4272,7 +3964,6 @@ def ai_compose_turn(
         print(f"AI compose turn failed: {exc}")
         return {}
 
-
 def reply_reasks_collected_fields(reply: str, answers: dict) -> bool:
     lowered = reply.lower()
     checks = [
@@ -4290,7 +3981,6 @@ def reply_reasks_collected_fields(reply: str, answers: dict) -> bool:
         if compact(answers.get(key)) and any(p in lowered for p in phrases):
             return True
     return False
-
 
 def _safe_deterministic_fallback(
     session: dict,
@@ -4333,7 +4023,6 @@ def _safe_deterministic_fallback(
     )
     return save_session_reply(lead_state_path, state, session, fallback)
 
-
 def _finish_ai_turn(
     session: dict,
     state: dict,
@@ -4372,7 +4061,6 @@ def _finish_ai_turn(
             session, state, query, lead_state_path, drafts, listing_doc_url,
             calendly_url, agent_name, openai_api_key, openai_model,
         )
-
 
 def _finish_ai_turn_impl(
     session: dict,
@@ -4442,27 +4130,6 @@ def _finish_ai_turn_impl(
     reply = sanitize_bot_reply(compact(result.get("reply")))
     answers = session.get("answers", {})
 
-    # region agent log
-    _agent_debug_log(
-        "messenger_automation.py:_finish_ai_turn_impl",
-        "ai_reply_check",
-        {
-            "query_preview": query[:80],
-            "has_listing_block": bool(listing_block),
-            "soft_ack": looks_like_soft_acknowledgment(query),
-            "reply_claims_empty": bool(
-                re.search(
-                    r"don.?t see any available|no available listings|nothing available|no listings",
-                    reply.lower(),
-                )
-            ),
-            "reply_preview": reply[:120],
-        },
-        hypothesis_id="K",
-        run_id="post-fix",
-    )
-    # endregion
-
     # Never let the model invent "no listings" when we did not run a sheet search this turn.
     if (
         reply
@@ -4487,15 +4154,6 @@ def _finish_ai_turn_impl(
             "Sounds good — tell me the area, budget, and how many bedrooms you want, "
             "and I’ll pull matching options from our current listings."
         )
-        # region agent log
-        _agent_debug_log(
-            "messenger_automation.py:_finish_ai_turn_impl",
-            "rewrote_false_empty_inventory",
-            {"query_preview": query[:80]},
-            hypothesis_id="K",
-            run_id="post-fix",
-        )
-        # endregion
 
     if reply and reply_reasks_collected_fields(reply, answers):
         missing_key = first_missing_qualification_key(answers)
@@ -4532,7 +4190,6 @@ def _finish_ai_turn_impl(
         reply = f"{reply}\n\n{must_include}".strip()
 
     return save_session_reply(lead_state_path, state, session, reply)
-
 
 def _unified_ai_turn(
     session: dict,
@@ -4693,7 +4350,6 @@ def _unified_ai_turn(
         listing_doc_url, openai_api_key, openai_model,
     )
 
-
 def handle_unified_ai_turn(
     sender_id: str,
     query: str,
@@ -4722,7 +4378,6 @@ def handle_unified_ai_turn(
         ),
     )
 
-
 def ai_route_conversation_turn(
     api_key: str,
     model: str,
@@ -4742,7 +4397,6 @@ def ai_route_conversation_turn(
     except Exception as exc:
         print(f"AI conversation routing failed: {exc}")
         return {}
-
 
 def handle_ai_conversation(
     sender_id: str,
@@ -5018,7 +4672,6 @@ def handle_ai_conversation(
         listing_doc_url,
     )
 
-
 def generate_ai_reply(
     query: str,
     matches: List[dict],
@@ -5067,7 +4720,6 @@ def generate_ai_reply(
     resp.raise_for_status()
     output_text = extract_response_text(resp.json())
     return sanitize_bot_reply(output_text) or None
-
 
 def build_qualified_reply(
     session: dict,
@@ -5131,7 +4783,6 @@ def build_qualified_reply(
         "Tell me the address, ListingKey, or what you'd like to refine — "
         "area, budget, or bedrooms — and I'll pull matching options."
     )
-
 
 def _reply_deterministic(
     session: dict,
@@ -5293,7 +4944,6 @@ def _reply_deterministic(
     )
     return save_session_reply(lead_state_path, state, session, reply)
 
-
 def build_reply_deterministic(
     sender_id: str,
     query: str,
@@ -5323,7 +4973,6 @@ def build_reply_deterministic(
             use_ai,
         ),
     )
-
 
 def build_reply(
     sender_id: str,
@@ -5386,7 +5035,6 @@ def build_reply(
         use_ai=False,
     )
 
-
 def current_drafts(config: MessengerConfig) -> List[dict]:
     now = time.time()
     source = config.drafts_sheet_csv_url or str(config.drafts_path)
@@ -5426,7 +5074,6 @@ def current_drafts(config: MessengerConfig) -> List[dict]:
         _DRAFT_CACHE["degraded"] = False
     return drafts
 
-
 def send_message(page_access_token: str, recipient_id: str, text: str) -> dict:
     url = f"{GRAPH_BASE}/me/messages"
     payload = {
@@ -5441,7 +5088,6 @@ def send_message(page_access_token: str, recipient_id: str, text: str) -> dict:
     )
     resp.raise_for_status()
     return resp.json()
-
 
 def send_sender_action(page_access_token: str, recipient_id: str, action: str) -> dict:
     url = f"{GRAPH_BASE}/me/messages"
@@ -5458,7 +5104,6 @@ def send_sender_action(page_access_token: str, recipient_id: str, action: str) -
     resp.raise_for_status()
     return resp.json()
 
-
 def verify_signature(app_secret: str, raw_body: bytes, signature_header: Optional[str]) -> bool:
     if not signature_header:
         return False
@@ -5466,7 +5111,6 @@ def verify_signature(app_secret: str, raw_body: bytes, signature_header: Optiona
         return False
     expected = hmac.new(app_secret.encode("utf-8"), msg=raw_body, digestmod=hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature_header.split("=", 1)[1])
-
 
 @dataclass
 class MessengerConfig:
@@ -5487,7 +5131,6 @@ class MessengerConfig:
     token_source: str = "page"
     bootstrap_reply_lookback_seconds: int = 86400
     stable_mode: bool = False
-
 
 def make_config() -> MessengerConfig:
     page_id = optional_env("META_PAGE_ID", "")
@@ -5527,7 +5170,6 @@ def make_config() -> MessengerConfig:
         bootstrap_reply_lookback_seconds=int(os.getenv("POLL_BOOTSTRAP_LOOKBACK_SECONDS", "86400") or "86400"),
         stable_mode=env_flag("STABLE_MODE"),
     )
-
 
 class MessengerWebhookHandler(BaseHTTPRequestHandler):
     server_version = "MessengerAutomation/1.0"
@@ -5683,19 +5325,6 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                 print(f"Webhook inbound from {sender_id}: {text[:120]}")
 
                 claimed = claim_inbound_message(message_id, self.config.poll_state_path)
-                # region agent log
-                _agent_debug_log(
-                    "messenger_automation.py:process_webhook",
-                    "inbound",
-                    {
-                        "sender_id": sender_id,
-                        "message_id": message_id,
-                        "text_preview": text[:80],
-                        "claimed": claimed,
-                    },
-                    hypothesis_id="A",
-                )
-                # endregion
                 if not claimed:
                     print(f"Skipping duplicate webhook message {message_id}")
                     continue
@@ -5720,40 +5349,12 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                     )
                 except Exception as exc:
                     print(f"build_reply crashed for {sender_id}: {exc}")
-                    # region agent log
-                    _agent_debug_log(
-                        "messenger_automation.py:process_webhook",
-                        "build_reply_crashed",
-                        {"sender_id": sender_id, "error": str(exc)},
-                        hypothesis_id="B",
-                    )
-                    # endregion
                     reply = (
                         "Sorry about that — I'm here to help find rentals for your family. "
                         "What city or area are you looking in, and how many bedrooms do you need?"
                     )
-                # region agent log
-                _agent_debug_log(
-                    "messenger_automation.py:process_webhook",
-                    "reply_built",
-                    {
-                        "sender_id": sender_id,
-                        "reply_len": len(compact(reply)),
-                        "reply_preview": compact(reply)[:80],
-                    },
-                    hypothesis_id="B",
-                )
-                # endregion
                 if not compact(reply):
                     print(f"Empty reply for {sender_id}: {text[:80]}")
-                    # region agent log
-                    _agent_debug_log(
-                        "messenger_automation.py:process_webhook",
-                        "empty_reply",
-                        {"sender_id": sender_id, "text_preview": text[:80]},
-                        hypothesis_id="B",
-                    )
-                    # endregion
                     continue
                 session = (
                     session_store.load_session(sender_id)
@@ -5761,17 +5362,8 @@ class MessengerWebhookHandler(BaseHTTPRequestHandler):
                     else {}
                 )
                 delivered = deliver_reply(self.config, sender_id, reply, session)
-                # region agent log
-                _agent_debug_log(
-                    "messenger_automation.py:process_webhook",
-                    "deliver_result",
-                    {"sender_id": sender_id, "delivered": delivered},
-                    hypothesis_id="D",
-                )
-                # endregion
                 if delivered:
                     print(f"Replied to {sender_id}: {text[:80]}")
-
 
 def run_server(config: MessengerConfig, port: int):
     httpd = ThreadingHTTPServer(("0.0.0.0", port), MessengerWebhookHandler)
@@ -5779,7 +5371,6 @@ def run_server(config: MessengerConfig, port: int):
     httpd.poll_interval_seconds = int(os.getenv("POLL_CONVERSATIONS_SECONDS", "0") or "0")  # type: ignore[attr-defined]
     print(f"Messenger webhook listening on http://0.0.0.0:{port}/webhook")
     httpd.serve_forever()
-
 
 def list_conversations(page_id: str, page_access_token: str, limit: int = 25) -> dict:
     # Conversations API is useful for diagnostics/sync, but replies should still use Send API.
@@ -5796,7 +5387,6 @@ def list_conversations(page_id: str, page_access_token: str, limit: int = 25) ->
     resp.raise_for_status()
     return resp.json()
 
-
 def load_seen_message_ids(path: Path) -> set[str]:
     if not path.exists():
         return set()
@@ -5807,11 +5397,9 @@ def load_seen_message_ids(path: Path) -> set[str]:
     values = payload.get("seen_message_ids", []) if isinstance(payload, dict) else []
     return {str(value) for value in values}
 
-
 def save_seen_message_ids(path: Path, seen: set[str]):
     recent = sorted(seen)[-2000:]
     atomic_write_json(path, {"seen_message_ids": recent})
-
 
 def list_recent_messages(
     page_id: str,
@@ -5837,7 +5425,6 @@ def list_recent_messages(
         resp.raise_for_status()
         messages.extend(resp.json().get("data", []))
     return messages
-
 
 def poll_conversations_once(
     config: MessengerConfig,
@@ -5947,7 +5534,6 @@ def poll_conversations_once(
 
     return with_poll_state(config.poll_state_path, _poll_locked)
 
-
 def start_conversation_poller(config: MessengerConfig, interval_seconds: int):
     def worker():
         try:
@@ -5969,7 +5555,6 @@ def start_conversation_poller(config: MessengerConfig, interval_seconds: int):
     thread = threading.Thread(target=worker, name="conversation-poller", daemon=True)
     thread.start()
     print(f"Conversation polling fallback enabled every {interval_seconds}s")
-
 
 def main():
     parser = argparse.ArgumentParser(description="Messenger automation webhook for MLS listings.")
@@ -6004,7 +5589,6 @@ def main():
         print("STABLE_MODE=1: webhook-only delivery (set POLL_CONVERSATIONS_SECONDS>0 for fallback)")
 
     run_server(config, args.port)
-
 
 if __name__ == "__main__":
     main()
