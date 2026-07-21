@@ -137,6 +137,17 @@ def save_session(sender_id: str, session: dict) -> None:
                 (sender_id, payload),
             )
         conn.commit()
+    _notify_lead_sync(sender_id, session)
+
+
+def _notify_lead_sync(sender_id: str, session: dict) -> None:
+    """Mirror qualification answers to the Leads sheet tab (no-op unless configured)."""
+    try:
+        import leads_sheet_sync
+
+        leads_sheet_sync.schedule_lead_upsert(sender_id, session)
+    except Exception:
+        pass
 
 
 def load_seen_message_ids() -> Set[str]:
